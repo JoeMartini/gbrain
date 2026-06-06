@@ -225,6 +225,12 @@ export function dimsProviderOptions(
       // into the new inputType seam is a follow-up (see plan's deferred
       // section "Fix MiniMax embo-01 asymmetry"). When fixed: map
       // inputType==='query' → type:'query', else 'db'.
+      // SiliconFlow Qwen3-Embedding-8B (Matryoshka 64-4096) accepts
+      // `dimensions` on the OpenAI-compat path.
+      if (modelId === 'Qwen/Qwen3-Embedding-8B') {
+        return { openaiCompatible: { dimensions: dims } };
+      }
+
       if (modelId === 'embo-01') {
         return { openaiCompatible: { type: 'db' } };
       }
