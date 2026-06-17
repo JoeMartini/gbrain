@@ -1,5 +1,6 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { embedBatch, currentEmbeddingSignature } from '../core/embedding.ts';
+import { embedBatch, embedBatchMultiScale, currentEmbeddingSignature } from '../core/embedding.ts';
+import type { MultiScaleEmbeddings } from '../core/embedding.ts';
 import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
@@ -376,16 +377,21 @@ async function embedPage(
     return;
   }
 
-  const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text), { abortSignal: signal });
+  const embResult = await embedBatchMultiScaleWithBackoff(toEmbed.map(c => c.chunk_text), { abortSignal: signal });
   const embeddingMap = new Map<number, Float32Array>();
+  const embedding4096Map = new Map<number, Float32Array>();
   for (let j = 0; j < toEmbed.length; j++) {
-    embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
+    embeddingMap.set(toEmbed[j].chunk_index, embResult.embedding[j]);
+    if (embResult.embedding_4096[j]) {
+      embedding4096Map.set(toEmbed[j].chunk_index, embResult.embedding_4096[j]);
+    }
   }
   const updated: ChunkInput[] = chunks.map(c => ({
     chunk_index: c.chunk_index,
     chunk_text: c.chunk_text,
     chunk_source: c.chunk_source,
     embedding: embeddingMap.get(c.chunk_index),
+    embedding_4096: embedding4096Map.get(c.chunk_index) ?? undefined,
     token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
   }));
 
@@ -497,11 +503,15 @@ async function embedAll(
     }
 
     try {
-      const embeddings = await embedBatch(toEmbed.map(c => c.chunk_text));
-      // Build a map of new embeddings by chunk_index
+      const embResult = await embedBatchMultiScaleWithBackoff(toEmbed.map(c => c.chunk_text));
+      // Build maps of new embeddings by chunk_index
       const embeddingMap = new Map<number, Float32Array>();
+      const embedding4096Map = new Map<number, Float32Array>();
       for (let j = 0; j < toEmbed.length; j++) {
-        embeddingMap.set(toEmbed[j].chunk_index, embeddings[j]);
+        embeddingMap.set(toEmbed[j].chunk_index, embResult.embedding[j]);
+        if (embResult.embedding_4096[j]) {
+          embedding4096Map.set(toEmbed[j].chunk_index, embResult.embedding_4096[j]);
+        }
       }
       // Preserve ALL chunks, only update embeddings for stale ones
       const updated: ChunkInput[] = chunks.map(c => ({
@@ -509,6 +519,7 @@ async function embedAll(
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
         embedding: embeddingMap.get(c.chunk_index) ?? undefined,
+        embedding_4096: embedding4096Map.get(c.chunk_index) ?? undefined,
         token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
       }));
       await engine.upsertChunks(page.slug, updated, pageOpts);
@@ -727,18 +738,23 @@ async function embedAllStale(
         const keySourceId = stale[0]?.source_id ?? 'default';
         const slug = stale[0].slug;
         try {
-          const embeddings = await embedBatchWithBackoff(stale.map(c => c.chunk_text), { abortSignal: effectiveSignal });
+          const embedResult = await embedBatchMultiScaleWithBackoff(stale.map(c => c.chunk_text), { abortSignal: effectiveSignal });
           // Re-fetch existing chunks and merge to avoid deleting non-stale chunks.
           const existing = await engine.getChunks(slug, { sourceId: keySourceId });
           const staleIdxToEmbedding = new Map<number, Float32Array>();
+          const staleIdxToEmbedding4096 = new Map<number, Float32Array>();
           for (let j = 0; j < stale.length; j++) {
-            staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+            staleIdxToEmbedding.set(stale[j].chunk_index, embedResult.embedding[j]);
+            if (embedResult.embedding_4096[j]) {
+              staleIdxToEmbedding4096.set(stale[j].chunk_index, embedResult.embedding_4096[j]);
+            }
           }
           const merged: ChunkInput[] = existing.map(c => ({
             chunk_index: c.chunk_index,
             chunk_text: c.chunk_text,
             chunk_source: c.chunk_source,
             embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+            embedding_4096: staleIdxToEmbedding4096.get(c.chunk_index) ?? undefined,
             token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
           }));
           await engine.upsertChunks(slug, merged, { sourceId: keySourceId });
@@ -930,4 +946,33 @@ export async function embedBatchWithBackoff(
   }
   // Unreachable, but TypeScript needs it.
   return embedBatch(texts);
+}
+
+/**
+ * v0-MULTISCALE: embed a batch in base + 4096 dimensions with the same
+ * 429/retry backoff policy as `embedBatchWithBackoff`. Returns both vectors,
+ * falling open to partial results if one dimension fails.
+ */
+export async function embedBatchMultiScaleWithBackoff(
+  texts: string[],
+  opts: EmbedBatchWithBackoffOpts = {},
+): Promise<MultiScaleEmbeddings> {
+  const signal = opts.abortSignal;
+  for (let attempt = 0; attempt <= MAX_RATE_LIMIT_RETRIES; attempt++) {
+    if (signal?.aborted) throw new Error('embed budget aborted');
+    try {
+      return await embedBatchMultiScale(texts, { maxRetries: 0, ...(signal && { abortSignal: signal }) });
+    } catch (e: unknown) {
+      if (signal?.aborted) throw e;
+      const msg = e instanceof Error ? e.message : String(e);
+      const isRateLimit = detect429FromCause(e)
+        || /rate.?limit|429/i.test(msg);
+      if (!isRateLimit || attempt === MAX_RATE_LIMIT_RETRIES) throw e;
+
+      const delayMs = parseRetryDelayMs(msg);
+      serr(`  [rate-limit] multi-scale attempt ${attempt + 1}/${MAX_RATE_LIMIT_RETRIES}, waiting ${delayMs}ms...`);
+      await abortableSleep(delayMs, signal);
+    }
+  }
+  return embedBatchMultiScale(texts);
 }

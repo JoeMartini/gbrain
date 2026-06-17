@@ -291,6 +291,9 @@ export function rowToChunk(row: Record<string, unknown>, includeEmbedding = fals
     chunk_text: row.chunk_text as string,
     chunk_source: row.chunk_source as 'compiled_truth' | 'timeline' | 'fenced_code',
     embedding: includeEmbedding ? parseEmbedding(row.embedding) : null,
+    // v0-MULTISCALE: parse high-precision vector when caller asks for embeddings.
+    embedding_4096: includeEmbedding ? parseEmbedding(row.embedding_4096) : null,
+    has_full_vectors: row.has_full_vectors === undefined ? undefined : Boolean(row.has_full_vectors),
     model: row.model as string,
     token_count: row.token_count as number | null,
     embedded_at: row.embedded_at ? new Date(row.embedded_at as string) : null,

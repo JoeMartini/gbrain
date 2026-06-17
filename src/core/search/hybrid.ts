@@ -1122,6 +1122,7 @@ export async function hybridSearch(
   //   - 'both': text + image vector searches in parallel; merged via weighted RRF
   let vectorLists: SearchResult[][] = [];
   let queryEmbedding: Float32Array | null = null;
+  let queryEmbedding_4096: Float32Array | null = null;
   let imageVectorList: SearchResult[] | null = null;
   let crossModalFellOpen = false;
 
@@ -1218,6 +1219,17 @@ export async function hybridSearch(
       const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
       const embeddings = await Promise.all(queries.map(q => embedQueryBounded(q, embedOpts, embedDl)));
       queryEmbedding = embeddings[0];
+      // v0-MULTISCALE: also compute the 4096-dim query embedding for cascade
+      // re-scoring. Use a fresh deadline so a slow base embed/HNSW pass does
+      // not starve the high-dimensional query embedding. If it fails
+      // (unsupported model / timeout / cost), cosineReScore falls back to the
+      // base column transparently.
+      try {
+        const highEmbedDl = makeQueryEmbedDeadline();
+        queryEmbedding_4096 = await embedQueryBounded(queries[0], { dimensions: 4096 }, highEmbedDl);
+      } catch (e4096) {
+        if (DEBUG) console.error('[search-debug] 4096 query embed failed:', (e4096 as Error).message);
+      }
       const textLists = await Promise.all(
         embeddings.map(emb => engine.searchVector(emb, searchOpts)),
       );
@@ -1330,7 +1342,7 @@ export async function hybridSearch(
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
   // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
+    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name, queryEmbedding_4096);
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -1916,20 +1928,29 @@ async function cosineReScore(
   results: SearchResult[],
   queryEmbedding: Float32Array,
   column: string = 'embedding',
+  queryEmbedding_4096?: Float32Array | null,
 ): Promise<SearchResult[]> {
   const chunkIds = results
     .map(r => r.chunk_id)
     .filter((id): id is number => id != null);
 
   if (chunkIds.length === 0) return results;
+  const useCascade = queryEmbedding_4096 != null && queryEmbedding_4096.length === 4096;
 
   let embeddingMap: Map<number, Float32Array>;
   try {
-    // v0.36 (D9): hydrate from the active column so rescore happens in
-    // the same embedding space the HNSW just ranked in. Without this,
-    // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
-    // rescore against OpenAI vectors → NaN or wrong rankings.
-    embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, column);
+    if (useCascade) {
+      // v0-MULTISCALE: cascade rerank pulls the high-precision 4096-dim
+      // vectors that were written alongside the base HNSW column. Chunks
+      // without a 4096 vector are ignored for re-scoring (fall back below).
+      embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, 'embedding_4096');
+    } else {
+      // v0.36 (D9): hydrate from the active column so rescore happens in
+      // the same embedding space the HNSW just ranked in. Without this,
+      // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
+      // rescore against OpenAI vectors → NaN or wrong rankings.
+      embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, column);
+    }
   } catch {
     // DB error is non-fatal, return results without re-scoring
     return results;
@@ -1944,12 +1965,17 @@ async function cosineReScore(
     const chunkEmb = r.chunk_id != null ? embeddingMap.get(r.chunk_id) : undefined;
     if (!chunkEmb) return r;
 
-    const cosine = cosineSimilarity(queryEmbedding, chunkEmb);
+    // Cascade: re-score against the 4096-dim query embedding when both
+    // sides have high-precision vectors. Otherwise keep the original
+    // active-column behavior.
+    const activeQuery = useCascade ? queryEmbedding_4096! : queryEmbedding;
+    const cosine = cosineSimilarity(activeQuery, chunkEmb);
     const normRrf = maxRrf > 0 ? r.score / maxRrf : 0;
     const blended = 0.7 * normRrf + 0.3 * cosine;
 
     if (DEBUG) {
-      console.error(`[search-debug] ${r.slug}:${r.chunk_id} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);
+      const mode = useCascade ? '4096' : column;
+      console.error(`[search-debug] ${r.slug}:${r.chunk_id} mode=${mode} cosine=${cosine.toFixed(4)} norm_rrf=${normRrf.toFixed(4)} blended=${blended.toFixed(4)}`);
     }
 
     return { ...r, score: blended };

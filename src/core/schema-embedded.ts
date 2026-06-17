@@ -311,13 +311,20 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   modality              TEXT NOT NULL DEFAULT 'text',
   embedding_image       vector(1024),
   -- v0.36 Phase 3 cross-modal: unified column populated by reindex.
-  -- Migration v75 also adds it for upgrade paths.
-  embedding_multimodal  vector(1024)
+  -- Migration v75 also adds it on upgrade paths.
+  embedding_multimodal  vector(1024),
+  -- multi-scale retrieval: high-precision 4096-dim vector for cascade rerank
+  -- (HNSW not used; exact scan on a small candidate set).
+  embedding_4096        vector(4096),
+  -- tracks whether both 1024 and 4096 vectors were successfully written
+  has_full_vectors      boolean NOT NULL DEFAULT false
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_page_index ON content_chunks(page_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunks_page ON content_chunks(page_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);
+-- partial index to quickly find chunks missing the high-dim vector for backfill
+
 -- v0.19.0: partial indexes — only code chunks populate these columns.
 CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name ON content_chunks(symbol_name) WHERE symbol_name IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_chunks_language ON content_chunks(language) WHERE language IS NOT NULL;

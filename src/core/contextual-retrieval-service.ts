@@ -41,7 +41,7 @@
 
 import { createHash } from 'crypto';
 import * as fs from 'node:fs';
-import { embedBatch } from './embedding.ts';
+import { embedBatch, embedBatchMultiScale } from './embedding.ts';
 import { resolveContextualRetrievalMode } from './contextual-retrieval-resolver.ts';
 import {
   buildContextualPrefix,
@@ -398,13 +398,14 @@ async function tryBuildPhase1(opts: {
     );
 
     try {
-      const embeddings = await embedBatch(wrappedTexts, { abortSignal: args.abortSignal });
+      const embResult = await embedBatchMultiScale(wrappedTexts, { abortSignal: args.abortSignal });
       return {
         kind: 'success',
         embeddedChunks: chunks.map((c, i) => ({
           ...c,
           chunk_text: c.chunk_text, // canonical, NOT the wrapped string (D20-T1)
-          embedding: embeddings[i],
+          embedding: embResult.embedding[i],
+          embedding_4096: embResult.embedding_4096[i] ?? undefined,
           token_count: Math.ceil(wrappedTexts[i].length / 4),
         })),
       };
@@ -495,13 +496,14 @@ async function tryBuildPhase1(opts: {
 
   // All chunks synthesized successfully. Single batch embed (D27 P2-2).
   try {
-    const embeddings = await embedBatch(wrappedTexts, { abortSignal: args.abortSignal });
+    const embResult = await embedBatchMultiScale(wrappedTexts, { abortSignal: args.abortSignal });
     return {
       kind: 'success',
       embeddedChunks: chunks.map((c, i) => ({
         ...c,
         chunk_text: c.chunk_text, // canonical (D20-T1)
-        embedding: embeddings[i],
+        embedding: embResult.embedding[i],
+        embedding_4096: embResult.embedding_4096[i] ?? undefined,
         token_count: Math.ceil(wrappedTexts[i].length / 4),
       })),
     };

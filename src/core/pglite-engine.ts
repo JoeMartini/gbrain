@@ -613,7 +613,6 @@ export class PGLiteEngine implements BrainEngine {
     // it; pre-v112 brains crash without the column, so bootstrap adds it before
     // the CREATE INDEX runs. v112 runs later via runMigrations and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probe.pages_links_extracted_at_exists;
-
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsChunksEmbeddingImage
@@ -2075,18 +2074,23 @@ export class PGLiteEngine implements BrainEngine {
     // list. Image chunks pass embedding=null + embedding_image=Float32Array
     // (1024-dim Voyage). Text/code chunks pass embedding=Float32Array +
     // embedding_image=null. Default modality='text' when omitted.
-    const cols = '(page_id, chunk_index, chunk_text, chunk_source, embedding, model, token_count, embedded_at, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)';
+    const cols = '(page_id, chunk_index, chunk_text, chunk_source, embedding, embedding_4096, has_full_vectors, model, token_count, embedded_at, language, symbol_name, symbol_type, start_line, end_line, parent_symbol_path, doc_comment, symbol_name_qualified, modality, embedding_image)';
     const rowParts: string[] = [];
     const params: unknown[] = [];
     let paramIdx = 1;
 
     for (const chunk of chunks) {
+      // Inline ::vector NULL literals to avoid a per-branch placeholder.
       const embeddingStr = chunk.embedding
         ? '[' + Array.from(chunk.embedding).join(',') + ']'
+        : null;
+      const embedding4096Str = chunk.embedding_4096
+        ? '[' + Array.from(chunk.embedding_4096).join(',') + ']'
         : null;
       const embeddingImageStr = chunk.embedding_image
         ? '[' + Array.from(chunk.embedding_image).join(',') + ']'
         : null;
+      const hasFullVectors = !!(chunk.embedding && chunk.embedding_4096);
       const parentPath = chunk.parent_symbol_path && chunk.parent_symbol_path.length > 0
         ? chunk.parent_symbol_path
         : null;
@@ -2094,12 +2098,13 @@ export class PGLiteEngine implements BrainEngine {
 
       // Inline ::vector NULL literals to avoid a per-branch placeholder.
       const embeddingPh = embeddingStr ? `$${paramIdx++}::vector` : 'NULL';
+      const embedding4096Ph = embedding4096Str ? `$${paramIdx++}::vector` : 'NULL';
       const embeddedAtPh = embeddingStr ? 'now()' : 'NULL';
       const embeddingImagePh = embeddingImageStr ? `$${paramIdx++}::vector` : 'NULL';
 
       rowParts.push(
         `($${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
-        `${embeddingPh}, $${paramIdx++}, $${paramIdx++}, ${embeddedAtPh}, ` +
+        `${embeddingPh}, ${embedding4096Ph}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ${embeddedAtPh}, ` +
         `$${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, $${paramIdx++}, ` +
         `$${paramIdx++}::text[], $${paramIdx++}, $${paramIdx++}, ` +
         `$${paramIdx++}, ${embeddingImagePh})`,
@@ -2108,16 +2113,20 @@ export class PGLiteEngine implements BrainEngine {
       // Param push order MUST match placeholder allocation order. Both
       // embedding placeholders (when present) are allocated BEFORE the
       // bulk row placeholders, so their values must be pushed first.
+      // Row column order: page_id, chunk_index, chunk_text, chunk_source,
+      // embedding, embedding_4096, has_full_vectors, model, token_count, ...
       if (embeddingStr) params.push(embeddingStr);
-      if (embeddingImageStr) params.push(embeddingImageStr);
+      if (embedding4096Str) params.push(embedding4096Str);
       params.push(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
+        hasFullVectors,
         chunk.model || DEFAULT_EMBEDDING_MODEL, chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
         parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
         modality,
       );
+      if (embeddingImageStr) params.push(embeddingImageStr);
     }
 
     // CONSISTENCY: when chunk_text changes and no new embedding is supplied, BOTH embedding AND
@@ -2140,6 +2149,8 @@ export class PGLiteEngine implements BrainEngine {
                 THEN EXCLUDED.embedding
            ELSE content_chunks.embedding
          END,
+         embedding_4096 = COALESCE(EXCLUDED.embedding_4096, content_chunks.embedding_4096),
+         has_full_vectors = COALESCE(EXCLUDED.has_full_vectors, content_chunks.has_full_vectors),
          model = COALESCE(EXCLUDED.model, content_chunks.model),
          token_count = EXCLUDED.token_count,
          embedded_at = CASE

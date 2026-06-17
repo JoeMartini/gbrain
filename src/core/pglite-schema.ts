@@ -226,12 +226,18 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   -- v0.36 Phase 3 cross-modal: unified column populated by reindex
   -- (search.unified_multimodal=true routes here). Migration v75 adds it
   -- on upgrade; fresh installs land at head with the column present.
-  embedding_multimodal vector(1024)
+  embedding_multimodal vector(1024),
+  -- multi-scale retrieval: high-precision 4096-dim vector for cascade rerank.
+  embedding_4096       vector(4096),
+  -- tracks whether both 1024 and 4096 vectors were successfully written
+  has_full_vectors     boolean NOT NULL DEFAULT false
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_page_index ON content_chunks(page_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunks_page ON content_chunks(page_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (embedding vector_cosine_ops);
+-- partial index for gbrain embed --stale and backfill of missing 4096 vectors
+
 -- v0.27.1: partial HNSW for multimodal images. Footprint stays proportional
 -- to image-chunk count, not table size.
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image

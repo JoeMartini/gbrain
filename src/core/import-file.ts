@@ -8,7 +8,7 @@ import { chunkText } from './chunkers/recursive.ts';
 import { chunkCodeText, chunkCodeTextFull, detectCodeLanguage, CHUNKER_VERSION } from './chunkers/code.ts';
 import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
-import { embedBatch, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
+import { embedBatch, embedBatchMultiScale, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from './sync.ts';
 import type { ChunkInput, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
@@ -704,9 +704,11 @@ export async function importFromContent(
     const wrappedTexts = prefix
       ? chunks.map((c) => wrapChunkForEmbedding(c.chunk_text, prefix, c.chunk_source))
       : chunks.map((c) => c.chunk_text);
-    const embeddings = await embedBatch(wrappedTexts);
+    const embResult = await embedBatchMultiScale(wrappedTexts);
     for (let i = 0; i < chunks.length; i++) {
-      chunks[i].embedding = embeddings[i];
+      chunks[i].embedding = embResult.embedding[i];
+      // v0-MULTISCALE: store the 4096-dim high-precision vector when available.
+      chunks[i].embedding_4096 = embResult.embedding_4096[i] ?? undefined;
       // token_count tracks the wrapped string length so cost reporting
       // reflects what we actually sent to the embedder.
       chunks[i].token_count = Math.ceil(wrappedTexts[i].length / 4);
@@ -1131,6 +1133,8 @@ export async function importCodeFile(
     if (matched && matched.embedding) {
       // Reuse the existing embedding verbatim. No API call, no cost.
       chunks[i]!.embedding = matched.embedding as Float32Array;
+      // v0-MULTISCALE: preserve the high-precision vector if it exists.
+      chunks[i]!.embedding_4096 = matched.embedding_4096 as Float32Array | undefined;
       chunks[i]!.token_count = matched.token_count ?? undefined;
     } else {
       needsEmbedIndexes.push(i);
@@ -1141,10 +1145,11 @@ export async function importCodeFile(
   if (!opts.noEmbed && needsEmbedIndexes.length > 0) {
     try {
       const textsToEmbed = needsEmbedIndexes.map((i) => chunks[i]!.chunk_text);
-      const embeddings = await embedBatch(textsToEmbed);
+      const embResult = await embedBatchMultiScale(textsToEmbed);
       for (let j = 0; j < needsEmbedIndexes.length; j++) {
         const i = needsEmbedIndexes[j]!;
-        chunks[i]!.embedding = embeddings[j]!;
+        chunks[i]!.embedding = embResult.embedding[j]!;
+        chunks[i]!.embedding_4096 = embResult.embedding_4096[j] ?? undefined;
         chunks[i]!.token_count = Math.ceil(chunks[i]!.chunk_text.length / 4);
       }
     } catch (e: unknown) {

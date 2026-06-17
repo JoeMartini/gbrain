@@ -118,6 +118,76 @@ export function getEmbeddingModelName(): string {
   return gatewayGetModel().split(':').slice(1).join(':') || 'text-embedding-3-large';
 }
 
+export interface MultiScaleEmbeddings {
+  /** Base/fast-recall embedding (matches configured dimensions, typically 1024). */
+  embedding: Float32Array[];
+  /** High-precision 4096-dim embedding for cascade rerank. */
+  embedding_4096: Float32Array[];
+  /** Whether each index has both vectors populated. */
+  has_full_vectors: boolean[];
+}
+
+/**
+ * v0-MULTISCALE: embed a batch in two dimensions simultaneously.
+ *
+ * Requests the base embedding (configured dimensions, usually 1024) and a
+ * 4096-dim version in parallel. If one request fails, the other is still
+ * returned so callers can degrade gracefully (e.g. fall back to base-only
+ * search). `has_full_vectors` flags which indices succeeded for both.
+ */
+export async function embedBatchMultiScale(
+  texts: string[],
+  options: EmbedBatchOptions = {},
+): Promise<MultiScaleEmbeddings> {
+  if (!texts || texts.length === 0) {
+    return { embedding: [], embedding_4096: [], has_full_vectors: [] };
+  }
+
+  const gwOpts = {
+    ...(options.abortSignal !== undefined && { abortSignal: options.abortSignal }),
+    ...(options.maxRetries !== undefined && { maxRetries: options.maxRetries }),
+  };
+
+  // Helper paginator to keep progress callbacks reasonable on large imports.
+  async function paginate(dimensions: number): Promise<Float32Array[]> {
+    if (texts.length <= BATCH_SIZE && !options.onBatchComplete) {
+      return gatewayEmbed(texts, { ...gwOpts, dimensions });
+    }
+    const results: Float32Array[] = [];
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const slice = texts.slice(i, i + BATCH_SIZE);
+      const out = await gatewayEmbed(slice, { ...gwOpts, dimensions });
+      results.push(...out);
+      // Progress callback fires on the base pass only to avoid double counting.
+      if (dimensions === 1024) {
+        options.onBatchComplete?.(results.length, texts.length);
+      }
+    }
+    return results;
+  }
+
+  const [baseResult, highResult] = await Promise.allSettled([
+    paginate(gatewayGetDims()),
+    paginate(4096),
+  ]);
+
+  const embedding = baseResult.status === 'fulfilled' ? baseResult.value : [];
+  const embedding_4096 = highResult.status === 'fulfilled' ? highResult.value : [];
+
+  if (baseResult.status === 'rejected') {
+    console.warn(`[embedBatchMultiScale] base embedding failed: ${baseResult.reason}`);
+  }
+  if (highResult.status === 'rejected') {
+    console.warn(`[embedBatchMultiScale] high-dim embedding failed: ${highResult.reason}`);
+  }
+
+  const has_full_vectors = texts.map((_, i) =>
+    !!embedding[i] && !!embedding_4096[i],
+  );
+
+  return { embedding, embedding_4096, has_full_vectors };
+}
+
 /** Currently-configured embedding dimensions. */
 export function getEmbeddingDimensions(): number {
   return gatewayGetDims();

@@ -20,6 +20,7 @@
 import type { BrainEngine } from './engine.ts';
 import type { ChunkInput } from './types.ts';
 import { embedBatchWithBackoff } from '../commands/embed.ts';
+import type { MultiScaleEmbeddings } from './embedding.ts';
 
 /** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
@@ -50,7 +51,7 @@ export interface EmbedStaleOpts {
    * Test seam: lets unit tests inject a deterministic fake without mocking
    * the gateway. Production callers leave it unset.
    */
-  embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[]>;
+  embedFn?: (texts: string[], opts: { abortSignal?: AbortSignal }) => Promise<Float32Array[] | MultiScaleEmbeddings>;
   /**
    * v0.41.31: current embedding provenance signature (`<provider:model>:<dims>`).
    * When set, embeddings stamped under a DIFFERENT signature are invalidated
@@ -103,8 +104,9 @@ export async function embedStaleForSource(
   const batchSize = opts.batchSize ?? 2000;
   const concurrency = opts.concurrency ?? 20;
   const signal = opts.signal;
+  // v0-MULTISCALE: backfill with both base + 4096 embeddings.
   const embedFn = opts.embedFn ?? ((texts, fnOpts) =>
-    embedBatchWithBackoff(texts, { abortSignal: fnOpts.abortSignal }));
+    import('../commands/embed.ts').then(m => m.embedBatchMultiScaleWithBackoff(texts, { abortSignal: fnOpts.abortSignal })));
 
   let afterPageId = opts.cursor?.afterPageId ?? 0;
   let afterChunkIndex = opts.cursor?.afterChunkIndex ?? -1;
@@ -173,20 +175,28 @@ export async function embedStaleForSource(
       const keySourceId = stale[0]?.source_id ?? sourceId;
       const slug = stale[0].slug;
       try {
-        const embeddings = await embedFn(
+        const embedResult = await embedFn(
           stale.map((c) => c.chunk_text),
           { abortSignal: signal },
         );
+        const isMulti = embedResult && typeof embedResult === 'object' && 'embedding_4096' in embedResult;
+        const baseEmbeddings = isMulti ? (embedResult as MultiScaleEmbeddings).embedding : (embedResult as Float32Array[]);
+        const hiEmbeddings = isMulti ? (embedResult as MultiScaleEmbeddings).embedding_4096 : undefined;
         const existing = await engine.getChunks(slug, { sourceId: keySourceId });
         const staleIdxToEmbedding = new Map<number, Float32Array>();
+        const staleIdxToEmbedding4096 = new Map<number, Float32Array>();
         for (let j = 0; j < stale.length; j++) {
-          staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
+          staleIdxToEmbedding.set(stale[j].chunk_index, baseEmbeddings[j]);
+          if (hiEmbeddings) {
+            staleIdxToEmbedding4096.set(stale[j].chunk_index, hiEmbeddings[j]);
+          }
         }
         const merged: ChunkInput[] = existing.map((c) => ({
           chunk_index: c.chunk_index,
           chunk_text: c.chunk_text,
           chunk_source: c.chunk_source,
           embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
+          embedding_4096: staleIdxToEmbedding4096.get(c.chunk_index) ?? undefined,
           token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
         }));
         await engine.upsertChunks(slug, merged, { sourceId: keySourceId });

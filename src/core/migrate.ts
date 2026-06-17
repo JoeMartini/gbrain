@@ -5270,6 +5270,31 @@ export const MIGRATIONS: Migration[] = [
         ON context_volunteer_events (source_id, slug);
     `,
   },
+  {
+    version: 118,
+    name: 'multiscale_embedding_4096',
+    // v0-MULTISCALE: add high-precision 4096-dim embedding column for cascade
+    // rerank. The base `embedding` column (<=2000 dims, HNSW-indexed) remains
+    // the fast-recall vector; `embedding_4096` is populated in parallel and
+    // used for exact-scan reranking over a small candidate set.
+    idempotent: true,
+    sql: `
+      ALTER TABLE content_chunks
+        ADD COLUMN IF NOT EXISTS embedding_4096 vector(4096),
+        ADD COLUMN IF NOT EXISTS has_full_vectors boolean NOT NULL DEFAULT false;
+      CREATE INDEX IF NOT EXISTS idx_chunks_missing_4096
+        ON content_chunks(page_id, chunk_index) WHERE embedding_4096 IS NULL;
+    `,
+    verify: async (engine) => {
+      const col = await engine.executeRaw<{ exists: boolean }>(`
+        SELECT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'content_chunks' AND column_name = 'embedding_4096'
+        ) AS exists
+      `);
+      return col.length > 0 && col[0].exists;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -562,6 +562,10 @@ export interface Chunk {
   chunk_text: string;
   chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code';
   embedding: Float32Array | null;
+  /** v0-MULTISCALE: high-precision 4096-dim embedding for cascade rerank. */
+  embedding_4096?: Float32Array | null;
+  /** v0-MULTISCALE: true when both base and 4096 embeddings are present. */
+  has_full_vectors?: boolean;
   model: string;
   token_count: number | null;
   embedded_at: Date | null;
@@ -635,6 +639,8 @@ export interface ChunkInput {
    */
   chunk_source: 'compiled_truth' | 'timeline' | 'fenced_code' | 'image_asset';
   embedding?: Float32Array;
+  /** v0-MULTISCALE: optional 4096-dim embedding for cascade rerank. */
+  embedding_4096?: Float32Array;
   model?: string;
   token_count?: number;
   /**
