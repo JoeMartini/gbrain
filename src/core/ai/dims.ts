@@ -220,6 +220,12 @@ export function dimsProviderOptions(
       if (modelId === 'text-embedding-v3' || modelId === 'embedding-3') {
         return { openaiCompatible: { dimensions: dims } };
       }
+      // SiliconFlow Qwen3 family is Matryoshka (64..4096 dims). Without
+      // dimensions passthrough the provider always returns 4096, which breaks
+      // brains configured for a smaller HNSW-friendly width.
+      if (modelId === 'Qwen/Qwen3-Embedding-8B' || modelId.startsWith('Qwen/Qwen3-Embedding')) {
+        return { openaiCompatible: { dimensions: dims } };
+      }
       // MiniMax embo-01 takes a `type: 'db' | 'query'` field for asymmetric
       // retrieval. Today still hardcoded to 'db' for back-compat — opting
       // into the new inputType seam is a follow-up (see plan's deferred
