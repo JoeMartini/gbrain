@@ -41,3 +41,9 @@ test/fixtures/pglite-snapshot.version
 
 # Private brain reports — never check these in (per CLAUDE.md privacy rule)
 reports/network-intelligence/
+
+# Runtime brain data directory
+.gbrain/
+
+# npm lockfile — gbrain uses bun.lock
+package-lock.json
