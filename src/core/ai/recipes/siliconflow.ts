@@ -37,6 +37,8 @@ export const siliconflow: Recipe = {
       ],
       default_dims: 4096,
       dims_options: [64, 128, 256, 512, 768, 1024, 2048, 4096],
+      supports_multimodal: true,
+      multimodal_models: ['Qwen/Qwen3-VL-Embedding-8B'],
       cost_per_1m_tokens_usd: 0.0, // SiliconFlow embedding is currently free
       price_last_verified: '2026-05-31',
       max_batch_tokens: 300_000,

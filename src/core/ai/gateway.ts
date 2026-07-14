@@ -1754,6 +1754,9 @@ export async function embedMultimodal(
   // /embeddings endpoint with multimodal content arrays. The Voyage
   // recipe is `openai-compat` per tier but uses its own /multimodalembeddings
   // path, so we still branch on recipe.id for that one.
+  if (recipe.id === 'siliconflow') {
+    return embedMultimodalSiliconflow(inputs, recipe, parsed.modelId, cfg, opts);
+  }
   if (recipe.id !== 'voyage' && recipe.implementation === 'openai-compatible') {
     return embedMultimodalOpenAICompat(inputs, recipe, parsed.modelId, cfg, opts);
   }
@@ -1869,6 +1872,110 @@ export async function embedMultimodal(
       }
       allEmbeddings.push(new Float32Array(row.embedding));
     }
+  }
+
+  return allEmbeddings;
+}
+
+/**
+ * SiliconFlow multimodal embedding path.
+ *
+ * SiliconFlow's /v1/embeddings endpoint accepts Matryoshka dimensions and
+ * mixed text/image input, but its multimodal content shape is NOT the
+ * OpenAI content-array format: images must be passed as
+ * `{image: "data:<mime>;base64,<bytes>"}` and text can be passed as a
+ * plain string or `{text: "..."}`. gbrain's image chunks land in the
+ * dedicated `embedding_image` column, which is fixed at 1024 dims, so we
+ * request 1024 here and let the async backfill service generate 2048/4096
+ * variants into the new embedding_2048 / embedding columns.
+ */
+async function embedMultimodalSiliconflow(
+  inputs: MultimodalInput[],
+  recipe: Recipe,
+  modelId: string,
+  cfg: AIGatewayConfig,
+  _opts: EmbedMultimodalOpts = {},
+): Promise<Float32Array[]> {
+  const targetDims = 1024;
+
+  const authResult = recipe.resolveAuth
+    ? recipe.resolveAuth(cfg.env)
+    : defaultResolveAuth(recipe, cfg.env, 'embedding');
+
+  const baseUrl = cfg.base_urls?.[recipe.id] ?? recipe.base_url_default;
+  if (!baseUrl) {
+    throw new AIConfigError(
+      `${recipe.name} requires a base URL for multimodal embedding.`,
+      recipe.setup_hint,
+    );
+  }
+
+  const allEmbeddings: Float32Array[] = [];
+  for (const input of inputs) {
+    const body: Record<string, unknown> = {
+      model: modelId,
+      input: input.kind === 'text'
+        ? input.text
+        : [{ image: `data:${input.mime};base64,${input.data}` }],
+    };
+    if (targetDims > 0) {
+      body.dimensions = targetDims;
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(`${baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [authResult.headerName]: authResult.token,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(AI_MULTIMODAL_TIMEOUT_MS),
+      });
+    } catch (err) {
+      throw normalizeAIError(err, `embedMultimodalSiliconflow(${recipe.id}:${modelId})`);
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 401 || res.status === 403) {
+        const requiredKey = recipe.auth_env?.required[0];
+        throw new AIConfigError(
+          `${recipe.name} multimodal returned ${res.status}: ${text || 'auth failed'}.`,
+          requiredKey
+            ? `Re-export ${requiredKey} or rotate the key at ${recipe.auth_env?.setup_url ?? recipe.setup_hint}.`
+            : recipe.setup_hint,
+        );
+      }
+      throw new AITransientError(
+        `${recipe.name} multimodal returned ${res.status}: ${text || 'transient error'}.`,
+      );
+    }
+
+    let parsedBody: { data?: Array<{ embedding: number[] }> };
+    try {
+      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }> };
+    } catch (err) {
+      throw new AITransientError(
+        `${recipe.name} multimodal returned malformed JSON: ${err instanceof Error ? err.message : String(err)}.`,
+      );
+    }
+    if (!parsedBody.data || !Array.isArray(parsedBody.data) || parsedBody.data.length < 1) {
+      throw new AITransientError(`${recipe.name} multimodal returned no embeddings (expected 1).`);
+    }
+
+    const row = parsedBody.data[0];
+    if (!Array.isArray(row.embedding)) {
+      throw new AITransientError(`${recipe.name} multimodal returned non-array embedding payload.`);
+    }
+    if (row.embedding.length !== targetDims) {
+      throw new AIConfigError(
+        `${recipe.id}:${modelId} returned ${row.embedding.length}-dim vector; expected ${targetDims}.`,
+        `The image embedding column is fixed at ${targetDims} dims.`,
+      );
+    }
+    allEmbeddings.push(new Float32Array(row.embedding));
   }
 
   return allEmbeddings;
