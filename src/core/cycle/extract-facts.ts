@@ -255,12 +255,22 @@ export async function runExtractFacts(
         const texts = extracted.map(e => e.fact);
         // #1972: forward the abort signal so a cancelled cycle's in-flight
         // batch embed (a network call) is itself abortable, not just the loop.
-        const embeddings = await embed(texts, { abortSignal: opts.signal });
+        // v0.42.x (martini fork): generate both full-precision (4096d) and
+        // HNSW-compatible (2048d) embeddings in parallel. The full vector goes
+        // to facts.embedding; the 2048-dim vector goes to facts.embedding_2048
+        // for fast approximate recall.
+        const [embeddings, embeddings2048] = await Promise.all([
+          embed(texts, { abortSignal: opts.signal }),
+          embed(texts, { abortSignal: opts.signal, dimensions: 2048 }),
+        ]);
         // Defensive: embed should return one vector per input; if the
         // gateway returns a partial array (provider partial-batch retry
         // returning fewer than requested), only fill what we have.
         for (let i = 0; i < extracted.length && i < embeddings.length; i++) {
           extracted[i].embedding = embeddings[i];
+        }
+        for (let i = 0; i < extracted.length && i < embeddings2048.length; i++) {
+          extracted[i].embedding_2048 = embeddings2048[i];
         }
       } catch (err) {
         // Embedding failure is non-fatal — facts still get inserted, just

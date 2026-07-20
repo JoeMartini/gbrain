@@ -5505,6 +5505,47 @@ export const MIGRATIONS: Migration[] = [
         WHERE dimension IS NOT NULL;
     `,
   },
+  {
+    version: 123,
+    name: 'facts_embedding_2048_hnsw',
+    // v0.42.x (martini fork): add an HNSW-compatible 2048-dim embedding
+    // column alongside the full-precision facts.embedding. The 4096-dim
+    // column is retained for exact rescoring; this column feeds fast
+    // approximate recall on facts. HALFVEC is used on pgvector >= 0.7 to
+    // keep the index small; older pgvector falls back to VECTOR.
+    sql: '',
+    handler: async (engine) => {
+      let useHalfvec = true;
+      if (engine.kind === 'postgres') {
+        try {
+          const vrows = await engine.executeRaw<{ extversion: string }>(
+            `SELECT extversion FROM pg_extension WHERE extname = 'vector'`,
+          );
+          if (vrows.length > 0) {
+            const v = vrows[0].extversion;
+            const parts = v.split('.');
+            const major = parseInt(parts[0] ?? '0', 10);
+            const minor = parseInt(parts[1] ?? '0', 10);
+            if (major === 0 && minor < 7) {
+              useHalfvec = false;
+            }
+          }
+        } catch {
+          // probe failed — fall back to halfvec-safe DDL below
+        }
+      }
+      const vecType = useHalfvec ? 'HALFVEC' : 'VECTOR';
+      const opclass = useHalfvec ? 'halfvec_cosine_ops' : 'vector_cosine_ops';
+      await engine.runMigration(123, `
+        ALTER TABLE facts
+          ADD COLUMN IF NOT EXISTS embedding_2048 ${vecType}(2048);
+
+        CREATE INDEX IF NOT EXISTS idx_facts_embedding_2048_hnsw
+          ON facts USING hnsw (embedding_2048 ${opclass})
+          WHERE embedding_2048 IS NOT NULL AND expired_at IS NULL;
+      `);
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

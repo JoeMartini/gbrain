@@ -32,6 +32,7 @@ function fact(entity_slug: string | null, id = 0): FactRow {
     source_session: null,
     confidence: 0.5,
     embedding: null,
+    embedding_2048: null,
     embedded_at: null,
     created_at: new Date(0),
   };

@@ -16,7 +16,7 @@ function makeFact(overrides: Partial<FactRow> = {}): FactRow {
     valid_from: new Date(), valid_until: null, expired_at: null,
     superseded_by: null, consolidated_at: null, consolidated_into: null,
     source: 'test', source_session: null, confidence: 1.0,
-    embedding: null, embedded_at: null, created_at: new Date(),
+    embedding: null, embedding_2048: null, embedded_at: null, created_at: new Date(),
     ...overrides,
   };
 }

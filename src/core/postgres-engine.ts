@@ -3880,12 +3880,16 @@ export class PostgresEngine implements BrainEngine {
     const context = input.context ?? null;
     const sourceSession = input.source_session ?? null;
     const embedding = input.embedding ?? null;
+    const embedding2048 = input.embedding_2048 ?? null;
     const embeddedAt = embedding ? new Date() : null;
     const embedLit = embedding ? toPgVectorLiteral(embedding) : null;
+    const embed2048Lit = embedding2048 ? toPgVectorLiteral(embedding2048) : null;
     // v0.41.15.0 (T6, codex #20): match cast to actual column type so
     // a halfvec(N) column doesn't pay an implicit-cast round-trip + can
     // run on pgvector versions that lack the auto vector→halfvec cast.
+    // v0.42.x (martini fork): the second column is always HALFVEC(2048).
     const castSuffix = await this.resolveFactsEmbeddingCast();
+    const cast2048Suffix = '::halfvec';
     // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
     const claimMetric = input.claim_metric ?? null;
     const claimValue  = input.claim_value  ?? null;
@@ -3903,12 +3907,14 @@ export class PostgresEngine implements BrainEngine {
           INSERT INTO facts (
             source_id, entity_slug, fact, kind, visibility, notability, context,
             valid_from, valid_until, source, source_session, confidence,
-            embedding, embedded_at,
+            embedding, embedding_2048, embedded_at,
             claim_metric, claim_value, claim_unit, claim_period
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
-            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
+            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)},
+            ${embed2048Lit === null ? null : tx.unsafe(`'${embed2048Lit}'${cast2048Suffix}`)},
+            ${embeddedAt},
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
           ) RETURNING id
         `;
@@ -3929,12 +3935,14 @@ export class PostgresEngine implements BrainEngine {
         INSERT INTO facts (
           source_id, entity_slug, fact, kind, visibility, notability, context,
           valid_from, valid_until, source, source_session, confidence,
-          embedding, embedded_at,
+          embedding, embedding_2048, embedded_at,
           claim_metric, claim_value, claim_unit, claim_period
         ) VALUES (
           ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
           ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
-          ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
+          ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)},
+          ${embed2048Lit === null ? null : tx.unsafe(`'${embed2048Lit}'${cast2048Suffix}`)},
+          ${embeddedAt},
           ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
         ) RETURNING id
       `;
@@ -4017,7 +4025,9 @@ export class PostgresEngine implements BrainEngine {
     // v0.41.15.0 (T6, codex #20): resolve the embedding-cast suffix
     // ONCE per process so the cast matches the actual column type
     // (halfvec vs vector). The probe is cached after first call.
+    // v0.42.x (martini fork): the second column is always HALFVEC(2048).
     const castSuffix = await this.resolveFactsEmbeddingCast();
+    const cast2048Suffix = '::halfvec';
     // Single transaction so the v51 partial UNIQUE index can roll back
     // the whole batch on constraint violation. Per-row INSERTs (not
     // multi-row VALUES) keep the embedding-vs-no-embedding branching
@@ -4037,8 +4047,10 @@ export class PostgresEngine implements BrainEngine {
         const context = input.context ?? null;
         const sourceSession = input.source_session ?? null;
         const embedding = input.embedding ?? null;
+        const embedding2048 = input.embedding_2048 ?? null;
         const embeddedAt = embedding ? new Date() : null;
         const embedLit = embedding ? toPgVectorLiteral(embedding) : null;
+        const embed2048Lit = embedding2048 ? toPgVectorLiteral(embedding2048) : null;
         // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
         const claimMetric = input.claim_metric ?? null;
         const claimValue  = input.claim_value  ?? null;
@@ -4051,14 +4063,16 @@ export class PostgresEngine implements BrainEngine {
           INSERT INTO facts (
             source_id, entity_slug, fact, kind, visibility, notability, context,
             valid_from, valid_until, source, source_session, confidence,
-            embedding, embedded_at,
+            embedding, embedding_2048, embedded_at,
             row_num, source_markdown_slug,
             claim_metric, claim_value, claim_unit, claim_period,
             event_type
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
-            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)}, ${embeddedAt},
+            ${embedLit === null ? null : tx.unsafe(`'${embedLit}'${castSuffix}`)},
+            ${embed2048Lit === null ? null : tx.unsafe(`'${embed2048Lit}'${cast2048Suffix}`)},
+            ${embeddedAt},
             ${input.row_num}, ${input.source_markdown_slug},
             ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
             ${eventType}
@@ -6023,22 +6037,28 @@ interface FactRowSqlShape {
   source_session: string | null;
   confidence: number | string;
   embedding: string | number[] | Float32Array | null;
+  /** v0.42.x (martini fork): HNSW-compatible 2048-dim embedding column. */
+  embedding_2048: string | number[] | Float32Array | null;
   embedded_at: Date | null;
   created_at: Date;
 }
 
 function rowToFactPg(row: FactRowSqlShape): FactRow {
-  let embedding: Float32Array | null = null;
-  if (row.embedding != null) {
-    if (row.embedding instanceof Float32Array) embedding = row.embedding;
-    else if (Array.isArray(row.embedding)) embedding = new Float32Array(row.embedding);
-    else if (typeof row.embedding === 'string') {
-      const trimmed = row.embedding.trim();
+  const parseEmbedding = (raw: unknown): Float32Array | null => {
+    if (raw == null) return null;
+    if (raw instanceof Float32Array) return raw;
+    if (Array.isArray(raw)) return new Float32Array(raw);
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
       const inner = trimmed.startsWith('[') ? trimmed.slice(1, -1) : trimmed;
       const parts = inner.split(',').map(p => parseFloat(p.trim())).filter(Number.isFinite);
-      embedding = parts.length > 0 ? new Float32Array(parts) : null;
+      return parts.length > 0 ? new Float32Array(parts) : null;
     }
-  }
+    return null;
+  };
+  const embedding = parseEmbedding(row.embedding);
+  const embedding_2048 = parseEmbedding(row.embedding_2048);
+
   return {
     id: Number(row.id),
     source_id: row.source_id,
@@ -6062,6 +6082,7 @@ function rowToFactPg(row: FactRowSqlShape): FactRow {
     source_session: row.source_session,
     confidence: typeof row.confidence === 'string' ? parseFloat(row.confidence) : row.confidence,
     embedding,
+    embedding_2048,
     embedded_at: row.embedded_at,
     created_at: row.created_at,
   };

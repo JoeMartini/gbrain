@@ -490,6 +490,12 @@ export interface FactRow {
   source_session: string | null;
   confidence: number;
   embedding: Float32Array | null;
+  /**
+   * v0.42.x (martini fork): HNSW-compatible (2048d) embedding stored
+   * alongside the full-precision `embedding`. Returned so callers can
+   * choose approximate vs exact retrieval strategies.
+   */
+  embedding_2048: Float32Array | null;
   embedded_at: Date | null;
   created_at: Date;
 }
@@ -507,7 +513,16 @@ export interface NewFact {
   source_session?: string | null;
   confidence?: number;                  // [0,1], default 1.0
   notability?: 'high' | 'medium' | 'low'; // salience filter for extraction gate
-  embedding?: Float32Array | null;     // pre-computed; if null, insertFact computes via gateway
+  embedding?: Float32Array | null;     // pre-computed full-precision (4096d); if null, insertFact computes via gateway
+  /**
+   * v0.42.x (martini fork): pre-computed HNSW-compatible (2048d) embedding.
+   * When provided alongside `embedding`, both columns are written so recall
+   * can use the HNSW-indexed `embedding_2048` column for speed while the
+   * full `embedding` remains available for exact rescoring. If null but
+   * `embedding` is set, insertFact derives it by requesting dims=2048 from
+   * the gateway.
+   */
+  embedding_2048?: Float32Array | null;
   /**
    * v0.35.4 (D-CDX-5) — typed-claim fields. Optional. When populated,
    * `gbrain eval trajectory` + `find_trajectory` MCP op consume them for

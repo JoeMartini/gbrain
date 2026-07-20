@@ -511,6 +511,7 @@ function remoteFactToRow(o: Record<string, unknown>): FactRow {
     source_session: typeof o.source_session === 'string' ? o.source_session : null,
     confidence: typeof o.confidence === 'number' ? o.confidence : 0.5,
     embedding: null,
+    embedding_2048: null,
     embedded_at: null,
     created_at: parseMaybeDate(o.created_at) ?? new Date(0),
   };

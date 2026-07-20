@@ -3847,8 +3847,10 @@ export class PGLiteEngine implements BrainEngine {
     const context = input.context ?? null;
     const sourceSession = input.source_session ?? null;
     const embedding = input.embedding ?? null;
+    const embedding2048 = input.embedding_2048 ?? null;
     const embeddedAt = embedding ? new Date() : null;
     const embedStr = embedding ? toPgVectorLiteral(embedding) : null;
+    const embed2048Str = embedding2048 ? toPgVectorLiteral(embedding2048) : null;
     // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
     const claimMetric = input.claim_metric ?? null;
     const claimValue  = input.claim_value  ?? null;
@@ -3864,26 +3866,26 @@ export class PGLiteEngine implements BrainEngine {
             ? `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
-                 embedding, embedded_at,
+                 embedding, embedding_2048, embedded_at,
                  claim_metric, claim_value, claim_unit, claim_period
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                 NULL, NULL,
+                 NULL, NULL, NULL,
                  $13, $14, $15, $16
                ) RETURNING id`
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
-                 embedding, embedded_at,
+                 embedding, embedding_2048, embedded_at,
                  claim_metric, claim_value, claim_unit, claim_period
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                 $13::vector, $14,
-                 $15, $16, $17, $18
+                 $13::vector, $14::halfvec, $15,
+                 $16, $17, $18, $19
                ) RETURNING id`,
           embedStr === null
             ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embed2048Str, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
         );
         const newId = ins.rows[0].id;
         await tx.query(
@@ -3901,26 +3903,26 @@ export class PGLiteEngine implements BrainEngine {
         ? `INSERT INTO facts (
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
-             embedding, embedded_at,
+             embedding, embedding_2048, embedded_at,
              claim_metric, claim_value, claim_unit, claim_period
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-             NULL, NULL,
+             NULL, NULL, NULL,
              $13, $14, $15, $16
            ) RETURNING id`
         : `INSERT INTO facts (
              source_id, entity_slug, fact, kind, visibility, notability, context,
              valid_from, valid_until, source, source_session, confidence,
-             embedding, embedded_at,
+             embedding, embedding_2048, embedded_at,
              claim_metric, claim_value, claim_unit, claim_period
            ) VALUES (
              $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-             $13::vector, $14,
-             $15, $16, $17, $18
+             $13::vector, $14::halfvec, $15,
+             $16, $17, $18, $19
            ) RETURNING id`,
       embedStr === null
         ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, claimMetric, claimValue, claimUnit, claimPeriod]
-        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
+        : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embed2048Str, embeddedAt, claimMetric, claimValue, claimUnit, claimPeriod],
     );
     return { id: ins.rows[0].id, status: 'inserted' };
   }
@@ -3959,8 +3961,10 @@ export class PGLiteEngine implements BrainEngine {
         const context = input.context ?? null;
         const sourceSession = input.source_session ?? null;
         const embedding = input.embedding ?? null;
+        const embedding2048 = input.embedding_2048 ?? null;
         const embeddedAt = embedding ? new Date() : null;
         const embedStr = embedding ? toPgVectorLiteral(embedding) : null;
+        const embed2048Str = embedding2048 ? toPgVectorLiteral(embedding2048) : null;
         // v0.35.4 (D-CDX-5) — typed-claim columns. All four nullable.
         const claimMetric = input.claim_metric ?? null;
         const claimValue  = input.claim_value  ?? null;
@@ -3978,13 +3982,13 @@ export class PGLiteEngine implements BrainEngine {
             ? `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
-                 embedding, embedded_at,
+                 embedding, embedding_2048, embedded_at,
                  row_num, source_markdown_slug,
                  claim_metric, claim_value, claim_unit, claim_period,
                  event_type
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                 NULL, $13,
+                 NULL, NULL, $13,
                  $14, $15,
                  $16, $17, $18, $19,
                  $20
@@ -3992,20 +3996,20 @@ export class PGLiteEngine implements BrainEngine {
             : `INSERT INTO facts (
                  source_id, entity_slug, fact, kind, visibility, notability, context,
                  valid_from, valid_until, source, source_session, confidence,
-                 embedding, embedded_at,
+                 embedding, embedding_2048, embedded_at,
                  row_num, source_markdown_slug,
                  claim_metric, claim_value, claim_unit, claim_period,
                  event_type
                ) VALUES (
                  $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
-                 $13::vector, $14,
-                 $15, $16,
-                 $17, $18, $19, $20,
-                 $21
+                 $13::vector, $14::halfvec, $15,
+                 $16, $17,
+                 $18, $19, $20, $21,
+                 $22
                ) RETURNING id`,
           embedStr === null
             ? [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType]
-            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType],
+            : [ctx.source_id, entitySlug, input.fact, kind, visibility, notability, context, validFrom, validUntil, input.source, sourceSession, confidence, embedStr, embed2048Str, embeddedAt, input.row_num, input.source_markdown_slug, claimMetric, claimValue, claimUnit, claimPeriod, eventType],
         );
         out.push(ins.rows[0].id);
       }
@@ -5906,6 +5910,8 @@ interface FactRowSqlShape {
   source_session: string | null;
   confidence: number;
   embedding: string | number[] | Float32Array | null;
+  /** v0.42.x (martini fork): HNSW-compatible 2048-dim embedding column. */
+  embedding_2048: string | number[] | Float32Array | null;
   embedded_at: Date | string | null;
   created_at: Date | string;
 }
@@ -5917,18 +5923,22 @@ function toDate(v: Date | string | null): Date | null {
 }
 
 function rowToFact(row: FactRowSqlShape): FactRow {
-  let embedding: Float32Array | null = null;
-  if (row.embedding != null) {
-    if (row.embedding instanceof Float32Array) embedding = row.embedding;
-    else if (Array.isArray(row.embedding)) embedding = new Float32Array(row.embedding);
-    else if (typeof row.embedding === 'string') {
+  const parseEmbedding = (raw: unknown): Float32Array | null => {
+    if (raw == null) return null;
+    if (raw instanceof Float32Array) return raw;
+    if (Array.isArray(raw)) return new Float32Array(raw);
+    if (typeof raw === 'string') {
       // pgvector text format: "[0.1,0.2,...]"
-      const trimmed = row.embedding.trim();
+      const trimmed = raw.trim();
       const inner = trimmed.startsWith('[') ? trimmed.slice(1, -1) : trimmed;
       const parts = inner.split(',').map(p => parseFloat(p.trim())).filter(Number.isFinite);
-      embedding = parts.length > 0 ? new Float32Array(parts) : null;
+      return parts.length > 0 ? new Float32Array(parts) : null;
     }
-  }
+    return null;
+  };
+  const embedding = parseEmbedding(row.embedding);
+  const embedding_2048 = parseEmbedding(row.embedding_2048);
+
   return {
     id: Number(row.id),
     source_id: row.source_id,
@@ -5950,6 +5960,7 @@ function rowToFact(row: FactRowSqlShape): FactRow {
     source_session: row.source_session,
     confidence: Number(row.confidence),
     embedding,
+    embedding_2048,
     embedded_at: toDate(row.embedded_at),
     created_at: toDate(row.created_at)!,
   };
