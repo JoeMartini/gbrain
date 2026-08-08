@@ -1,5 +1,34 @@
 # TODOS
 
+## serve --http takes-holders + agent-voice hardening follow-ups (filed v0.42.74.0)
+
+Deferred from the #2529/#2477 security-fix wave (plan-eng-review + codex outside
+voice CLEARED). None block the wave.
+
+- [ ] **P2 — Per-OAuth-client `takes_holders` storage (#2529 follow-up).** Legacy
+  bearer tokens honor `access_tokens.permissions.takes_holders` through
+  `verifyAccessToken`; OAuth clients have no equivalent column on `oauth_clients`,
+  so OAuth-minted tokens fail closed to `['world']`. Needs a schema migration
+  (`oauth_clients.takes_holders` JSONB or TEXT[]) + a `register-client` flag +
+  the `verifyAccessToken` JOIN projection. Include surfacing the EFFECTIVE
+  takes-holder scope in `whoami` output as part of this follow-up, so operators
+  can self-diagnose the legacy-vs-OAuth semantic split instead of reading docs.
+  Where: `src/schema.sql`, `src/core/migrate.ts`, `src/core/oauth-provider.ts`,
+  `src/commands/auth.ts`, `src/core/operations.ts` (whoami).
+- [ ] **P3 — agent-voice Host-header allowlist (DNS-rebinding hardening).** The
+  #2477 fix ships default-deny CORS + an Origin gate on `/session`/`/tool`, but
+  the gate derives self-origin from the `Host` header, so a DNS-rebound page
+  (attacker origin whose host resolves to the operator's loopback) still passes.
+  Validate `Host` against `localhost`/`127.0.0.1`/operator-configured hosts and
+  403 otherwise; slots beside `originAllowed()` in the router. Issue #2477
+  explicitly deferred this. Where: `recipes/agent-voice/code/server.mjs`.
+- [ ] **P3 — Debounce `last_used_at` in the oauth-provider legacy path.** The
+  legacy branch of `verifyAccessToken` fires an unconditional
+  `UPDATE access_tokens SET last_used_at = now()` on EVERY request, while the
+  legacy HTTP transport debounces the same write to once per 60s via a WHERE
+  clause (`src/mcp/http-transport.ts` validateToken). Apply the same pattern —
+  one fewer write per request on the `serve --http` hot path.
+  Where: `src/core/oauth-provider.ts`.
 ## v0.42.67.0 follow-ups (Windows build tooling)
 
 Filed as follow-ups from v0.42.67.0 (`.gitattributes` LF pin for `*.sh` +
@@ -2580,7 +2609,7 @@ contributor traps.
 
 - [ ] **v0.37.x: Adopt `resolveDefaultHeaders` for Together / Groq / other attribution-bearing recipes.** v0.37.6.0's `default_headers` / `resolveDefaultHeaders` seam is generic — any recipe whose provider benefits from app-attribution headers can opt in. Together and Groq both have rankings/analytics tied to per-app headers. Add their respective attribution headers to each recipe, similar to OR's `HTTP-Referer` + `X-OpenRouter-Title`. No type-system or gateway changes needed; just `default_headers` blocks on the existing recipes plus `<PROVIDER>_REFERER` / `<PROVIDER>_TITLE` env vars in their `auth_env.optional`. Filed during v0.37.6.0 eng review as a D4 generalization opportunity.
 
-- [ ] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
+- [x] **v0.37.x: Guard cli.ts `main()` so importing `buildGatewayConfig` doesn't print help.** v0.37.6.0 exported `buildGatewayConfig` from `src/cli.ts` for test access. Importing it triggers the file's top-level `main()` which prints help to stdout during tests — functionally harmless (tests pass) but noisy. Fix: wrap `main()` in `if (import.meta.main)` so it only runs when cli.ts is the entry point, not when imported. Touches one line; trivial. Filed during v0.37.6.0 implementation.
 
 
 ## v0.37.4.0 pgGraph CI scaffolding follow-ups (v0.37.x+)
