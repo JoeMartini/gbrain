@@ -130,9 +130,14 @@ export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
   'memory_verbs_usage',
   'resolver_health',
   'retrieval_reflex_health',
+  // Harness hook adapters: per-channel push-context visibility (sibling of
+  // retrieval_reflex_health — same "is my agent's context wiring live?" question).
+  'volunteer_channels',
   'skill_brain_first',
   'skill_conformance',
   'skills_manifest_integrity',
+  'skill_currency',
+  'skill_preconditions',
   'whoknows_health',
 ]);
 
@@ -147,6 +152,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'bootstrap_hooks_heartbeat',
   'bootstrap_last_verify',
   'bootstrap_push_health',
+  'bootstrap_durability_job',
   'bootstrap_runbook_skew',
   'bootstrap_serve_lock',
   'batch_retry_health',
@@ -161,6 +167,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'pgbouncer_prepare',
   'pglite_data_dir',
+  'pglite_leftovers',
   'pgvector',
   'pool_budget',
   'progressive_batch_audit_health',

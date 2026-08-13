@@ -209,6 +209,12 @@ for (const op of operations) {
 // GBRAIN_SKIP_STARTUP_HOOKS for any children they spawn.
 const STARTUP_HOOK_SKIP_COMMANDS = new Set([
   'upgrade', 'post-upgrade', 'check-update', 'self-upgrade',
+  // hook runs once per harness EVENT (user-prompt fires per prompt): a stale
+  // update cache would spawn a detached network-touching check-update child
+  // per prompt and emit UPGRADE_AVAILABLE stderr per turn. NOTE: this path
+  // no-ops under NODE_ENV=test, so membership is pinned by a source grep
+  // (test/hook-command.serial.test.ts), not a runtime test.
+  'hook',
 ]);
 
 /**
@@ -2243,6 +2249,18 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       refuseThinClient('jobs', cfgJobs!.remote_mcp!.mcp_url);
     }
+  }
+
+  // Autopilot status + uninstall are filesystem-only verdicts and MUST stay
+  // engine-free: a running PGLite daemon holds the exclusive DB lock, so an
+  // engine-bound status would fail to connect in exactly the scenarios the
+  // exit-code contract exists to diagnose (live daemon, DB outage). Order
+  // mirrors runAutopilot's own flag precedence (uninstall before status).
+  if (command === 'autopilot' && (args.includes('--uninstall') || args.includes('--status'))) {
+    const { runAutopilotStatus, uninstallDaemon } = await import('./commands/autopilot.ts');
+    if (args.includes('--uninstall')) uninstallDaemon();
+    else runAutopilotStatus(args);
+    return;
   }
 
   // All remaining CLI-only commands need a DB connection

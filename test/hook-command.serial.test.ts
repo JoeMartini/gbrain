@@ -8,7 +8,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
   copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
-  rmSync, utimesSync, writeFileSync,
+  rmSync, statSync, utimesSync, writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
 import { execFileSync } from 'node:child_process';
@@ -23,8 +23,10 @@ import {
   HEARTBEAT_MAX_LINES,
   DIGEST_MEMORY_CAP_BYTES,
   memoryDigest,
+  PUSH_ANNOUNCE_REFIRE_MS,
   type HookHeartbeatEntry,
 } from '../src/commands/hook.ts';
+import { pushStatusPathForRoot } from '../src/core/workspace-push.ts';
 import {
   ensureIpcSecret,
   resolveSocketPath,
@@ -32,9 +34,16 @@ import {
   type TurnContextRequest,
 } from '../src/core/context/resolve-ipc.ts';
 import { CLAUDE_HOOK_OUTPUT_CAP_CHARS } from '../src/core/bootstrap/host-specs.ts';
+import { writeReceipt } from '../src/core/bootstrap/format.ts';
+import type { RepoReceipt } from '../src/core/bootstrap/repo.ts';
 
 const FIXTURE = join(import.meta.dir, 'fixtures', 'conversation-formats', 'claude-code.jsonl');
-const ENV_KEYS = ['GBRAIN_HOME', 'DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_SOURCE', 'GBRAIN_HOOKS'] as const;
+const ENV_KEYS = [
+  'GBRAIN_HOME', 'DATABASE_URL', 'GBRAIN_DATABASE_URL', 'GBRAIN_SOURCE', 'GBRAIN_HOOKS',
+  // stop-push [D3/D17/D20] + banner [D5] + cloud detection knobs
+  'GBRAIN_STOP_PUSH', 'GBRAIN_STOP_PUSH_DEBOUNCE_MIN', 'CLAUDE_CODE_REMOTE',
+  'CLAUDE_CODE_REMOTE_SESSION_ID', 'GH_TOKEN', 'GITHUB_TOKEN',
+] as const;
 
 let tmp: string;
 let saved: Record<string, string | undefined>;
@@ -206,6 +215,96 @@ describe('user-prompt', () => {
     expect(win[win.length - 1]).toEqual({ role: 'user', text: 'and now?' });
     expect(win.map((t) => t.text).join(' ')).not.toContain('SIDECHAIN-ONLY-TEXT');
     expect((await lastHeartbeat())?.turns).toBe(5);
+  });
+
+  test('cross-turn dedupe: previously-injected blocks ride priorContextText; channel defaults to claude-code', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    let seen: TurnContextRequest | null = null;
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen = r; } });
+    // Real captured transcript (claude CLI 2.1.224, hook installed): two
+    // hook_additional_context attachments naming companies/acme-example.
+    const projRoot = join(tmp, 'projects');
+    mkdirSync(join(projRoot, 'p1'), { recursive: true });
+    const transcript = join(projRoot, 'p1', 'sess.jsonl');
+    copyFileSync(join(import.meta.dir, 'fixtures', 'hook-transcript.jsonl'), transcript);
+    const out = collectStdout();
+    await runHook(['user-prompt'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'more about Acme Example?', transcript_path: transcript, session_id: 's-3' }),
+      transcriptRoot: projRoot,
+    });
+    expect(seen).not.toBeNull();
+    // Dedupe input = ONLY the structured injections (both blocks, joined) —
+    // the serve suppresses re-volunteering companies/acme-example this turn.
+    expect(seen!.priorContextText).toContain('companies/acme-example');
+    expect(seen!.priorContextText).not.toContain('Reply with exactly'); // never raw turn text
+    // Feedback-loop attribution: default channel is claude-code (the only
+    // harness bootstrap registers hooks for today).
+    expect(seen!.channel).toBe('claude-code');
+  });
+
+  test('priorContextText is deduped and byte-capped: an injection-heavy session can never blow the IPC message cap', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    let seen: TurnContextRequest | null = null;
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen = r; } });
+    const projRoot = join(tmp, 'projects');
+    mkdirSync(join(projRoot, 'p1'), { recursive: true });
+    const transcript = join(projRoot, 'p1', 'sess.jsonl');
+    // 60 injections: 50 identical (per-turn re-records of one block) + 10
+    // distinct 8KB blocks — raw join would be ~90KB+; the cap keeps ≤32KB
+    // of NEWEST distinct blocks.
+    const bigBlock = (i: number) =>
+      `## Brain pages mentioned this turn\n- **Page ${i}** → \`pages/p${i}\` — ${'x'.repeat(8000)}`;
+    const lines = [
+      ...Array.from({ length: 50 }, () =>
+        JSON.stringify({ type: 'attachment', attachment: { type: 'hook_additional_context', content: ['## Brain pages mentioned this turn\n- **Dup** → `pages/dup` — same block every turn'] } })),
+      ...Array.from({ length: 10 }, (_, i) =>
+        JSON.stringify({ type: 'attachment', attachment: { type: 'hook_additional_context', content: [bigBlock(i)] } })),
+    ];
+    writeFileSync(transcript, lines.join('\n') + '\n');
+    const out = collectStdout();
+    await runHook(['user-prompt'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'more about Acme?', transcript_path: transcript, session_id: 's-cap' }),
+      transcriptRoot: projRoot,
+    });
+    expect(seen).not.toBeNull();
+    const prior = seen!.priorContextText!;
+    expect(Buffer.byteLength(prior, 'utf8')).toBeLessThanOrEqual(32 * 1024);
+    // Newest-first retention: the newest distinct block survives the cap...
+    expect(prior).toContain('pages/p9');
+    // ...and identical re-records collapsed to one occurrence.
+    expect(prior.split('pages/dup').length - 1).toBeLessThanOrEqual(1);
+  });
+
+  test('--harness codex flags the channel; unknown values fall back to the default', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    const seen: TurnContextRequest[] = [];
+    await startServer({ dataDir, blockText: 'ok', onRequest: (r) => { seen.push(r); } });
+    const out = collectStdout();
+    await runHook(['user-prompt', '--harness', 'codex'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'hello Acme' }),
+    });
+    await runHook(['user-prompt', '--harness', 'vim'], {
+      ...out.io,
+      stdin: JSON.stringify({ prompt: 'hello Acme' }),
+    });
+    expect(seen).toHaveLength(2);
+    expect(seen[0].channel).toBe('codex');
+    expect(seen[1].channel).toBe('claude-code'); // fail-open to the default
+  });
+
+  test('hook ∈ STARTUP_HOOK_SKIP_COMMANDS (source grep — maybeEmitUpdateMarker no-ops under NODE_ENV=test, so no runtime test can pin this)', () => {
+    const cliSrc = readFileSync(join(import.meta.dir, '..', 'src', 'cli.ts'), 'utf8');
+    const m = cliSrc.match(/const STARTUP_HOOK_SKIP_COMMANDS = new Set\(\[[\s\S]*?\]\);/);
+    expect(m).not.toBeNull();
+    // user-prompt fires once per user PROMPT: a stale update cache would
+    // otherwise spawn a detached check-update child per prompt.
+    expect(m![0]).toContain("'hook'");
   });
 
   test('confinement rejection aborts: heartbeat + exit 0 empty [S3#8]', async () => {
@@ -666,6 +765,34 @@ const INITIALIZED_MANIFEST = {
   source_id: 'workspace',
 };
 
+/** Simulate a COMPLETED repo phase: a receipt for this workspace carrying a
+ * recorded repo_url. Without this the no-daemon push is deferred (a
+ * create-repo-first install must not push to an unverified-privacy origin). */
+function markRepoPhaseComplete(repo: string): void {
+  const toplevel = execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  const repoUrl = 'https://github.com/alice/boot-repo';
+  // The push gate binds to the recorded repo: origin must resolve to repo_url.
+  try {
+    execFileSync('git', ['-C', repo, 'remote', 'remove', 'origin'], { stdio: 'ignore' });
+  } catch {
+    /* no origin yet */
+  }
+  execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', repoUrl]);
+  mkdirSync(join(home(), 'bootstrap'), { recursive: true });
+  writeReceipt(home(), {
+    receipt_version: 1,
+    workspace_dir: toplevel,
+    source_id: 'workspace',
+    agent_name: 'test-agent',
+    created_at: '2026-01-01T00:00:00.000Z',
+    created_by: 'test',
+    brain_created_by_bootstrap: false,
+    created_paths: [],
+    registrations: [],
+    repo_url: repoUrl,
+  } as RepoReceipt);
+}
+
 describe('bootstrap push gate [G4]', () => {
   test('git repo + dirty tree + NO agent.json: session-start and session-end never spawn a push, repo untouched', async () => {
     const repo = join(tmp, 'plain-repo');
@@ -719,6 +846,7 @@ describe('bootstrap push gate [G4]', () => {
     const repo = join(tmp, 'boot-repo');
     initGitRepoWithDirtyTree(repo);
     writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    markRepoPhaseComplete(repo); // repo phase done → push is allowed
     const spawned: string[] = [];
 
     const out = collectStdout();
@@ -744,6 +872,7 @@ describe('bootstrap push gate [G4]', () => {
     const repo = join(tmp, 'boot-repo-end');
     initGitRepoWithDirtyTree(repo);
     writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    markRepoPhaseComplete(repo); // repo phase done → push is allowed
     const spawned: string[] = [];
     await runHook(['session-end'], {
       write: () => {},
@@ -751,6 +880,305 @@ describe('bootstrap push gate [G4]', () => {
       stdin: JSON.stringify({ session_id: 'sess-boot-end', cwd: repo }),
     });
     expect(spawned).toHaveLength(1);
+  });
+
+  test('create-repo-first BEFORE the repo phase (no repo_url yet): session-start defers the push, never publishes to an unverified origin', async () => {
+    const repo = join(tmp, 'boot-repo-pending');
+    initGitRepoWithDirtyTree(repo);
+    writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    // NB: no markRepoPhaseComplete — the repo phase has not run yet.
+    const spawned: string[] = [];
+    const out = collectStdout();
+    await runHook(['session-start'], {
+      ...out.io,
+      spawnPush: (root: string) => { spawned.push(root); },
+      stdin: '',
+      cwd: repo,
+    });
+    expect(spawned).toEqual([]); // deferred, not spawned
+    expect((await lastHeartbeat())?.reason).toBe('push_deferred_repo_pending');
+  });
+
+  test('create-repo-first BEFORE the repo phase (no repo_url yet): session-end defers the backstop push', async () => {
+    const repo = join(tmp, 'boot-repo-pending-end');
+    initGitRepoWithDirtyTree(repo);
+    writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    const spawned: string[] = [];
+    await runHook(['session-end'], {
+      write: () => {},
+      spawnPush: (root: string) => { spawned.push(root); },
+      stdin: JSON.stringify({ session_id: 'sess-boot-end-pending', cwd: repo }),
+    });
+    expect(spawned).toEqual([]); // deferred until `gbrain bootstrap repo`
+  });
+});
+
+// ── stop-hook per-turn push [D3/D17/D20] ────────────────────────────────────
+//
+// SessionEnd never fires on /exit and a cloud VM can be reclaimed between
+// turns; the Stop boundary is the only always-runs cadence. These tests pin:
+// the security gate (same as session-end), per-root debounce isolation, the
+// kill switch, the failing-status bypass, and fail-open state handling.
+
+function stopIo(repo: string, spawned: string[]) {
+  return {
+    write: () => {},
+    spawnPush: (root: string) => { spawned.push(root); },
+    stdin: JSON.stringify({ session_id: 'sess-stop-push', cwd: repo }),
+  };
+}
+
+function bootRepo(name: string, opts: { repoPhase?: boolean; clean?: boolean } = {}): string {
+  const repo = join(tmp, name);
+  initGitRepoWithDirtyTree(repo);
+  writeFileSync(join(repo, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+  if (opts.repoPhase !== false) markRepoPhaseComplete(repo);
+  if (opts.clean) {
+    execFileSync('git', ['-C', repo, 'add', '-A'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], { stdio: 'ignore' });
+    // Model a FULLY-PUSHED clean repo: origin/<branch> == HEAD, so treeNeedsPush
+    // measures zero commits ahead (a committed-but-never-pushed repo correctly
+    // reports needs-push under the new origin-ref-based measure).
+    const branch = execFileSync('git', ['-C', repo, 'branch', '--show-current'], { encoding: 'utf8' }).trim();
+    const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    execFileSync('git', ['-C', repo, 'update-ref', `refs/remotes/origin/${branch}`, head], { stdio: 'ignore' });
+  }
+  return repo;
+}
+
+const stopPushStateFiles = () => {
+  try {
+    return readdirSync(join(home(), 'bootstrap')).filter((n) => n.startsWith('stop-push-'));
+  } catch {
+    return [];
+  }
+};
+
+describe('stop-hook per-turn push [D3]', () => {
+  test('dirty initialized workspace: stop spawns the detached push, records per-root state (0600), heartbeat push_spawned', async () => {
+    const repo = bootRepo('stop-boot');
+    const spawned: string[] = [];
+    expect(await runHook(['stop'], stopIo(repo, spawned))).toBe(0);
+    expect(spawned).toHaveLength(1);
+    expect((await lastHeartbeat())?.reason).toBe('push_spawned');
+    const states = stopPushStateFiles();
+    expect(states).toHaveLength(1);
+    const mode = statSync(join(home(), 'bootstrap', states[0]!)).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  test('second stop inside the debounce window: push_debounced, no second spawn', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '5';
+    const repo = bootRepo('stop-debounce');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    expect((await lastHeartbeat())?.reason).toBe('push_debounced');
+  });
+
+  test('GBRAIN_STOP_PUSH_DEBOUNCE_MIN=0 pushes every turn', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '0';
+    const repo = bootRepo('stop-zero');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2);
+  });
+
+  test('cloud-sandbox default is debounce 0 (CLAUDE_CODE_REMOTE=true, no explicit knob) [D17]', async () => {
+    process.env.CLAUDE_CODE_REMOTE = 'true';
+    const repo = bootRepo('stop-cloud');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2);
+  });
+
+  test('GBRAIN_STOP_PUSH=0 disables the per-turn push (buffer append still runs)', async () => {
+    process.env.GBRAIN_STOP_PUSH = '0';
+    const repo = bootRepo('stop-disabled');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_disabled');
+  });
+
+  test('non-bootstrap git repo: never spawns (same security boundary as session-end)', async () => {
+    const repo = join(tmp, 'stop-plain');
+    initGitRepoWithDirtyTree(repo);
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_skipped_not_bootstrap');
+  });
+
+  test('repo phase pending (no repo_url): defers, never publishes to an unverified origin', async () => {
+    const repo = bootRepo('stop-pending', { repoPhase: false });
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_deferred_repo_pending');
+  });
+
+  test('clean tree with nothing ahead: push_clean, no spawn (CRITICAL regression: buffer append unchanged)', async () => {
+    const repo = bootRepo('stop-clean', { clean: true });
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_clean');
+    // the live-buffer append still happened (stop's original contract)
+    const bufDir = join(home(), 'transcripts', 'live');
+    expect(readdirSync(bufDir).some((n) => n.includes('sess-stop-push'))).toBe(true);
+  });
+
+  test('corrupt per-root state file is treated as due (fail-open)', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '5';
+    const repo = bootRepo('stop-corrupt');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    const state = stopPushStateFiles()[0]!;
+    writeFileSync(join(home(), 'bootstrap', state), 'not json');
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2);
+  });
+
+  test('[D20] a failing push-status bypasses the debounce (retry next turn)', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '60';
+    const repo = bootRepo('stop-retry');
+    const toplevel = execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    // Simulate the detached child recording a refusal for THIS root.
+    writeFileSync(
+      pushStatusPathForRoot(toplevel),
+      JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'refused_visibility', repoRoot: toplevel }) + '\n',
+      { mode: 0o600 },
+    );
+    // Inside the 60s failing-retry floor: still debounced (no spawn storm)…
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
+    // …but once the floor passes, the failing status bypasses the 60-MINUTE
+    // debounce window (age the state file past the floor).
+    const stateFile = join(home(), 'bootstrap', stopPushStateFiles()[0]!);
+    const aged = JSON.parse(readFileSync(stateFile, 'utf8')) as { ts: string; root: string };
+    writeFileSync(stateFile, JSON.stringify({ ...aged, ts: new Date(Date.now() - 90_000).toISOString() }) + '\n');
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(2); // floor passed → failing status bypassed the 60min window
+  });
+
+  test('[D3] two workspaces debounce independently (per-root state, no clobber)', async () => {
+    process.env.GBRAIN_STOP_PUSH_DEBOUNCE_MIN = '60';
+    const a = bootRepo('stop-ws-a');
+    const b = join(tmp, 'stop-ws-b');
+    initGitRepoWithDirtyTree(b);
+    writeFileSync(join(b, 'agent.json'), JSON.stringify(INITIALIZED_MANIFEST, null, 2) + '\n');
+    // B gets its own receipt? One receipt per home — markRepoPhaseComplete
+    // overwrites. Root-binding means only the receipt's workspace pushes; the
+    // OTHER workspace must be treated as repo-phase-pending, not crash.
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(a, spawned));
+    expect(spawned).toHaveLength(1);
+    await runHook(['stop'], stopIo(b, spawned));
+    expect(spawned).toHaveLength(1); // b defers (no receipt binding) — and does NOT clobber a's state
+    expect((await lastHeartbeat())?.reason).toBe('push_deferred_repo_pending');
+    await runHook(['stop'], stopIo(a, spawned));
+    expect(spawned).toHaveLength(1); // a still debounced — b's activity didn't reset a
+    expect((await lastHeartbeat())?.reason).toBe('push_debounced');
+  });
+});
+
+// ── push-failure banner [D5/D13/D19] ────────────────────────────────────────
+
+describe('user-prompt push-failure banner [D5]', () => {
+  // repoRoot must EXIST on disk: entries for deleted workspaces are ghosts
+  // the reader filters out by design (they could never be cleared).
+  const bannerRoot = () => {
+    const r = join(tmp, 'banner-brain');
+    mkdirSync(r, { recursive: true });
+    return r;
+  };
+  const failingStatus = (root: string, ts = new Date().toISOString()) => {
+    mkdirSync(join(home(), 'bootstrap'), { recursive: true });
+    writeFileSync(
+      pushStatusPathForRoot(root),
+      JSON.stringify({ ts, ok: false, reason: 'refused_visibility: origin unverifiable', repoRoot: root }) + '\n',
+      { mode: 0o600 },
+    );
+  };
+
+  test('failing push-status → banner-only payload on a degraded path, with BOTH additionalContext and systemMessage', async () => {
+    const root = bannerRoot();
+    failingStatus(root);
+    const out = collectStdout();
+    // No config at all → degraded no_pglite_path; the banner must still land.
+    expect(await runHook(['user-prompt'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi' }) })).toBe(0);
+    const payload = JSON.parse(out.get()) as {
+      hookSpecificOutput?: { additionalContext?: string };
+      systemMessage?: string;
+    };
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('FAILING');
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('banner-brain');
+    expect(payload.systemMessage).toContain('NOT on GitHub');
+  });
+
+  test('banner announces once per failure ts, then stays quiet [D19]', async () => {
+    const root = bannerRoot();
+    failingStatus(root);
+    const first = collectStdout();
+    await runHook(['user-prompt'], { ...first.io, stdin: JSON.stringify({ prompt: 'hi' }) });
+    expect(first.get()).toContain('FAILING');
+    const second = collectStdout();
+    await runHook(['user-prompt'], { ...second.io, stdin: JSON.stringify({ prompt: 'hi again' }) });
+    expect(second.get()).toBe(''); // announced — no re-fire inside the floor
+  });
+
+  test('a NEW failure ts re-announces immediately; a persisting one re-fires after the 30-min floor [D19]', async () => {
+    const root = bannerRoot();
+    failingStatus(root, '2026-08-12T00:00:00.000Z');
+    const first = collectStdout();
+    await runHook(['user-prompt'], { ...first.io, stdin: JSON.stringify({ prompt: 'x' }) });
+    expect(first.get()).toContain('FAILING');
+    // Same ts + fresh announce → quiet. Age the announce past the floor → re-fires.
+    const announced = `${pushStatusPathForRoot(root)}.announced`;
+    const state = JSON.parse(readFileSync(announced, 'utf8')) as { announced_ts: string };
+    writeFileSync(
+      announced,
+      JSON.stringify({ announced_ts: state.announced_ts, last_announce_at: new Date(Date.now() - PUSH_ANNOUNCE_REFIRE_MS - 60_000).toISOString() }) + '\n',
+    );
+    const third = collectStdout();
+    await runHook(['user-prompt'], { ...third.io, stdin: JSON.stringify({ prompt: 'z' }) });
+    expect(third.get()).toContain('FAILING');
+  });
+
+  test('CRITICAL regression: ok push-status → NO banner, stdout empty on degraded paths', async () => {
+    mkdirSync(join(home(), 'bootstrap'), { recursive: true });
+    const okRoot = bannerRoot();
+    writeFileSync(
+      pushStatusPathForRoot(okRoot),
+      JSON.stringify({ ts: new Date().toISOString(), ok: true, repoRoot: okRoot }) + '\n',
+    );
+    const out = collectStdout();
+    await runHook(['user-prompt'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi' }) });
+    expect(out.get()).toBe('');
+  });
+
+  test('banner rides INSIDE the main context payload when serve answers (one JSON doc, systemMessage present)', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, blockText: 'BRAIN CONTEXT BLOCK' });
+    const root = bannerRoot();
+    failingStatus(root);
+    const out = collectStdout();
+    await runHook(['user-prompt'], { ...out.io, stdin: JSON.stringify({ prompt: 'hi', session_id: 'sess-banner' }) });
+    const payload = JSON.parse(out.get()) as {
+      hookSpecificOutput?: { additionalContext?: string };
+      systemMessage?: string;
+    };
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('FAILING');
+    expect(payload.hookSpecificOutput?.additionalContext).toContain('BRAIN CONTEXT BLOCK');
+    expect(payload.systemMessage).toContain('FAILING');
   });
 });
 
