@@ -463,6 +463,37 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
           // Banner is cosmetic; never block the upgrade.
         }
 
+        // Waiting-TTL pre-notice (one-shot, warn-before-act). The worker
+        // gates its first sweep behind the SAME flag via runWaitingTtlTick
+        // (notice → grace window → sweep) because daemon restarts never run
+        // this CLI path — this banner is the interactive channel. Stamping
+        // the ISO timestamp here starts the same grace clock, so an operator
+        // who sees this banner gets the full window to tune before anything
+        // is cancelled.
+        try {
+          const { admissionKilled, resolveTtlNames, countTtlExpiredWaiting, ttlNoticeGraceMs, TTL_NOTICE_SHOWN_KEY } =
+            await import('../core/minions/admission.ts');
+          const shown = await engine.getConfig(TTL_NOTICE_SHOWN_KEY);
+          if ((shown == null || shown.trim() === '') && !admissionKilled()) {
+            const ttlNames = await resolveTtlNames(engine);
+            const { total: affected, by_name } = await countTtlExpiredWaiting(engine, ttlNames);
+            const parts = [...ttlNames].map(([name, hours]) => `${name} > ${hours}h: ${by_name[name] ?? 0}`);
+            console.log('');
+            console.log(`⚠ [gbrain] Waiting-TTL is now active: queued jobs that never get claimed are`);
+            console.log(`  cancelled after their per-type TTL (${parts.join('; ') || 'defaults'}).`);
+            if (affected > 0) {
+              console.log(`  ${affected} currently-queued job(s) already exceed their TTL and will be`);
+              console.log(`  cancelled after a ${Math.round(ttlNoticeGraceMs() / 60_000)}min grace window`);
+              console.log(`  (auditable error_text; visible in 'gbrain jobs stats').`);
+            }
+            console.log(`  Tune or disable: gbrain config set minions.ttl_waiting_hours.<name> <hours|0>`);
+            console.log('');
+            await engine.setConfig(TTL_NOTICE_SHOWN_KEY, new Date().toISOString());
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
         // #3390: ZeroEntropy sunset notice. ZE announced (2026-07-24) that
         // its hosted endpoints — including /models/embed and /models/rerank —
         // shut down on 2026-09-04. Any brain resolving to a zeroentropyai:*
@@ -496,8 +527,9 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             try {
               const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
               colDims = (await readContentChunksEmbeddingDim(engine)).dims;
-            } catch { /* fresh brain — omit --dim */ }
-            const dimFlag = colDims ? ` --dim ${colDims}` : '';
+            } catch { /* fresh brain — canonical command carries its own --dim */ }
+            const { renderCanonicalMigrationCommands } = await import('../core/ai/defaults.ts');
+            const cmds = renderCanonicalMigrationCommands({ colDims });
             console.log('');
             console.log('═══════════════════════════════════════════════════════════════');
             console.log(`[gbrain] ACTION REQUIRED: ZeroEntropy hosted API sunsets ${ZEROENTROPY_SUNSET_DATE}.`);
@@ -515,17 +547,18 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             console.log('');
             console.log('Two fixes, either works:');
             console.log('');
-            console.log('[1] Self-host the same model — zembed-1 weights are Apache-2.0. Serve');
-            console.log('    them via llama-server or Ollama and point the config at the local');
-            console.log('    endpoint. Keeps every existing vector; NO re-embed at all. See');
-            console.log('    docs/guides/embedding-migration.md ("Self-hosting instead of migrating").');
+            console.log('[1] Self-host the same model — zembed-1 weights are Apache-2.0. Keep the');
+            console.log('    zeroentropyai:zembed-1 id and point provider_base_urls.zeroentropyai');
+            console.log('    at a ZE-wire-compatible endpoint (NOT a generic OpenAI-compatible');
+            console.log('    server — the id speaks ZE\'s /models/embed dialect). Keeps every');
+            console.log('    vector; NO re-embed. See docs/guides/embedding-migration.md.');
             console.log('');
             console.log('[2] Migrate to another provider (resumable; preview cost first):');
-            console.log(`      gbrain migrate embeddings --to <provider:model>${dimFlag} --dry-run`);
-            console.log(`      gbrain migrate embeddings --to <provider:model>${dimFlag}`);
-            if (colDims) {
-              console.log(`    (--dim ${colDims} is this brain's current index width — keep it to`);
-              console.log('    avoid a needless schema rebuild when the target supports it.)');
+            console.log(`      ${cmds.recommendedDryRun}`);
+            console.log(`      ${cmds.recommended}`);
+            if (cmds.note) console.log(`    ${cmds.note}`);
+            if (cmds.openaiAlternative) {
+              console.log(`    Keep-width alternative: ${cmds.openaiAlternative}`);
             }
             if (onZeReranker) {
               console.log('');
@@ -536,6 +569,43 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
             console.log('provider (check name: provider_sunset).');
             console.log('');
             await engine.setConfig('ze_sunset_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // v0.46.3: stage-2 sunset notice, gated by `ze_sunset_notice_v2_shown`.
+        // Fires even for brains that saw stage 1 — this release ships the
+        // migration playbook + the Voyage default, and the exposure story
+        // widened (custom columns, env overrides, reranker-without-key).
+        // The gate opens on `exposed` and on `unknown` (fail-safe: nag rather
+        // than stay silent). Reranker-only exposure is COVERED by `exposed`:
+        // detectZeExposure sets status='exposed' whenever the resolved
+        // reranker is ZE (including the legacy bundle default), so an
+        // OpenAI/Voyage-embedding brain whose reranking rides the ZE bundle
+        // still opens the gate, and renderZeActionRequired includes the
+        // reranker paragraph.
+        try {
+          const shownV2 = await engine.getConfig('ze_sunset_notice_v2_shown');
+          if (shownV2 !== 'true') {
+            const { detectZeExposure, renderZeActionRequired } =
+              await import('../core/ze-exposure.ts');
+            const exposure = await detectZeExposure(engine);
+            if (exposure.status === 'exposed' || exposure.status === 'unknown') {
+              console.log('');
+              console.log('═══════════════════════════════════════════════════════════════');
+              console.log('[gbrain] ACTION REQUIRED — ZeroEntropy shutdown (v0.46.3 notice)');
+              console.log('═══════════════════════════════════════════════════════════════');
+              for (const line of renderZeActionRequired(exposure).split('\n')) {
+                console.log(`[gbrain] ${line}`);
+              }
+              console.log('[AGENT] Relay this to your operator: this brain needs an embedding/');
+              console.log('[AGENT] reranker migration before the shutdown date. Playbook:');
+              console.log('[AGENT] skills/migrations/v0.46.3.0.md');
+              console.log('═══════════════════════════════════════════════════════════════');
+              console.log('');
+              await engine.setConfig('ze_sunset_notice_v2_shown', 'true');
+            }
           }
         } catch {
           // Banner is cosmetic; never block the upgrade.

@@ -45,14 +45,21 @@ directly. Keep that prefix when you add a new shell-script check.
 src/
   cli.ts                  CLI entry point
   commands/               CLI-only commands (init, upgrade, import, export, etc.)
+    doctor.ts             gbrain doctor façade (buildChecks/runDoctor/output)
+    doctor/               Peeled doctor modules: checks/* bundles + tail clusters
+    sync.ts               gbrain sync CLI + performSync/performFullSync
   core/
-    operations.ts         Contract-first operation definitions (the foundation)
+    operations.ts         Operation contract assembly (façade over ops/)
+    ops/                  Contract types + security fences + the op domain modules
     engine.ts             BrainEngine interface
     engine-factory.ts     Engine factory (dynamic import of the configured engine)
-    postgres-engine.ts    Postgres + pgvector implementation
-    pglite-engine.ts      PGLite (embedded Postgres via WASM) implementation
+    postgres-engine.ts    Postgres + pgvector implementation (façade)
+    postgres-engine/      Narrow-deps engine modules (facts, takes, code-edges, salience)
+    pglite-engine.ts      PGLite (embedded Postgres via WASM) implementation (façade)
+    pglite-engine/        Narrow-deps engine modules (facts, takes, code-edges, salience)
     db.ts                 Connection management + schema loader
     import-file.ts        Import pipeline (chunk + embed + tags)
+    sync-*.ts             Peeled sync clusters (cost-gate, git, anchor, lock, reconcile, status-report, ...)
     types.ts              TypeScript types
     markdown.ts           Frontmatter parsing
     config.ts             Config file management
@@ -65,7 +72,7 @@ src/
     yaml-lite.ts          Lightweight YAML parser
     chunkers/             3-tier chunking (recursive, semantic, llm)
     search/               Hybrid search (vector, keyword, hybrid, expansion, dedup)
-    embedding.ts          Embedding service (provider-routed; ZeroEntropy default)
+    embedding.ts          Embedding service (provider-routed; Voyage default)
   mcp/
     server.ts             MCP stdio server (generated from operations)
     http-transport.ts     HTTP MCP transport (OAuth, body caps)
@@ -126,8 +133,6 @@ refusal message walks you through it; details in
 the database name must carry "test" as a word segment (like `gbrain_test`
 above) or destructive tests refuse to run — opt a differently-named database
 in one-shot with `GBRAIN_E2E_ALLOW_DB=<name>`.
-
-Use `bun run verify` before pushing. It runs 19+ guard checks in parallel
 
 Use `bun run verify` before pushing. It runs 40+ guard checks in parallel
 (`scripts/run-verify-parallel.sh`), including: banned fork-name leaks
@@ -201,10 +206,16 @@ bun build --compile --outfile bin/gbrain src/cli.ts
 
 ## Adding a new operation
 
-GBrain uses a contract-first architecture. Add your operation to one file and it
-automatically appears in the CLI, MCP server, and tools-json:
+GBrain uses a contract-first architecture. Add your operation to one domain module
+and it automatically appears in the CLI, MCP server, and tools-json:
 
-1. Add your operation to `src/core/operations.ts` (define params, handler, cliHints)
+1. Add your operation to the matching domain module under `src/core/ops/`
+   (`pages.ts`, `search.ts`, `takes.ts`, `jobs.ts`, ... — define params, handler,
+   cliHints there). `src/core/operations.ts` is the assembly façade that spreads
+   every domain module into the single `operations` array: a new op in an existing
+   domain needs no façade change; a brand-new domain module gets one spread line
+   in `operations.ts`. Shared contract types live in `src/core/ops/contract.ts`,
+   the security/scope fences in `src/core/ops/context.ts`.
 2. Add tests
 3. That's it. The CLI, MCP server, and tools-json are generated from operations.
 
@@ -300,9 +311,9 @@ Trigger paths (rerun if your diff touches any of these):
 
 - `src/core/search/hybrid.ts`
 - `src/core/search/source-boost.ts`, `sql-ranking.ts`
-- `src/core/search/intent.ts`, `expansion.ts`, `dedup.ts`
+- `src/core/search/query-intent.ts`, `expansion.ts`, `dedup.ts`
 - `src/core/embedding.ts`
-- `src/core/operations.ts` (query / search handlers)
+- `src/core/ops/search.ts` (query / search op handlers)
 - `src/core/postgres-engine.ts` / `pglite-engine.ts` (searchKeyword /
   searchVector SQL)
 
