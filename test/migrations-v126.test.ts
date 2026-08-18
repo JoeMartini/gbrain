@@ -1,8 +1,8 @@
 /**
- * v0.45.7 ambient recall (issue #1) — migration v127 (session_context_state).
+ * v0.45.7 ambient recall (issue #1) — migration v126 (session_context_state).
  *
  * Pinned contracts:
- * 1. Migration v127 exists in the MIGRATIONS array with the canonical name
+ * 1. Migration v126 exists in the MIGRATIONS array with the canonical name
  *    and is flagged idempotent.
  * 2. Table created cleanly via initSchema() on PGLite, with the exact column
  *    set/types, client_id DEFAULT 'local', jsonb '[]' literal defaults, and
@@ -12,7 +12,7 @@
  *    coexists (the eng-1B two-harnesses-one-source isolation property).
  * 4. session_context_state_updated_idx present for the updated_at prune scan.
  * 5. Upgrade path: drop the table, rewind the version ledger to 125, re-run
- *    runMigrations — v127 alone recreates it, and the migrated shape matches
+ *    runMigrations — v126 alone recreates it, and the migrated shape matches
  *    the fresh-bootstrap shape exactly (drift guard: migrate.ts DDL vs the
  *    schema blob, same contract as test/e2e/schema-drift.test.ts pins for
  *    Postgres).
@@ -47,10 +47,14 @@ async function captureShape() {
     is_nullable: string;
     column_default: string | null;
   }>(
+    // Name-ordered ON PURPOSE (cathedral 5): additive columns land at CREATE
+    // position on fresh bootstrap but ALTER-append on the migrated path, so
+    // ordinal_position legitimately differs — the drift guard compares the
+    // column SET + types + defaults, never physical order.
     `SELECT column_name, data_type, is_nullable, column_default
        FROM information_schema.columns
       WHERE table_name = 'session_context_state'
-      ORDER BY ordinal_position`,
+      ORDER BY column_name`,
   );
   const pk = await engine.executeRaw<{ column_name: string }>(
     `SELECT kcu.column_name
@@ -70,12 +74,12 @@ async function captureShape() {
   return { columns, pk: pk.map(r => r.column_name), indexes };
 }
 
-describe('migration v127 — session_context_state', () => {
-  test('v127 exists in MIGRATIONS with canonical name and idempotent flag', () => {
-    const v127 = MIGRATIONS.find(m => m.version === 127);
-    expect(v127).toBeDefined();
-    expect(v127?.name).toBe('session_context_state');
-    expect(v127?.idempotent).toBe(true);
+describe('migration v126 — session_context_state', () => {
+  test('v126 exists in MIGRATIONS with canonical name and idempotent flag', () => {
+    const v126 = MIGRATIONS.find(m => m.version === 126);
+    expect(v126).toBeDefined();
+    expect(v126?.name).toBe('session_context_state');
+    expect(v126?.idempotent).toBe(true);
   });
 
   test('LATEST_VERSION >= 126', () => {
@@ -93,6 +97,7 @@ describe('migration v127 — session_context_state', () => {
     const { columns } = await captureShape();
     const byName = Object.fromEntries(columns.map(c => [c.column_name, c]));
     expect(Object.keys(byName).sort()).toEqual([
+      'checkpoint_manifest', // cathedral 5 — added by migration v132
       'client_id',
       'last_wake_at',
       'session_id',
@@ -106,6 +111,9 @@ describe('migration v127 — session_context_state', () => {
     expect(byName.session_id.data_type).toBe('text');
     expect(byName.standing_entities.data_type).toBe('jsonb');
     expect(byName.surfaced_slugs.data_type).toBe('jsonb');
+    expect(byName.checkpoint_manifest.data_type).toBe('jsonb');
+    expect(byName.checkpoint_manifest.is_nullable).toBe('NO');
+    expect(byName.checkpoint_manifest.column_default).toContain('[]');
     expect(byName.last_wake_at.data_type).toBe('timestamp with time zone');
     expect(byName.updated_at.data_type).toBe('timestamp with time zone');
     // last_wake_at is the only nullable column (no wake yet).
@@ -203,16 +211,17 @@ describe('migration v127 — session_context_state', () => {
     expect(rows.length).toBe(1);
   });
 
-  test('drop + rewind to v126 → runMigrations recreates the fresh-bootstrap shape', async () => {
+  test('drop + rewind to v125 → runMigrations recreates the fresh-bootstrap shape', async () => {
     // Drift guard: capture the fresh-bootstrap shape (schema blob), then drop
-    // the table, rewind the version ledger, and re-run migrations so v127's
-    // DDL alone recreates it. The two shapes must match exactly — a divergence
-    // means migrate.ts drifted from src/schema.sql / pglite-schema.ts.
+    // the table, rewind the version ledger, and re-run migrations so v126's
+    // DDL + the v132 checkpoint_manifest ALTER recreate it. The two shapes
+    // must match exactly — a divergence means migrate.ts drifted from
+    // src/schema.sql / pglite-schema.ts.
     const fresh = await captureShape();
-    expect(fresh.columns.length).toBe(7);
+    expect(fresh.columns.length).toBe(8); // 7 (v126) + checkpoint_manifest (v132)
 
     await engine.executeRaw(`DROP TABLE IF EXISTS session_context_state`);
-    await engine.setConfig('version', '126');
+    await engine.setConfig('version', '125');
 
     const res = await runMigrations(engine);
     expect(res.applied).toBeGreaterThanOrEqual(1);
@@ -228,14 +237,27 @@ describe('migration v127 — session_context_state', () => {
   }, 30000);
 
   test('source DDL pins the table, key shape, sentinel default, and index', () => {
-    const v127 = MIGRATIONS.find(m => m.version === 127);
-    expect(v127).toBeDefined();
-    // v127 ships one engine-agnostic sql block (no sqlFor split) — both
+    const v126 = MIGRATIONS.find(m => m.version === 126);
+    expect(v126).toBeDefined();
+    // v126 ships one engine-agnostic sql block (no sqlFor split) — both
     // engines run the same DDL.
-    expect(v127?.sqlFor).toBeUndefined();
-    expect(v127?.sql).toContain('CREATE TABLE IF NOT EXISTS session_context_state');
-    expect(v127?.sql).toContain(`DEFAULT 'local'`);
-    expect(v127?.sql).toContain('PRIMARY KEY (source_id, client_id, session_id)');
-    expect(v127?.sql).toContain('session_context_state_updated_idx');
+    expect(v126?.sqlFor).toBeUndefined();
+    expect(v126?.sql).toContain('CREATE TABLE IF NOT EXISTS session_context_state');
+    expect(v126?.sql).toContain(`DEFAULT 'local'`);
+    expect(v126?.sql).toContain('PRIMARY KEY (source_id, client_id, session_id)');
+    expect(v126?.sql).toContain('session_context_state_updated_idx');
+  });
+});
+
+describe('MIGRATIONS registry integrity (pre-landing review guard)', () => {
+  test('versions are UNIQUE — a cross-PR number collision fails loudly instead of silently skipping', () => {
+    // Two migrations sharing a version is the silent-death shape: whichever
+    // lands second is skipped forever on brains already at that version
+    // (runMigrations gates on version > current). Historical array order is
+    // NOT ascending (early entries were reordered) — uniqueness is the
+    // load-bearing invariant.
+    const versions = MIGRATIONS.map((m) => m.version);
+    const unique = new Set(versions);
+    expect(unique.size).toBe(versions.length);
   });
 });
