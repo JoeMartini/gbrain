@@ -2,6 +2,164 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.46.27.0] - 2026-08-21
+
+**The autopilot daemon can no longer lose your API keys silently.** The
+failure mode: `autopilot --install` generated a wrapper that loaded env only
+from interactive shell rc files, which daemon supervisors (launchd, systemd,
+cron) never run — so the daemon started green while every LLM phase
+(chronicle, dream, enrich) quietly produced nothing, for days, with no error
+anywhere. This release adopts the env-file fix from PR #4443 (thank you
+@Masashi-Ono0611) and hardens the whole lane. Closes #2608.
+
+### Added
+- The daemon wrapper now sources a gbrain-owned `~/.gbrain/env` file (after
+  your shell profiles, so it wins on conflicts; honors `GBRAIN_HOME`).
+  `autopilot --install` creates it as a fully-commented, owner-only (0600)
+  template — API keys plus the process-level env only a wrapper can deliver
+  (`NODE_EXTRA_CA_CERTS`, proxy vars, custom base URLs). gbrain never
+  overwrites or deletes it; a pre-existing group/world-readable file gets one
+  warning and is left untouched.
+- Autopilot prints one loud line at boot when no chat provider is available,
+  naming both remediation paths and the reload step — the silent no-op is now
+  visible in `autopilot.log` at startup instead of surfacing as "runs green,
+  extracts nothing."
+
+### Fixed
+- `autopilot --install` now actually reloads a running daemon: launchd
+  unloads before loading (a bare `launchctl load` over a loaded agent also
+  errored and aborted every reinstall), systemd restarts an already-active
+  unit, and the cron/container paths tell you when a running loop keeps its
+  old environment and exactly how to end it.
+- Env files with plain `KEY=value` lines (no `export`) now reach the daemon —
+  the wrapper sources under `set -a`, matching how dedicated env files are
+  usually written.
+
+To take advantage of v0.46.27.0:
+- Existing daemon installs: re-run `gbrain autopilot --install` once. The
+  upgrade alone swaps the binary but does not regenerate the wrapper, so the
+  env-file sourcing (and the template) only appear after a reinstall — which
+  now also reloads the daemon for you on launchd and systemd.
+- Then put your keys in `~/.gbrain/env` (or keep them in
+  `~/.gbrain/config.json`); the wrapper sources the env file on every daemon
+  start.
+
+## [0.46.26.0] - 2026-08-20
+
+**Dream fan-out can no longer strand work in queues nobody owns.** The
+production incident: dead parent runs left thousands of waiting jobs in
+private `dream-inline-*` queues for 16-27 hours, and every dashboard said
+"restart the worker" — advice that cannot work, because no shared worker can
+claim a private queue. This release adopts the lifecycle repair from
+PR #4361 (thank you @garrytan-agents) and hardens every recovery lane the
+review found unwired. Closes #4332.
+
+### Added
+- Private dream queues now carry an explicit owner job, owner token, and
+  renewable lease (adopted from #4361). Synthesize and patterns reconcile
+  their children on every terminal path — success, throw, timeout, abort,
+  cancellation — and startup recovery cancels provably-orphaned queues
+  (owner terminal/missing, or lease expired) while never touching live ones.
+- Recovery now runs on EVERY lane that can strand a queue: the supervisor's
+  pre-spawn hook (adopted), bare `gbrain jobs work` startup, autopilot's
+  worker spawns and crash respawns, and dream-cycle start — the last one
+  being the only possible lane on PGLite brains, which previously had no
+  recovery surface at all.
+- Reconcile cancellations are stamped with a machine-readable reason family
+  (`private_queue_reconciled: <detail>`), mirroring the waiting-TTL prefix,
+  so operators and tooling can tell reconciliation from TTL expiry.
+
+### Changed
+- Lease renewal is monotonic (a renewal can only extend, never shrink) and
+  fires from the drain loop's idle polls and fast-failure iterations too —
+  a live queue with slow or bouncing children can no longer read as orphaned
+  mid-run.
+- The maintenance lane (where synthesize/patterns actually run on
+  multi-source brains) now threads its job id as the private-queue owner, so
+  its queues get the fast owner-terminal recovery path instead of waiting
+  out the lease.
+- Doctor's `orphaned_private_queue` check now runs on PGLite too and buckets
+  findings through the same classifier recovery uses: metadata-backed
+  orphans advertise auto-recovery, legacy unowned queues advertise the
+  retriage preview, and owner-pending queues say which owner job to inspect.
+  The wedged-queue surfaces (doctor, `jobs stats`, the `get_job_stats` op)
+  never call a private queue "wedged" and never advertise a worker restart
+  for it.
+- Doctor's stale-lock hints now name only commands that exist:
+  `gbrain dream --break-lock` was advertised for years but never implemented
+  — pasting it ran a full (paid) dream cycle instead of breaking a lock. The
+  cycle-lock remediation is `gbrain doctor --fix` (dead holders on this
+  host; also swept at the next dream start), and the circular `gbrain
+  doctor` fallback hint is gone. The wedged-queue restart hint names the
+  wedged queue (`supervisor start --queue '<q>'`) instead of always bouncing
+  the default worker.
+
+### Fixed
+- Doctor's orphaned-queue check is honest about truncation on the healthy
+  path too: with more than 100 candidate queues, the never-classified
+  remainder is now reported (`unclassified_candidates`) even when everything
+  classified came back live — previously 100 live + 50 unexamined orphans
+  read as a clean bill of health. `waiting_jobs` now counts flagged queues
+  only, matching what `orphaned_private_queues` reports.
+- The upgrade bootstrap probes all three private-queue columns (owner id,
+  owner token, lease) in both engines — a partially-upgraded brain missing
+  only the token column now repairs itself instead of wedging.
+- The private-queue lease keepalive is one shared, tested helper
+  (`MinionQueue.makeThrottledLeaseRenewer`) instead of twin inline copies in
+  synthesize and patterns; the coverage wave backfills behavioral tests for
+  every recovery lane, the renewing wait, the v136 migration replay, doctor's
+  hint/bucket surfaces, and token redaction on the jobs MCP ops.
+
+To take advantage of v0.46.26.0:
+- `gbrain upgrade` (or reinstall the binary). No schema action needed beyond
+  the automatic migration that adds the owner/lease columns.
+- Existing abandoned queues from before this release are legacy-unowned:
+  `gbrain doctor` now tells you exactly which repair applies; use the
+  `gbrain dream retriage` preview for those.
+
+## [0.46.25.0] - 2026-08-20
+
+**The backlog release: 62 community pull requests merged, ~50 maintainer fixes, and 87 open issues closed in one landing.** Every pull request was individually trial-merged and tested before inclusion; every fix started from a reproduced bug and shipped with a failing-first test. The headline classes: embedding backfills can no longer quietly destroy vectors (probe-gated invalidation, honest counts, content-revision staleness, registry-aware writes end to end), sync can no longer delete the wrong page or be repointed by a foreign repo, search caching can no longer serve one source's rows to another or one query's rows to a different query, page timelines survive filesystem rebuilds, large piped CLI output is delivered to the last byte on every path, and the DB config plane is finally read at runtime.
+
+### Added
+- Ops accept an explicit per-call `source_id` on `get_page`/`delete_page`/`restore_page` — honored or rejected, never silently ignored. Destructive ops act only within the caller's write authority; federated read grants confer no delete access.
+- `gbrain migrate-engine` now copies the facts table and all config rows (minus engine-local keys, printed when skipped) with a per-table copied-count summary — a migrated brain arrives whole.
+- Doctor warns when `chat_fallback_chain` is set but inert. Contributed by @Masashi-Ono0611.
+
+### Changed
+- Embedding backfills and stale sweeps are honest end to end: a live embedder probe gates any invalidation, a run that nulls vectors but embeds zero fails loudly, updated pages re-embed on content change (not just signature), and `embed_skip` pages are never invalidated into a permanent hole.
+- The embedding write path, stale selectors, coverage counts, invalidation, and bootstrap verify all resolve the same active embedding column through the registry — multi-column brains no longer see false 0% coverage or phantom stale loops.
+- The sole-non-default source shortcut only routes bare writes when the default corpus is empty, and says so on stderr when it declines — no more silent write hijacks.
+
+### Fixed
+- 23 community fixes, each trial-merged in isolation and tested before landing: C# file-scoped namespace indexing (@gregario), a $HOME bootstrap guard and unknown-flag rejection on `config set` and subagent-loop capability classification and DB-plane `eval.*` gating and doctor effective-date re-parsing and inert-fallback-chain warning and latest-model cache invalidation (@Masashi-Ono0611), chat probe token floor (@ethanbeard), `models.dream.synthesize` honored in concept synthesis (@awilhite), recipe secret-name matching (@rayers), two unregisterable config keys (@JavanC), source-aware backlog drain hints and trigger-only skills dirs (@javieraldape), keyword-arm fail-open in hybrid search (@Jinstronda), wasm-embed check under pipefail and skillpack binary path resolution (@abhiramasonny), conversation-miner facts in verify and thin-client think routing (@mdcruz88), win32 resolve-ipc client gate (@oscampo), stub entity-page types from the active pack (@marmikcfc), image assets by source root and chronicle backfill source ids (@frxiaobei).
+- Facts fences and page writes now compute the identical target file, and an unresolvable target routes to a DB-only insert instead of being dropped — closing a fact-wipe class. Co-authored with @harjothkhara.
+- A facts-only target brain refuses a destructive engine-migration overwrite instead of losing its memory.
+
+### Also landed (the full wave)
+- 39 further community PRs beyond the first 23, each trial-merged and tested: contributions by @gregario, @Masashi-Ono0611, @ethanbeard, @awilhite, @rayers, @JavanC, @javieraldape, @Jinstronda, @abhiramasonny, @mdcruz88, @oscampo, @marmikcfc, @frxiaobei, @herove-successor accounts and more — every author is credited on their merged PR. The oldest open PR in the repo (June) landed in this pass.
+- The remaining P0s: sync delete-by-approximation (a page with a trailing-hyphen path could delete a DIFFERENT page), cross-host page-lock stealing, and stranded manual timeline entries on filesystem-canonical brains.
+- Retrieval correctness: the long-standing ranking inversion, a pre-fusion candidate floor so exact matches at rank >20 are reachable at default limits, per-source cache isolation, and a same-text guard so near-identical embeddings (worst in CJK) can't serve one query's cached rows to a different query.
+- Serve hardening: per-request MCP transport teardown (multi-GB RSS growth gone), an opt-in event-loop stall watchdog, SIGTERM/SIGHUP cleanup, and default-deny CORS on the auth endpoints.
+- Ops honesty: `jobs list/get --json`, duplicate timeline entries report `skipped` instead of lying `ok`, doctor stops recommending a sunsetting reranker default, and CLI output over 64KiB is delivered to the last byte on every emission path — including `console.log`-shaped `--json` handlers.
+- Windows: git sync credentials, msys path healing, and resolve-IPC client gating.
+
+## To take advantage of v0.46.25.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Migration v133 adds a content-revision stamp to chunks; no manual action needed.** Existing embeddings are grandfathered and re-embed only when content actually changes.
+3. **Verify the outcome:**
+   ```bash
+   gbrain doctor
+   gbrain stats
+   ```
+4. **If any step fails or the numbers look wrong,** please file an issue: https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
 ## [0.46.24.0] - 2026-08-20
 
 **`gbrain sync` now works while your agent's brain is live.** On a PGLite
@@ -113,7 +271,7 @@ the brain.
 - `dream extract-atoms` failure details name the provider and model that
   failed. Contributed by @proprieties.
 - Reserve failures caused by missing pricing are recorded in the budget audit
-  trail instead of vanishing. Contributed by @herove.
+  trail instead of vanishing. Contributed by @frxiaobei.
 
 ### Fixed
 - Piped CLI output larger than 64KiB no longer truncates with exit 0 when the
@@ -138,8 +296,8 @@ the brain.
   reaches the transcript adapters; a truncated scan never advances the
   ingest watermark over unscanned content. Contributed by @mweber82.
 - Malformed extractor output is retried once with an explicit JSON-only
-  reminder before the turn's facts are given up on. Contributed by @herove.
-- Fence writes are committed durably. Contributed by @herove.
+  reminder before the turn's facts are given up on. Contributed by @frxiaobei.
+- Fence writes are committed durably. Contributed by @frxiaobei.
 - Reflex telemetry writes register before the CLI drain, so they are no
   longer lost at shutdown. Contributed by @monkeygold.
 - International home locations are supported in context resolution.
