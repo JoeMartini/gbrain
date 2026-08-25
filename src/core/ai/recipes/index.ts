@@ -26,6 +26,7 @@ import { azureOpenAI } from './azure-openai.ts';
 import { zeroentropyai } from './zeroentropyai.ts';
 import { llamaServerReranker } from './llama-server-reranker.ts';
 import { siliconflow } from './siliconflow.ts';
+import { nan } from './nan.ts';
 import { moonshot } from './moonshot.ts';
 import { mistral } from './mistral.ts';
 import { nvidia } from './nvidia.ts';
@@ -52,6 +53,7 @@ const ALL: Recipe[] = [
   azureOpenAI,
   zeroentropyai,
   siliconflow,
+  nan,
   moonshot,
   mistral,
   nvidia,
