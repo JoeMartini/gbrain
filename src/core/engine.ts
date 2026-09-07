@@ -1,5 +1,5 @@
 import type {
-  Page, PageInput, PageFilters, GetPageOpts,
+  Page, PageInput, PageFilters, GetPageOpts, PageReadScope, PageReadPolicy,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow, ChunklessPageRow,
   SearchResult, SearchOpts, ResolvedColumn,
   Link, GraphNode, GraphPath, RelationalFanoutRow, RelationalFanoutOpts,
@@ -61,7 +61,7 @@ export interface SourceRow {
   config: Record<string, unknown>;
 }
 
-export interface TraverseGraphOpts {
+export interface TraverseGraphOpts extends PageReadScope {
   sourceId?: string;
   sourceIds?: string[];
   frontierCap?: number;
@@ -295,7 +295,7 @@ export interface Take {
   updated_at: string;
 }
 
-export interface TakesListOpts {
+export interface TakesListOpts extends PageReadPolicy {
   page_id?: number;
   page_slug?: string;       // resolved via JOIN
   holder?: string;
@@ -399,7 +399,7 @@ export interface TakesScorecard {
   unresolvable_rate?: number | null;
 }
 
-export interface TakesScorecardOpts {
+export interface TakesScorecardOpts extends PageReadScope {
   holder?: string;
   domainPrefix?: string; // e.g. 'companies/' to scope the scorecard
   since?: string;        // ISO date 'YYYY-MM-DD'
@@ -423,7 +423,7 @@ export interface CalibrationBucket {
   predicted: number | null;
 }
 
-export interface CalibrationCurveOpts {
+export interface CalibrationCurveOpts extends PageReadScope {
   holder?: string;
   bucketSize?: number; // default 0.1
   /** Federated/source scope via the take's page.source_id (array wins over scalar). */
@@ -981,7 +981,7 @@ export interface BrainEngine {
    * `gbrain query --resolve` CLI path, etc.). Field names match the
    * `sourceScopeOpts(ctx)` helper output so callers can spread directly.
    */
-  resolveSlugs(partial: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<string[]>;
+  resolveSlugs(partial: string, opts?: PageReadScope): Promise<string[]>;
   /**
    * Returns the slug of every page in the brain. Used by batch commands as a
    * mutation-immune iteration source (alternative to listPages OFFSET pagination,
@@ -1154,7 +1154,7 @@ export interface BrainEngine {
    * them away). `includeEmbedding` opts back in, and beats
    * `getChunksWithEmbeddings`, which honors neither scope precedence nor RLS.
    */
-  getChunks(slug: string, opts?: { sourceId?: string; sourceIds?: string[]; includeEmbedding?: boolean }): Promise<Chunk[]>;
+  getChunks(slug: string, opts?: PageReadScope & { includeEmbedding?: boolean }): Promise<Chunk[]>;
   /**
    * Count chunks whose registry-ACTIVE embedding column IS NULL (S2).
    * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
@@ -1443,13 +1443,13 @@ export interface BrainEngine {
    * grant); the scalar branch is internal/CLI and keeps cross-source visibility
    * (reconcileLinks + back-link validators depend on it).
    */
-  getLinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getLinks(slug: string, opts?: PageReadScope): Promise<Link[]>;
   /**
    * v0.31.8 (D12 + D16): same `opts.sourceId` semantics as `getLinks`,
    * applied to the to-page side of the join. #2200: `opts.sourceIds` federated
    * grant constrains both endpoints (see `getLinks`).
    */
-  getBacklinks(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<Link[]>;
+  getBacklinks(slug: string, opts?: PageReadScope): Promise<Link[]>;
   /**
    * v114 (#1941): distinct link_source provenances with edge counts, for
    * `gbrain link-sources`. Source-scoped via `{sourceId?, sourceIds?}` (both
@@ -1512,7 +1512,7 @@ export interface BrainEngine {
    */
   traversePaths(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+    opts?: PageReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
   ): Promise<GraphPath[]>;
   /**
    * `traversePaths` plus its truncation signal. The final SELECT is bounded
@@ -1526,7 +1526,7 @@ export interface BrainEngine {
    */
   traversePathsDetailed(
     slug: string,
-    opts?: { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both'; sourceId?: string; sourceIds?: string[] },
+    opts?: PageReadScope & { depth?: number; linkType?: string; direction?: 'in' | 'out' | 'both' },
   ): Promise<{ paths: GraphPath[]; truncated: boolean }>;
   /**
    * Typed-edge relational fan-out for the relational recall arm (v0.43).
@@ -1558,7 +1558,7 @@ export interface BrainEngine {
    * Keyed by page id — NOT slug — so namesake slugs across sources never
    * share or sum counts (#4380). Ids with zero links map to 0.
    */
-  getBacklinkCounts(pageIds: number[]): Promise<Map<number, number>>;
+  getBacklinkCounts(pageIds: number[], opts?: PageReadScope): Promise<Map<number, number>>;
   /**
    * v0.40.4 — for a list of page_ids, return adjacency aggregates
    * restricted to the subgraph induced by them. Returns ALL pages with
@@ -1571,7 +1571,7 @@ export interface BrainEngine {
    *     target's own source), in-set
    *
    * SOURCE-SCOPE CONTRACT: pageIds MUST already be source-scoped by the
-   * caller. This method does NOT filter by source_id. Adjacency is
+   * caller. An optional read scope authorizes endpoints and origins. Adjacency is
    * page-id keyed and the in-set restriction makes cross-source leakage
    * impossible BY CONSTRUCTION (a leaked-in page_id from another source
    * would have to also appear in the caller's input set, which the
@@ -1584,7 +1584,7 @@ export interface BrainEngine {
    * source" (codex outside-voice #15). T-todo-4 captures the v0.41+
    * sync-topology-aware refinement.
    */
-  getAdjacencyBoosts(pageIds: number[]): Promise<Map<number, AdjacencyRow>>;
+  getAdjacencyBoosts(pageIds: number[], opts?: PageReadScope): Promise<Map<number, AdjacencyRow>>;
   /**
    * v0.42 (issue #1699): for a list of page_ids, return their
    * `frontmatter.content_flag` markers (reason + detail). Used by hybrid
@@ -1595,6 +1595,7 @@ export interface BrainEngine {
    */
   getContentFlagsByPageIds(
     pageIds: number[],
+    opts?: PageReadScope,
   ): Promise<Map<number, { reason: string; detail: string }>>;
   /**
    * Extraction quarantine lane (issue #160), widened for #4220: for a list
@@ -1610,6 +1611,7 @@ export interface BrainEngine {
    */
   getUnverifiedExtractionPageIds(
     pageIds: number[],
+    opts?: PageReadScope,
   ): Promise<Map<number, { unverified: boolean; status: string }>>;
   /**
    * v0.27.0: for a list of slugs, return their updated_at timestamps (or created_at fallback).
@@ -1629,7 +1631,7 @@ export interface BrainEngine {
    * Drives the new applyRecencyBoost post-fusion stage. Returns NULL for refs
    * with no row; map omits them.
    */
-  getEffectiveDates(refs: Array<{slug: string; source_id: string}>): Promise<Map<string, Date>>;
+  getEffectiveDates(refs: Array<{slug: string; source_id: string}>, opts?: PageReadScope): Promise<Map<string, Date>>;
   /**
    * v0.29.1: for a list of (slug, source_id) refs, return the salience score
    * (emotional_weight × 5 + ln(1 + take_count)) per ref. Single SQL query.
@@ -1639,7 +1641,7 @@ export interface BrainEngine {
    * (or zero emotional_weight + zero takes) get score = 0; the boost stage
    * skips them.
    */
-  getSalienceScores(refs: Array<{slug: string; source_id: string}>): Promise<Map<string, number>>;
+  getSalienceScores(refs: Array<{slug: string; source_id: string}>, opts?: PageReadPolicy): Promise<Map<string, number>>;
   /**
    * Return every page with no inbound links.
    * Domain comes from the frontmatter `domain` field (null if unset).
@@ -1665,10 +1667,10 @@ export interface BrainEngine {
   /**
    * #4280: rows carry `type` + `quarantined` so the shared orphan-reporting
    * policy can exclude machine leaf types and quarantined shells that slug
-   * conventions cannot infer. The SQL stays raw (no filtering here) — policy
-   * lives in ONE place (`shouldExcludeFromOrphanReporting`).
+   * conventions cannot infer. SQL applies read authorization; reporting exclusions remain in
+   * ONE place (`shouldExcludeFromOrphanReporting`).
    */
-  findOrphanPages(opts?: {
+  findOrphanPages(opts?: PageReadScope & {
     sourceId?: string;
     sourceIds?: string[];
     mode?: 'inbound' | 'islanded';
@@ -1744,9 +1746,9 @@ export interface BrainEngine {
   /** Events/timeline rows on or after `date`, optionally filtered by event.kind. */
   getSince(date: string, opts?: ChronicleTimelineOpts): Promise<ChronicleTimelineRow[]>;
   /** "On this day" — events from the same month-day in PRIOR years (default: today). */
-  getOnThisDay(opts?: { date?: string; limit?: number; sourceId?: string; sourceIds?: string[] }): Promise<ChronicleTimelineRow[]>;
+  getOnThisDay(opts?: PageReadScope & { date?: string; limit?: number }): Promise<ChronicleTimelineRow[]>;
   /** Most recent date an entity appears (its own page or an event's `who`). */
-  getLastSeen(entitySlug: string, opts?: { asof?: string; sourceId?: string; sourceIds?: string[] }): Promise<LastSeenResult>;
+  getLastSeen(entitySlug: string, opts?: PageReadScope & { asof?: string }): Promise<LastSeenResult>;
   /**
    * Upsert the date-index projection row for an event page: page_id = depth
    * page, event_page_id = event page, keyed (event_page_id, date). Re-extraction
@@ -1785,7 +1787,7 @@ export interface BrainEngine {
    * it, multi-source brains return raw_data rows from every same-slug page
    * (preserved via two-branch query for back-compat).
    */
-  getRawData(slug: string, source?: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<RawData[]>;
+  getRawData(slug: string, source?: string, opts?: PageReadScope): Promise<RawData[]>;
 
   // Files (v0.27.1: binary asset metadata + storage_path. Image bytes never
   // enter the DB; storage_path references a path inside the brain repo or an
@@ -2252,7 +2254,7 @@ export interface BrainEngine {
    * When omitted, returns versions for every same-slug page across sources
    * (pre-v0.31.8 behavior; preserved via two-branch query).
    */
-  getVersions(slug: string, opts?: { sourceId?: string; sourceIds?: string[] }): Promise<PageVersion[]>;
+  getVersions(slug: string, opts?: PageReadScope): Promise<PageVersion[]>;
   /**
    * v0.31.8 (D12): `opts.sourceId` source-scopes both the version lookup
    * and the page revert. Without it, multi-source brains can revert the
@@ -2319,6 +2321,7 @@ export interface BrainEngine {
   resolveSlugWithAlias(
     slug: string,
     sourceOrSources: string | readonly string[],
+    opts?: Pick<PageReadScope, 'excludePrivate'>,
   ): Promise<string>;
   /**
    * `resolveSlugWithAlias` plus the OWNING source of the winning alias row
@@ -2331,6 +2334,7 @@ export interface BrainEngine {
   resolveSlugWithAliasDetailed(
     slug: string,
     sourceOrSources: string | readonly string[],
+    opts?: Pick<PageReadScope, 'excludePrivate'>,
   ): Promise<{ canonical_slug: string; source_id: string } | null>;
 
   /**
@@ -2348,7 +2352,7 @@ export interface BrainEngine {
    */
   resolveAliases(
     aliasNorms: string[],
-    opts?: { sourceId?: string; sourceIds?: string[] },
+    opts?: PageReadScope,
   ): Promise<Map<string, Array<{ slug: string; source_id: string }>>>;
 
   /**
