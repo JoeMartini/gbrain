@@ -3,7 +3,24 @@
 On-demand reference (see CLAUDE.md Reference map). Current behavior + invariants
 only.
 
-`test/e2e/serve-http-oauth.test.ts` additionally pins confidential POST/Basic revocation, public-client SDK fallthrough, malformed/mixed authentication rejection, cross-client isolation, unknown-token opacity, metadata auth methods, no-store responses, strict post-revoke `401`, and retryable backend `503` semantics.
+`test/e2e/serve-http-oauth.test.ts` additionally pins confidential POST/Basic revocation, public-client SDK fallthrough, malformed/mixed authentication rejection, cross-client isolation, unknown-token opacity, metadata auth methods, no-store responses, strict post-revoke `401`, and retryable backend `503` semantics. SDK-driven discovery and real owner-approved PKCE also pin read-only bootstrap, explicit writer requests, scope clamping, and DCR delegation refusal. `test/oauth-scope-hint.test.ts` exercises the actual SDK middleware over HTTP without requiring a database.
+
+`test/put-page-persistence.test.ts` and `test/e2e/put-page-persistence-postgres.test.ts`
+pin the ordinary-error persistence boundary: contention does not publish a
+revision, filesystem failure rolls back the database transaction, embedding
+failure preserves the saved page, and a slow embed releases the page-owned
+worktree lock. The PGLite suite also covers source-path bookkeeping failure,
+legacy hashes, deletion/recreation, and secret-safe embedding diagnostics.
+Neither suite proves crash-atomic filesystem/database commit or a durable queue.
+
+`test/subagent-required-writes.test.ts` and
+`test/subagent-put-page-rejection.serial.test.ts` distinguish a persisted write
+from prose-only completion, rejected imports, and historical rejected ledger
+envelopes across the Anthropic, gateway, and oneshot lanes. Unchanged saves,
+optional-write jobs, and saved pages with failed enrichment are positive controls.
+`test/cycle/global-freshness-postcondition.serial.test.ts` exercises the registered
+maintenance handler with failed phases, incomplete children, budget deferrals,
+abort/lock loss, and successful warning-only controls.
 
 ### Test command tiers
 
@@ -618,6 +635,7 @@ Unit tests and what they cover:
 - `test/sync-failures.test.ts` — `classifyErrorCode` regex coverage for all 12 codes against literal production message strings from `markdown.ts` and `import-file.ts`; `summarizeFailuresByCode` sort + pre-classified-honor; `recordSyncFailures` code-field persistence; `acknowledgeSyncFailures` `AcknowledgeResult` shape + backfill on legacy entries.
 - `test/sync-soft-delete.serial.test.ts` — removed-file recovery arc: a `git rm` drained by sync SOFT-deletes the page (`deleted_at` set; row recoverable, not gone), an already-soft-deleted row isn't re-flipped (purge clock preserved), batch delete failures decompose to per-file batches and the run banks instead of aborting, delete → re-add inside the window revives via upsert (content updated, chunks replaced, no duplicate), soft-deleted pages stay invisible to search/getLinks/getBacklinks, the rename lane converges against an out-of-band soft delete, and full-sync reconcile + the unsyncable lane are SOFT with the purge window honored end-to-end.
 - `test/sync-exclude-config.test.ts` — persisted `sync.exclude` reach: honored with no flag on incremental AND first-sync full-walk paths, trailing-slash covers directory contents, a per-call flag narrows without re-opening the persisted scope, mixed comma+newline multi-pattern values, conservative posture (pages imported before the exclusion stay live, incl. full-sync reconcile), and a throwing/unreadable config read degrades to no-persisted-scope instead of breaking the sync.
+- `test/sync-include-hidden-config.test.ts` — persisted `sync.include_hidden` reach (the dot-directory waiver's twin to `sync.exclude`): baseline control (no config, no flag → dot-directory pruned), honored with no flag on incremental AND first-sync full-walk paths, trailing-slash covers nested files (lowercased slug), an unnamed dot-directory stays pruned, a per-call `includeHidden` unions with the persisted waiver, and a throwing config read degrades to no-waiver instead of breaking the sync.
 - `test/doctor.test.ts` — doctor command; assertions that `jsonb_integrity` scans the four JSONB write sites and `markdown_body_completeness` is present.
 - `test/utils.test.ts` — shared SQL utilities + `tryParseEmbedding` null-return and single-warn semantics.
 - `test/build-llms.test.ts` — `llms.txt`/`llms-full.txt` generator: path resolution, idempotence, spec shape, regen-drift guard, content contract, AGENTS.md install-path mirror, size-budget enforcement.
