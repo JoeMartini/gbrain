@@ -56,6 +56,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 
 import type { BrainEngine } from '../engine.ts';
+import { assertUnmanagedCanonicalWriter } from '../persistence/maintenance.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
@@ -94,6 +95,7 @@ interface ExistingPageFact {
   // equality compare cannot churn on case/format/NULL.
   visibility: string;
   notability: string;
+  has_embedding: boolean;
 }
 
 function factContentKey(fact: string, source: string | null | undefined): string {
@@ -223,7 +225,8 @@ async function listExistingFactsForPage(
   sourceId: string,
 ): Promise<ExistingPageFact[]> {
   return engine.executeRaw<ExistingPageFact>(
-    `SELECT id, fact, source, row_num, superseded_by, expired_at, visibility, notability
+    `SELECT id, fact, source, row_num, superseded_by, expired_at, visibility, notability,
+            embedding IS NOT NULL AS has_embedding
        FROM facts
       WHERE source_id = $1
         AND source_markdown_slug = $2
@@ -356,6 +359,7 @@ export async function runExtractFacts(
   engine: BrainEngine,
   opts: ExtractFactsOpts = {},
 ): Promise<ExtractFactsResult> {
+  await assertUnmanagedCanonicalWriter(engine, 'legacy fact-fence reconciliation');
   const sourceId = opts.sourceId ?? 'default';
   const result: ExtractFactsResult = {
     pagesScanned: 0,
@@ -614,6 +618,35 @@ export async function runExtractFacts(
     const existingKeys = new Set(existing.map(f => factContentKey(f.fact, f.source)));
     const desiredByKey = new Map(extracted.map(f => [factContentKey(f.fact, f.source), f]));
 
+    const restrictions = existing.filter(fact => {
+      const desired = desiredByKey.get(factContentKey(fact.fact, fact.source));
+      return (fact.expired_at == null && (!desired || desired.expired_at != null))
+        || (fact.visibility !== 'private' && desired?.visibility === 'private');
+    });
+    if (restrictions.length > 0) {
+      const restricted = await underPageLock(slug, async () => {
+        if (await refuseDestructiveReconcileOnStaleCache(
+          engine, slug, sourceId, page.compiled_truth ?? '', page.timeline ?? '', result.warnings,
+        )) return null;
+        return engine.transaction(async tx => {
+          const current = await tx.getPage(slug, { sourceId });
+          if (!current || current.compiled_truth !== page.compiled_truth || current.timeline !== page.timeline) return null;
+          for (const fact of restrictions) {
+            const desired = desiredByKey.get(factContentKey(fact.fact, fact.source));
+            await tx.executeRaw(
+              `UPDATE facts SET expired_at=COALESCE(expired_at,$5::timestamptz),
+                 visibility=CASE WHEN $6 THEN 'private' ELSE visibility END
+               WHERE id=$1 AND source_id=$2 AND fact=$3 AND source IS NOT DISTINCT FROM $4`,
+              [fact.id, sourceId, fact.fact, fact.source,
+                !desired ? new Date() : desired.expired_at ?? null, desired?.visibility === 'private'],
+            );
+          }
+          return true;
+        });
+      }, opts, result.warnings);
+      if (!restricted) continue;
+    }
+
     if (extracted.length === 0) {
       if (existing.length > 0) {
         const deletion = await underPageLock(slug, async () => {
@@ -768,10 +801,15 @@ export async function runExtractFacts(
             embed(texts, { abortSignal: opts.signal }),
             embed(texts, { abortSignal: opts.signal, dimensions: 2048 }),
           ]);
-          // Defensive: embed should return one vector per input; if the
-          // gateway returns a partial array (provider partial-batch retry
-          // returning fewer than requested), only fill what we have.
-          for (let i = 0; i < toInsert.length && i < embeddings.length; i++) {
+          // Strict batch validation (upstream #5361 wave): treat a partial or
+          // non-finite batch as a failed embed (throw -> caught below -> NULL
+          // embeddings + warning) instead of a silent partial fill drifting
+          // fact vectors out of sync with their page rows.
+          if (embeddings.length !== toInsert.length || embeddings.some(vector =>
+            !vector?.length || !vector.every(Number.isFinite))) {
+            throw new Error('embedding provider returned an incomplete or invalid fact batch');
+          }
+          for (let i = 0; i < toInsert.length; i++) {
             toInsert[i].embedding = embeddings[i];
           }
           for (let i = 0; i < extracted.length && i < embeddings2048.length; i++) {
@@ -793,20 +831,44 @@ export async function runExtractFacts(
         // NULL-embedding rows with a clean green 'ok', hiding the degraded
         // consolidate/drift_score behavior until someone diffed the DB.
         result.warnings.push(
-          `${slug}: embedding gateway unavailable — ${toInsert.length} fact(s) inserted with NULL embedding (won't cluster in consolidate until re-embedded)`,
+          `${slug}: embedding gateway unavailable — ${toInsert.length} fact(s) need embeddings (NULL embeddings won't cluster in consolidate until re-embedded)`,
         );
       }
     }
 
+    if (isAborted(opts.signal)) {
+      result.warnings.push(`${slug}: fact reconciliation deferred after cancellation; existing rows preserved`);
+      break;
+    }
+    if (deleteForPageFirst && existing.some(fact => fact.has_embedding)
+      && toInsert.some(fact => !fact.embedding)) {
+      result.warnings.push(`${slug}: destructive fact reconciliation deferred; existing vectors preserved until embedding succeeds`);
+      continue;
+    }
+
     if (toInsert.length === 0) continue;
 
-    const insert = () => engine.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
-      toInsert,
-      { source_id: sourceId },
-      deleteForPageFirst ? { deleteForPageFirst } : undefined,
-    );
+    const insert = async () => {
+      try {
+        return await engine.transaction(async tx => {
+          opts.signal?.throwIfAborted();
+          const inserted = await tx.insertFacts( // gbrain-allow-direct-insert: extract_facts cycle phase reconciles fence → DB
+            toInsert,
+            { source_id: sourceId },
+            deleteForPageFirst ? { deleteForPageFirst } : undefined,
+          );
+          opts.signal?.throwIfAborted();
+          return inserted;
+        });
+      } catch (error) {
+        if (!isAborted(opts.signal)) throw error;
+        result.warnings.push(`${slug}: fact reconciliation cancelled; transaction rolled back`);
+        return null;
+      }
+    };
     const inserted = deleteForPageFirst
       ? await underPageLock(slug, async () => {
+        if (isAborted(opts.signal)) return null;
         if (await refuseDestructiveReconcileOnStaleCache(
           engine,
           slug,
@@ -817,6 +879,7 @@ export async function runExtractFacts(
         )) {
           return null;
         }
+        if (isAborted(opts.signal)) return null;
         return insert();
       }, opts, result.warnings)
       : await insert();
