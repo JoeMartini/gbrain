@@ -265,6 +265,7 @@ describe('meta-hook cache hygiene (bounded, expired-entry eviction)', () => {
       source_session: null,
       confidence: 0.9,
       embedding: null,
+      embedding_2048: null,
       embedded_at: null,
       created_at: new Date(),
     });
