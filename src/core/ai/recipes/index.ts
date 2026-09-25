@@ -24,7 +24,6 @@ import { dashscope } from './dashscope.ts';
 import { dashscopeRerank } from './dashscope-rerank.ts';
 import { zhipu } from './zhipu.ts';
 import { azureOpenAI } from './azure-openai.ts';
-import { zeroentropyai } from './zeroentropyai.ts';
 import { llamaServerReranker } from './llama-server-reranker.ts';
 import { siliconflow } from './siliconflow.ts';
 import { nan } from './nan.ts';
@@ -53,7 +52,6 @@ const ALL: Recipe[] = [
   dashscopeRerank,
   zhipu,
   azureOpenAI,
-  zeroentropyai,
   siliconflow,
   nan,
   moonshot,
