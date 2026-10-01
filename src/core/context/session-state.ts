@@ -7,7 +7,7 @@
  * columns are written through the sanctioned `$N::text::jsonb` positional path
  * (binds as text, the cast parses it — dodges the postgres.js ::jsonb
  * double-encode trap; guarded by scripts/check-jsonb-params.mjs). The table is
- * `session_context_state` (migration v127); its schema parity is covered by the
+ * `session_context_state` (migration v126); its schema parity is covered by the
  * schema-drift e2e.
  *
  * Key is (source_id, client_id, session_id). `client_id` is the caller's OAuth

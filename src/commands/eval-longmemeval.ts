@@ -40,7 +40,8 @@
 import { homedir } from 'os';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
-import { withBenchmarkBrain, resetTables } from '../eval/longmemeval/harness.ts';
+import { brainRecycler, createBenchmarkBrain, LME_BRAIN_RECYCLE_EVERY, resetTables } from '../eval/longmemeval/harness.ts';
+export { LME_BRAIN_RECYCLE_EVERY };
 import { haystackToPages, normalizeSessions } from '../eval/longmemeval/adapter.ts';
 import {
   generateAnswer,
@@ -488,6 +489,9 @@ export interface RunOpts {
    * the result of createBenchmarkBrain(); the caller owns lifecycle.
    */
   engine?: PGLiteEngine;
+  /** #5092 test seams: brain recycle interval and factory (harness-owned brain only). */
+  brainRecycleEvery?: number;
+  createBrain?: () => Promise<PGLiteEngine>;
   /**
    * Live nightly-probe search-mode/reranker settings copied into the isolated
    * benchmark brain (#3676). Explicit pin flags (--mode/--reranker/--autocut/
@@ -829,7 +833,7 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     // Gate on the RESOLVED reranker pin (flag, --search-pin, snapshot or bundle),
     // not the flag alone: a configured-but-silently-skipped reranker never exits 0.
     if (pins.reranker.enabled && st.rerankerSkippedRows > 0) {
-      process.stderr.write(`[longmemeval] FAIL reranker on (resolved pin): ${st.rerankerSkippedRows} row(s) fell through un-reranked (reranker_skipped / rerank_passthrough) — pass --reranker off or set the reranker provider key (e.g. VOYAGE_API_KEY)\n`);
+      process.stderr.write(`[longmemeval] FAIL reranker on (resolved pin): ${st.rerankerSkippedRows} row(s) fell through un-reranked (reranker_skipped / rerank_passthrough / rerank_failed) — pass --reranker off or set the reranker provider key (e.g. VOYAGE_API_KEY)\n`);
       exitCode = 1;
     }
     // Every question of this run errored AND the output holds no scored row
@@ -1127,7 +1131,7 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     embedTxn: (fn) => fn(),
   };
 
-  const work = async (engine: PGLiteEngine): Promise<void> => {
+  const configureBrain = async (engine: PGLiteEngine): Promise<void> => {
     // #3676: nightly probe callers may copy audited live search config into
     // this isolated engine. Data tables stay hermetic.
     for (const [key, value] of Object.entries(runOpts.searchConfigSnapshot ?? {})) {
@@ -1146,6 +1150,10 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     if (opts.expansionVariantBudget !== undefined) {
       await engine.setConfig('search.expansion_variant_budget', opts.expansionVariantBudget === null ? 'legacy' : String(opts.expansionVariantBudget));
     }
+  };
+
+  const work = async (engine: PGLiteEngine): Promise<void> => {
+    await configureBrain(engine);
 
     // Resolved reranker pin on (flag, --search-pin, snapshot or bundle):
     // preflight. A reranker that cannot run would silently turn every row
@@ -1191,6 +1199,9 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     // below; a fresh output path (no resume, or a resume into a different
     // file) is truncated and the prior rows are carried forward explicitly.
     const emitter = makeEmitter(opts.outputPath, appendOutput);
+    // #5092: a harness-owned brain is replaced on a fixed cadence (see brainRecycler).
+    const brains = brainRecycler(engine, runOpts.engine ? 0 : (runOpts.brainRecycleEvery ?? LME_BRAIN_RECYCLE_EVERY),
+      runOpts.createBrain ?? createBenchmarkBrain, configureBrain);
     progress.start('eval.longmemeval', backfill.length + questions.length);
     try {
       // Judge-only backfill first (prior rows, no reader call), then re-emit
@@ -1216,9 +1227,10 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
         if (opts.judge && !appendOutput) emitter.emit(row);
       }
       for (const q of questions) {
+        const brain = await brains.next();
         const qStart = Date.now();
         try {
-          const outcome = await runOneQuestion(engine, q, ctx);
+          const outcome = await runOneQuestion(brain, q, ctx);
           if (judgeCtx && typeof outcome.row.error !== 'string') {
             // Judge inline from the row's hypothesis (the same path the backfill
             // takes). A judge THROW (judgeRow never throws for a transport
@@ -1281,6 +1293,7 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
         }
       }
     } finally {
+      await brains.close();
       progress.finish();
       emitter.close();
       if (appendOutput && opts.outputPath) {
@@ -1306,7 +1319,12 @@ export async function runEvalLongMemEval(args: string[], runOpts: RunOpts = {}):
     // Caller owns engine lifecycle (typically a test beforeAll/afterAll).
     await work(runOpts.engine);
   } else {
-    await withBenchmarkBrain(work);
+    const first = await (runOpts.createBrain ?? createBenchmarkBrain)();
+    try {
+      await work(first);
+    } finally {
+      await first.disconnect();
+    }
   }
 
   if (trajectoryEnabled) {
