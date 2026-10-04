@@ -71,6 +71,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'calibration_freshness',
   'child_table_orphans',
   'chronicle_projection_health',
+  'auto_chronicle',
+  'fact_take_vectors',
   'code_chunk_metadata',
   'content_hash_duplicates',
   'content_sanity_audit_recent',
@@ -182,6 +184,8 @@ export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
  * Infrastructure liveness signals. DB, workers, OAuth, RLS, locks, providers.
  */
 export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // F4b: PGLite row-delta planner statistics / Postgres autovacuum ANALYZE lag on the hot tables.
+  'planner_stats_stale',
   'alternative_providers',
   'autopilot_fanout_concurrency',
   'autopilot_lock_scope',
@@ -213,6 +217,7 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'oauth_confidential_client_health',
   'orphan_clones',
   'persistence_capacity',
+  'worktree_refresh_stuck',
   'persistence_request_growth',
   'persistence_request_indexes',
   'stale_embedding_effects',
@@ -230,8 +235,13 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'pool_budget',
   'progressive_batch_audit_health',
   'queue_health',
+  // #4578: brain-wide maintenance jobs dying at their deadline.
+  'global_maintenance_timeouts',
   // #5157: queued jobs from before the v0.50 authority cutover block every worker.
   'legacy_job_authority',
+  // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).
+  'legacy_token_grant_shape',
+  'legacy_token_grant_drift',
   'reranker_health',
   'rls',
   'rls_event_trigger',

@@ -1693,9 +1693,31 @@ END $$;
 
 -- Canonical page state (migration 150).
 -- BEGIN GENERATED from src/core/page-state/schema.ts (PAGE_STATE_SCHEMA_SQL). Edit that file, then run: bun run build:schema
-ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID NOT NULL DEFAULT gen_random_uuid();
+DO $do$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attisdropped) THEN
+      ALTER TABLE sources ADD COLUMN IF NOT EXISTS incarnation UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND atthasdef) THEN
+      ALTER TABLE sources ALTER COLUMN incarnation SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'sources'::regclass AND attname = 'incarnation' AND NOT attnotnull) THEN
+      UPDATE sources SET incarnation = gen_random_uuid() WHERE incarnation IS NULL;
+      ALTER TABLE sources ALTER COLUMN incarnation SET NOT NULL;
+    END IF;
+  END $do$;
 CREATE UNIQUE INDEX IF NOT EXISTS sources_incarnation_key ON sources(incarnation);
-ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID NOT NULL DEFAULT gen_random_uuid();
+DO $do$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attisdropped) THEN
+      ALTER TABLE pages ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND atthasdef) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET DEFAULT gen_random_uuid();
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pages'::regclass AND attname = 'knowledge_revision' AND NOT attnotnull)
+       AND NOT EXISTS (SELECT 1 FROM pages) THEN
+      ALTER TABLE pages ALTER COLUMN knowledge_revision SET NOT NULL;
+    END IF;
+  END $do$;
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS text_projection_revision UUID;
 ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS knowledge_revision UUID;
 ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS timeline TEXT;
@@ -1710,6 +1732,11 @@ CREATE TABLE IF NOT EXISTS page_write_guards (
   );
 CREATE OR REPLACE FUNCTION gbrain_advance_page_revision() RETURNS trigger LANGUAGE plpgsql AS $fn$
     BEGIN
+      IF OLD.knowledge_revision IS NULL THEN
+        NEW.knowledge_revision := COALESCE(NEW.knowledge_revision, gen_random_uuid());
+        NEW.text_projection_revision := NULL;
+        RETURN NEW;
+      END IF;
       IF (NEW.source_id, NEW.slug, NEW.type, NEW.page_kind, NEW.title, NEW.compiled_truth,
           NEW.timeline, NEW.frontmatter, NEW.deleted_at)
          IS DISTINCT FROM
@@ -1901,11 +1928,10 @@ BEGIN
     END IF;
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
-    IF TG_TABLE_NAME='facts' THEN
-      row_data := row_data - ARRAY['embedding_model','embedded_text_hash'];
-      old_data := old_data - ARRAY['embedding_model','embedded_text_hash'];
-    END IF;
-    -- Embedding completion and retrieval telemetry are physical projections.
+    row_data := row_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    old_data := old_data - ARRAY['embedding_model','embedded_text_hash'] - ARRAY['write_request_id','write_principal_kind','write_principal_id','last_write_request_id','last_write_principal_kind','last_write_principal_id','last_written_at'];
+    -- Embedding completion, retrieval telemetry and write attribution
+    -- (attribution-schema.ts; a journal backfill fills it) are physical projections.
     IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
       = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
   END IF;
@@ -1999,6 +2025,29 @@ CREATE TABLE IF NOT EXISTS persistence_topology_changes (
 ALTER TABLE persistence_topology_changes ADD COLUMN IF NOT EXISTS intent_bytes bigint NOT NULL DEFAULT 0 CHECK(intent_bytes>=0);
 CREATE INDEX IF NOT EXISTS persistence_topology_recovering ON persistence_topology_changes(created_at) WHERE state='recovering';
 -- END GENERATED from src/core/persistence/topology-schema.ts (PERSISTENCE_TOPOLOGY_SCHEMA_SQL)
+
+-- BEGIN GENERATED from src/core/persistence/worktree-refresh-schema.ts (WORKTREE_REFRESH_SCHEMA_SQL). Edit that file, then run: bun run build:schema
+CREATE TABLE IF NOT EXISTS persistence_worktree_refreshes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  worktree_id uuid NOT NULL REFERENCES persistence_worktrees(id),
+  source_ids text[] NOT NULL,
+  principal_id uuid NOT NULL,
+  owner_epoch bigint NOT NULL,
+  topology_generation bigint NOT NULL,
+  state text NOT NULL CHECK (state IN ('draining','fenced','merged','syncing','completed','aborted','recovery_required')),
+  old_head text NOT NULL,
+  target_head text NOT NULL,
+  upstream_ref text NOT NULL,
+  preserved_uncommitted text[] NOT NULL DEFAULT '{}',
+  outcome jsonb NOT NULL DEFAULT '{}',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+CREATE UNIQUE INDEX IF NOT EXISTS persistence_worktree_refreshes_active
+  ON persistence_worktree_refreshes(worktree_id)
+  WHERE state IN ('draining','fenced','merged','syncing','recovery_required');
+-- END GENERATED from src/core/persistence/worktree-refresh-schema.ts (WORKTREE_REFRESH_SCHEMA_SQL)
 
 -- BEGIN GENERATED from src/core/company-brain/receipt-schema.ts (SOURCE_INGESTION_RECEIPTS_SCHEMA_SQL). Edit that file, then run: bun run build:schema
 CREATE TABLE IF NOT EXISTS source_ingestion_receipts (
@@ -2444,3 +2493,12 @@ DO $rls$ BEGIN
   END IF;
 END $rls$;
 -- END GENERATED from src/core/facts/relink-schema.ts (FACT_RELINK_SCHEMA_SQL)
+
+-- #5255/#5176 (O-DX-8): last upstream observation per source, recorded by sync
+-- from the checkout's Git state (upstream ref, its last fetch/push time, commits
+-- the synced commit lacks); doctor sync_freshness reads it with no subprocess.
+-- Added last so a fresh install has the column order an upgraded brain gets.
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_checked_at TIMESTAMPTZ;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_commit TEXT;
+ALTER TABLE sources ADD COLUMN IF NOT EXISTS upstream_behind INTEGER;
+

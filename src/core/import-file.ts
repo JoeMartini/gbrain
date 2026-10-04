@@ -1,5 +1,6 @@
 import { assertUnmanagedCanonicalWriter } from './persistence/maintenance.ts';
-import { assertImportBase, sameCanonicalImport } from './page-state/import-guard.ts';
+import { maintenanceTransaction } from './persistence/attribution.ts';
+import { assertImportBase, sameCanonicalImport, sameContentAnyKeyOrder } from './page-state/import-guard.ts';
 import { stabilizeSafetyAssessments } from './persistence/reconcile-safety.ts';
 import { decideImportIdentity, collidingSlugOwner, fileOriginUri } from './import-identity.ts';
 import { readSourceFileSync } from './minions/source-filesystem.ts';
@@ -683,14 +684,30 @@ export async function importFromContent(
       await assertImportBase(tx, slug, sourceId ?? 'default', existing);
       if (refreshBody) await tx.refreshPageBody(slug, sourceId ?? 'default', parsed.compiled_truth, parsed.timeline || '', hash);
       await refreshSourcePath(tx, slug, sourceId, opts.sourcePath, existing, originUri);
-      if (opts.beforeCommit) await verifyPageReadable(tx, slug, hash, sourceId, 'importFromContent');
+      if (opts.beforeCommit) await verifyPageReadable(tx, slug, refreshBody ? hash : existing?.content_hash ?? hash, sourceId, 'importFromContent');
       await opts.beforeCommit?.(tx, slug);
     });
   };
 
   // Rebuild stale projections without granting --force-rechunk's external-ID dedup override.
   const needsProjectionRebuild = !opts.prepare && existing && existing.text_projection_revision !== existing.knowledge_revision;
-  if (existing?.content_hash === hash && !existing.deleted_at && !opts.forceRechunk && !needsProjectionRebuild && (!opts.prepare || sameCanonicalImport(existingSnapshot, parsedPage))) {
+  // #3694 one-time reconcile: a row written by the PRE-fix putPage formula
+  // carries the legacy hash. When the parsed file matches that legacy hash,
+  // the content is unchanged — stamp the canonical hash via the narrow
+  // refreshPageBody UPDATE (no chunk churn, no re-embed, no version snapshot)
+  // and skip. The next import then hits the fast path below.
+  const legacyHashMatch = !!existing && !existing.deleted_at && !opts.prepare && !opts.forceRechunk && !needsProjectionRebuild
+    && typeof engine.refreshPageBody === 'function' && existing.content_hash === contentHashLegacy({
+      title: parsed.title,
+      type: parsed.type,
+      compiled_truth: parsed.compiled_truth,
+      timeline: parsed.timeline,
+      frontmatter: parsed.frontmatter,
+    });
+  const unchanged = !!existing && !existing.deleted_at && !opts.forceRechunk && !needsProjectionRebuild && (existing.content_hash === hash
+    ? !opts.prepare || sameCanonicalImport(existingSnapshot, parsedPage)
+    : !legacyHashMatch && await sameContentAnyKeyOrder(engine, existing, existingSnapshot?.tags ?? null, parsedPage, sourceId ?? 'default'));
+  if (existing && unchanged) {
     // #5050: unchanged content chunked before the safe-chunk fence is re-sealed
     // projection-only; the canonical write stays a no-op.
     const reseal = await projectionBelowSafeFence(engine, existing.id);
@@ -705,24 +722,10 @@ export async function importFromContent(
     return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}) };
   }
 
-  // #3694 one-time reconcile: a row written by the PRE-fix putPage formula
-  // carries the legacy hash. When the parsed file matches that legacy hash,
-  // the content is unchanged — stamp the canonical hash via the narrow
-  // refreshPageBody UPDATE (no chunk churn, no re-embed, no version snapshot)
-  // and skip. The next import then hits the fast path above.
-  if (existing && !existing.deleted_at && !opts.prepare && !opts.forceRechunk && !needsProjectionRebuild && typeof engine.refreshPageBody === 'function') {
-    const legacyHash = contentHashLegacy({
-      title: parsed.title,
-      type: parsed.type,
-      compiled_truth: parsed.compiled_truth,
-      timeline: parsed.timeline,
-      frontmatter: parsed.frontmatter,
-    });
-    if (existing.content_hash === legacyHash) {
-      await persistUnchanged(true);
-      const resealed = await projectionBelowSafeFence(engine, existing.id) ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
-      return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}) };
-    }
+  if (existing && legacyHashMatch) {
+    await persistUnchanged(true);
+    const resealed = await projectionBelowSafeFence(engine, existing.id) ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
+    return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}) };
   }
 
   // Identity dedup (#1309): move, skip a true duplicate, or index both.
@@ -1029,7 +1032,7 @@ export async function importFromContent(
     validate: tx => assertPreparedFactWithdrawals(tx, txOpts.sourceId, parsed.compiled_truth, parsed.timeline || '', slug),
     apply: applyPrepared,
   });
-  await engine.transaction(applyPrepared).catch(async (err: unknown) => {
+  await maintenanceTransaction(engine, applyPrepared).catch(async (err: unknown) => {
     // #4287: name the dimension-mismatch rollback instead of letting the bare
     // pgvector message ("expected N dimensions, not M") surface with no code,
     // no consequence and no fix. S2: name the registry-ACTIVE column the
@@ -1544,7 +1547,7 @@ export async function importCodeFile(
     const result: ImportResult = { slug, status: 'imported', chunks: chunks.length };
     return opts.prepare({ slug, parsedPage, observedRevision: existing?.knowledge_revision ?? null, noop: false, result, validate: async () => {}, apply });
   }
-  await engine.transaction(apply);
+  await maintenanceTransaction(engine, apply);
 
   // Post-write read-back verification.
   // Same guard as the markdown path: a code page write is not "done" until
@@ -1694,7 +1697,7 @@ export async function withImportTransaction(
   engine: BrainEngine,
   spec: ImportTransactionSpec,
 ): Promise<void> {
-  await engine.transaction(tx => applyImportTransaction(tx, spec));
+  await maintenanceTransaction(engine, tx => applyImportTransaction(tx, spec));
 }
 
 async function applyImportTransaction(tx: BrainEngine, spec: ImportTransactionSpec): Promise<void> {
