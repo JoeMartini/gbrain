@@ -21,9 +21,11 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { operations } from '../src/core/operations.ts';
-import { runSourcesRefresh } from '../src/commands/sources-refresh.ts';
+import { parseRefreshArgs, runSourcesRefresh } from '../src/commands/sources-refresh.ts';
 import { claimCoalescedGitEffects, claimPersistenceEffect } from '../src/core/persistence/effect-journal.ts';
 import { localHostId } from '../src/core/persistence/identity.ts';
+import { tryAcquireNativeLock } from '../src/core/persistence/native-lock.ts';
+import { getWorktreeBinding } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { runManagedSourceLifecycle } from '../src/core/persistence/source-lifecycle.ts';
 import { runPersistenceAdministration } from '../src/core/persistence/administration.ts';
@@ -62,6 +64,13 @@ const refusedWith = async (promise: Promise<unknown>, code: string) => {
   expect(error!.code).toBe(code);
   return error!;
 };
+test('refresh timer bounds reject overflow and accept the maximum delay', () => each(async f => {
+  await refusedWith(refreshWorktree(f.engine, f.alpha, { fetchTimeoutMs: 2 ** 31 }), 'invalid_params');
+  const drain = parseRefreshArgs([f.alpha, '--wait-drain', String((2 ** 31) / 1000), '--dry-run']).options;
+  expect(drain.waitDrainMs).toBeGreaterThan(2 ** 31 - 1); // the drain wait is a performance.now() deadline, not a timer: still accepted
+  expect((await refreshWorktree(f.engine, f.alpha, drain)).status).toBe('dry_run');
+  expect((await refreshWorktree(f.engine, f.alpha, { fetchTimeoutMs: 2 ** 31 - 1, dryRun: true })).status).toBe('dry_run');
+}));
 /** Requeue a committed git effect so the drain must wait for the consumer to process it again. */
 async function requeueGitEffect(f: RefreshFixture, delayMs: number): Promise<number> {
   const [effect] = await f.engine.executeRaw<{ id: number }>(`SELECT id FROM persistence_effects WHERE worktree_id=$1::uuid AND kind='git' ORDER BY id DESC LIMIT 1`, [f.worktreeId]);
@@ -271,6 +280,91 @@ test('13. drain starvation: a writer every 50 ms is refused during draining and 
   expect(outcomes.filter(code => code === 'worktree_refreshing').length).toBeGreaterThan(3);
   expect(existsSync(join(f.root, 'alpha/two.md'))).toBe(true);
 }), 180_000);
+
+test('13b. a publication in flight (recovery under a live claim) is drained, not refused; one no live claim holds is recovery_required', () => each(async f => {
+  f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
+  await f.put(f.alpha, 'notes/seed', page('Seed', 'Has a worktree request.'));
+  const [request] = await f.engine.executeRaw<{ id: string }>(
+    'SELECT id::text FROM persistence_requests WHERE source_id=$1 AND worktree_id IS NOT NULL ORDER BY sequence DESC LIMIT 1', [f.alpha]);
+  const publishing = (claim: string) => f.engine.executeRaw(
+    `UPDATE persistence_requests SET state='running', recovery='{"version":1}'::jsonb, claim_expires_at=now()+$2::interval WHERE id=$1::uuid`, [request.id, claim]);
+  try {
+    await publishing('10 minutes');
+    await refusedWith(refreshWorktree(f.engine, f.alpha, { waitDrainMs: 300 }), 'refresh_drain_timeout');
+    await publishing('-1 minute');
+    await refusedWith(refreshWorktree(f.engine, f.alpha, { waitDrainMs: 300 }), 'refresh_recovery_required');
+  } finally {
+    await f.engine.executeRaw(`UPDATE persistence_requests SET state='committed', recovery=NULL, claim_expires_at=NULL WHERE id=$1::uuid`, [request.id]);
+  }
+}), 120_000);
+
+test('13c. a committed write whose publisher still holds the worktree lock (recovery not yet cleared) is drained, not refused', () => each(async f => {
+  // The coordinator commits the receipt (completeWrite) and only then clears the request's recovery record
+  // (clearResolvedRecovery), holding the worktree native lock throughout. A refresh whose precheck lands in
+  // that window used to refuse refresh_recovery_required; on loaded CI this flaked cases 8 and 13.
+  const target = f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
+  await f.put(f.alpha, 'notes/seed', page('Seed', 'Has a worktree request.'));
+  const [request] = await f.engine.executeRaw<{ id: string }>(
+    'SELECT id::text FROM persistence_requests WHERE source_id=$1 AND worktree_id IS NOT NULL ORDER BY sequence DESC LIMIT 1', [f.alpha]);
+  const binding = (await getWorktreeBinding(f.engine, f.alpha))!;
+  // Let the seed's Git effect finish, then stop the resident consumer so its recovery scan cannot settle the planted record.
+  for (let i = 0; i < 100; i++) {
+    const [busy] = await f.engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM persistence_effects
+      WHERE worktree_id=$1::uuid AND kind IN ('git','withdrawal-mirror') AND state IN ('queued','running')`, [f.worktreeId]);
+    if (Number(busy.n) === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  await disposePersistenceConsumer(f.engine);
+  const committedWithRecovery = () => f.engine.executeRaw(
+    `UPDATE persistence_requests SET recovery='{"version":1}'::jsonb, claim_expires_at=NULL WHERE id=$1::uuid AND state='committed'`, [request.id]);
+  const clear = () => f.engine.executeRaw('UPDATE persistence_requests SET recovery=NULL WHERE id=$1::uuid', [request.id]);
+  try {
+    // No live owner: the same record left by a crashed publisher is still refused.
+    await committedWithRecovery();
+    await refusedWith(refreshWorktree(f.engine, f.alpha, { waitDrainMs: 300 }), 'refresh_recovery_required');
+    // Live owner: the publisher holds the worktree lock until it clears the record.
+    const lock = (await tryAcquireNativeLock(binding.coordination_path!))!;
+    expect(lock).not.toBeNull();
+    await committedWithRecovery();
+    const publisherFinishes = new Promise<void>(resolve => setTimeout(() => { void clear().then(() => lock.release()).then(resolve); }, 400));
+    const result = await refreshWorktree(f.engine, f.alpha, { waitDrainMs: 10_000 });
+    await publisherFinishes;
+    expect(result).toMatchObject({ status: 'completed', target_head: target });
+  } finally { await clear(); }
+}), 120_000);
+
+test('13d. a publisher that clears its record and releases the lock between the precheck probe and its lock attempt is not refused', () => each(async f => {
+  // TOCTOU on 13c's fix: the precheck sees the record, then the publisher finishes before the lock probe.
+  const target = f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
+  await f.put(f.alpha, 'notes/seed', page('Seed', 'Has a worktree request.'));
+  const [request] = await f.engine.executeRaw<{ id: string }>(
+    'SELECT id::text FROM persistence_requests WHERE source_id=$1 AND worktree_id IS NOT NULL ORDER BY sequence DESC LIMIT 1', [f.alpha]);
+  for (let i = 0; i < 100; i++) {
+    const [busy] = await f.engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM persistence_effects
+      WHERE worktree_id=$1::uuid AND kind IN ('git','withdrawal-mirror') AND state IN ('queued','running')`, [f.worktreeId]);
+    if (Number(busy.n) === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  await disposePersistenceConsumer(f.engine);
+  const clear = () => f.engine.executeRaw('UPDATE persistence_requests SET recovery=NULL WHERE id=$1::uuid', [request.id]);
+  await f.engine.executeRaw(`UPDATE persistence_requests SET recovery='{"version":1}'::jsonb, claim_expires_at=NULL WHERE id=$1::uuid AND state='committed'`, [request.id]);
+  const engine = f.engine as BrainEngine & { executeRaw: BrainEngine['executeRaw'] };
+  const original = engine.executeRaw;
+  let finished = false;
+  // Intercept only the precheck's first recovery probe, then hand the engine back untouched.
+  engine.executeRaw = (async (sql: string, params?: unknown[], opts?: unknown) => {
+    if (finished || !sql.includes('AS publication')) return original.call(engine, sql, params as never, opts as never);
+    finished = true;
+    engine.executeRaw = original;
+    const rows = await original.call(engine, sql, params as never, opts as never);
+    await clear();
+    return rows;
+  }) as BrainEngine['executeRaw'];
+  try {
+    expect(await refreshWorktree(f.engine, f.alpha, { waitDrainMs: 10_000 })).toMatchObject({ status: 'completed', target_head: target });
+    expect(finished).toBe(true);
+  } finally { engine.executeRaw = original; await clear(); }
+}), 120_000);
 
 test('admission completes a syncing refresh whose members all reached the target, and refuses while one lags', () => each(async f => {
   const target = f.push('alpha/two.md', page('Alpha two', 'Upstream.'));

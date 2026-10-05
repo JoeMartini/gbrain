@@ -60,6 +60,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'captured_facts_active',
   'connector_checkpoints',
   'connector_held_items',
+  'git_held_files',
   'credential_projection_pending',
   'derived_visibility',
   'extractor_facts_expired',
@@ -72,6 +73,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'child_table_orphans',
   'chronicle_projection_health',
   'auto_chronicle',
+  'auto_chronicle_default_on',
+  'chronicle_config_invalid',
   'fact_take_vectors',
   'code_chunk_metadata',
   'content_hash_duplicates',
@@ -107,6 +110,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'facts_extraction_health',
   'facts_health',
   'frontmatter_integrity',
+  'frontmatter_repairable',
   'malformed_path_pages',
   'memory_writeback',
   'grade_confidence_drift',
@@ -140,6 +144,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stale_mentions',
   'stub_guard_24h',
   'sync_failures',
+  // #5984: unfinished managed sync cursors, their remaining entries and indexing ETA.
+  'managed_sync_backlog',
   'sync_freshness',
   'takes_count',
   'takes_weight_grid',
@@ -184,6 +190,9 @@ export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
  * Infrastructure liveness signals. DB, workers, OAuth, RLS, locks, providers.
  */
 export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // Agent operator wave: is an agent harness wired to this brain (registration read; --only adds the smoke test).
+  'harness_wiring',
+  'frontmatter_hook',
   // F4b: PGLite row-delta planner statistics / Postgres autovacuum ANALYZE lag on the hot tables.
   'planner_stats_stale',
   'alternative_providers',
@@ -204,7 +213,6 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'brainstorm_health',
   'connectors',
   'dream_paid_loop',
-  'chat_fallback_chain_inert',
   'connection',
   'db_only_collector_collision',
   'federation_health',
@@ -218,6 +226,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'persistence_capacity',
   'worktree_refresh_stuck',
+  'managed_guard_schema_drift',
+  'publication_refusals',
   'persistence_request_growth',
   'persistence_request_indexes',
   'stale_embedding_effects',
@@ -267,6 +277,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
  * housekeeping. Default category for unknown names (with stderr warn).
  */
 export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
+  // Agent operator wave E11: recent agent dead ends from the agent-contract event log.
+  'agent_contract',
   'cycle_phase_scope',
   'default_source_local_path',
   'eval_capture',

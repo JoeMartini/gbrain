@@ -134,6 +134,10 @@
         "name": "sync_failures"
       },
       {
+        "category": "brain",
+        "name": "managed_sync_backlog"
+      },
+      {
         "category": "meta",
         "name": "slug_fallback_audit"
       },
@@ -207,6 +211,14 @@
       },
       {
         "category": "ops",
+        "name": "harness_wiring"
+      },
+      {
+        "category": "meta",
+        "name": "agent_contract"
+      },
+      {
+        "category": "ops",
         "name": "pglite_data_dir"
       },
       {
@@ -252,6 +264,14 @@
       {
         "category": "ops",
         "name": "worktree_refresh_stuck"
+      },
+      {
+        "category": "ops",
+        "name": "managed_guard_schema_drift"
+      },
+      {
+        "category": "ops",
+        "name": "publication_refusals"
       },
       {
         "category": "meta",
@@ -363,6 +383,14 @@
       },
       {
         "category": "brain",
+        "name": "git_held_files"
+      },
+      {
+        "category": "ops",
+        "name": "frontmatter_hook"
+      },
+      {
+        "category": "brain",
         "name": "orphan_persistence_bindings"
       },
       {
@@ -468,6 +496,10 @@
       {
         "category": "brain",
         "name": "frontmatter_integrity"
+      },
+      {
+        "category": "brain",
+        "name": "frontmatter_repairable"
       },
       {
         "category": "meta",
@@ -583,15 +615,19 @@
       },
       {
         "category": "brain",
+        "name": "chronicle_config_invalid"
+      },
+      {
+        "category": "brain",
+        "name": "auto_chronicle_default_on"
+      },
+      {
+        "category": "brain",
         "name": "fact_take_vectors"
       },
       {
         "category": "ops",
         "name": "planner_stats_stale"
-      },
-      {
-        "category": "ops",
-        "name": "chat_fallback_chain_inert"
       },
       {
         "category": "ops",

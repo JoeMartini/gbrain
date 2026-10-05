@@ -275,6 +275,14 @@ carries an explicit reason; a bare `- None.` is a dodge, not an answer.
 Quotes are VERBATIM. Write what was said the way it was said — a paraphrase in
 a blockquote is a fabricated quote.
 
+Timeline events (`life/events/`) are extracted from the saved meeting page in
+the background (Life Chronicle, on by default; one paid chat call per page).
+Check the write receipt: `chronicle_backstop.pending: "next_cycle"` means the
+next cycle extracts it (`gbrain dream --phase chronicle` runs it now, paid), and
+`chronicle_backstop.skipped` names the reason and its fix. Never hand-write
+`life/events/` pages; edit the meeting page and extraction updates its events.
+See `docs/guides/life-chronicle.md`.
+
 ### Phase 6: Claim verification + consistency check (gate for every entity write)
 
 Recorder summaries inject false facts: speech-to-text garbles proper nouns,
@@ -497,6 +505,14 @@ resulting meeting page. If a claim was withheld or a contradiction flagged by
 Phase 6, list each flag — the user resolves them, not silence. If any
 checklist item cannot be made to pass, report the meeting as NOT ingested and
 name the failing item.
+
+## When it fails
+
+Follow the [agent operator protocol](../../docs/protocol/AGENT_OPERATOR_v1.md) for any gbrain error `code`, exit code, `[AGENT]` block or notice block. Specific to this skill:
+
+- A contradiction with an existing page blocks ingestion until the user fixes or waives it: show both sources and wait.
+- `add_link` / auto-link reports an error after the meeting page was written: the page is saved but the links are not; list the failed links and add them after fixing slugs.
+- `put_page` returns `revision_conflict` on an attendee page: re-read and merge; never overwrite a person page from an old read.
 
 ## Anti-Patterns
 

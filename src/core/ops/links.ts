@@ -8,7 +8,8 @@ import { coordinatedManualLinkWrite } from '../persistence/manual-links.ts';
  * '../operations.ts' here (cycle).
  */
 
-import { OperationError, type Operation } from './contract.ts';
+import { opError, type Operation } from './contract.ts';
+import { paramUse } from './op-fix.ts';
 import {
   assertExplicitSourceLive,
   enforceClientSlugFence,
@@ -51,8 +52,9 @@ export const MANAGED_LINK_SOURCES = ['markdown', 'frontmatter', 'mentions', 'wik
 
 const add_link: Operation = {
   name: 'add_link',
+  idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'Create link between pages',
+  description: 'Create a typed link (edge) from one page to another in the same source. Use when recording a relationship (works_at, invested_in, mentions). Needs write scope; an explicit link_type must be declared by the active schema pack. On page_not_found: resolve both slugs with resolve_slugs.',
   params: {
     from: { type: 'string', required: true, description: "Slug of the page the link originates from (the edge renders on this page), e.g. 'people/alice-example'. These are page slugs — there is no `source`/`target` pair." },
     to: { type: 'string', required: true, description: "Slug of the page the link points to, e.g. 'companies/acme-example'." },
@@ -75,7 +77,7 @@ const add_link: Operation = {
     if (linkType.length > 0) {
       const activePack = await loadActivePackForWriteVocabulary(ctx);
       if (activePack && !packDeclaresLinkType(activePack, linkType)) {
-        throw new OperationError(
+        throw opError(
           'invalid_params',
           undeclaredLinkTypeMessage(linkType, activePack, 'add_link'),
           undeclaredLinkTypeSuggestion(activePack),
@@ -88,10 +90,10 @@ const add_link: Operation = {
     // and forbid forging the reconciliation-managed built-ins.
     const linkSource = ((p.link_source as string) || 'manual').trim();
     if (MANAGED_LINK_SOURCES.includes(linkSource)) {
-      throw new Error(
+      throw opError('invalid_params',
         `link_source '${linkSource}' is reconciliation-managed and cannot be set manually; ` +
         `use 'manual' (the default) or a custom kebab tag like 'citation-graph'`,
-      );
+        `Omit link_source (defaults to 'manual') or pass a custom kebab tag such as 'citation-graph'; ${MANAGED_LINK_SOURCES.join(', ')} are reserved for reconciliation.`);
     }
     // v0.31.8 (D7): single ctx.sourceId scopes both endpoints + origin. Cross-
     // source link creation is out of scope for this wave; use the engine API
@@ -128,8 +130,9 @@ const add_link: Operation = {
 
 const remove_link: Operation = {
   name: 'remove_link',
+  idempotent: false,
   outputRedaction: 'no_stored_text',
-  description: 'Remove link between pages',
+  description: 'Remove a link between two pages (optionally only one link_type or link_source). Use when a relationship was recorded wrongly. Needs write scope. On page_not_found: resolve both slugs with resolve_slugs.',
   params: {
     from: { type: 'string', required: true, description: 'Slug of the page the link originates from (same endpoint order as add_link).' },
     to: { type: 'string', required: true, description: 'Slug of the page the link points to.' },
@@ -164,11 +167,11 @@ const remove_link: Operation = {
 
 const LINK_SOURCE_ID_PARAM = {
   type: 'string',
-  description: "Scope the read to one source (a multi-source brain can hold the same slug in several sources). Omitted: your granted sources remotely (a connection with no grant reads every federated source); locally, the resolved source, or every federated source when no --source / GBRAIN_SOURCE / .gbrain-source pinned it. '__all__' spans every source for trusted local callers and only your readable sources for remote callers.",
+  description: "One source, or '__all__'.",
 } as const;
 const LINK_ALL_SOURCES_PARAM = {
   type: 'boolean',
-  description: 'Span sources (equivalent to source_id=__all__): every source locally, only your readable sources remotely.',
+  description: 'Same as source_id __all__.',
 } as const;
 
 /**
@@ -190,10 +193,10 @@ async function resolveLinkReadScope(
 ): Promise<{ requested: string | undefined; policy: PageReadPolicy }> {
   const sourceIdParam = parseSourceIdParam(p.source_id, opName, { allowAll: true });
   if (p.all_sources === true && sourceIdParam !== undefined && sourceIdParam !== ALL_SOURCES) {
-    throw new OperationError(
+    throw opError(
       'invalid_params',
       `${opName}: pass either source_id or all_sources, not both.`,
-      'Drop all_sources to read one source, or drop source_id to span sources.',
+      `Drop ${paramUse(ctx, 'all_sources')} to read source ${sourceIdParam}, or drop source_id to span sources.`,
     );
   }
   const requested = p.all_sources === true ? ALL_SOURCES : sourceIdParam;
@@ -304,8 +307,10 @@ async function hintScopedLinkMiss(
 
 const get_links: Operation = {
   name: 'get_links',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'List outgoing links from a page',
+  description: 'List a page\'s outgoing links (typed edges to other pages). Use when exploring what a page points at; pass source_id or all_sources to widen. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.',
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose outgoing links to list.' },
     source_id: LINK_SOURCE_ID_PARAM,
@@ -318,10 +323,12 @@ const get_links: Operation = {
 
 const get_backlinks: Operation = {
   name: 'get_backlinks',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'List incoming links to a page',
+  description: 'List links pointing to a page. Use when finding what mentions an entity.',
   params: {
-    slug: { type: 'string', required: true, description: 'Slug of the page whose incoming links to list.' },
+    slug: { type: 'string', description: 'Page slug.', required: true },
     source_id: LINK_SOURCE_ID_PARAM,
     all_sources: LINK_ALL_SOURCES_PARAM,
   },
@@ -332,11 +339,13 @@ const get_backlinks: Operation = {
 
 const list_link_sources: Operation = {
   name: 'list_link_sources',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'no_stored_text',
   // v114 (#1941): the read-side counterpart to link-add/link-rm. Since
   // link_source is now an open kebab provenance (no allowlist), this is how an
   // agent discovers which provenances a brain actually carries.
-  description: 'List distinct link_source provenances in the brain with edge counts (e.g. citation-graph, manual, markdown)',
+  description: 'Link provenances in the brain (e.g. markdown, manual) with edge counts.',
   params: {},
   handler: async (ctx) => {
     // Route through sourceScopeOpts so the read honors both scalar ctx.sourceId
@@ -371,13 +380,15 @@ const DEFAULT_TRAVERSE_DEPTH = 5;
 
 const traverse_graph: Operation = {
   name: 'traverse_graph',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
-  description: `Traverse link graph from a page. Remote callers default to bidirectional edges (GraphPath[]) at depth ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH} (pass depth explicitly for deeper walks); trusted local no-filter callers keep the legacy node shape at depth ${DEFAULT_TRAVERSE_DEPTH}.`,
+  description: `Walk the link graph from a page. Remote callers get bidirectional paths at depth ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH} by default.`,
   params: {
-    slug: { type: 'string', required: true, description: "Slug of the page to start the traversal from, e.g. 'people/alice-example'. This is the start-node param — there is no `start` or `root` param." },
-    depth: { type: 'number', description: `Max traversal depth (capped at ${TRAVERSE_DEPTH_CAP}). Default ${DEFAULT_TRAVERSE_DEPTH}, except a remote call that lets direction default to 'both' uses ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH} (bidirectional path enumeration is combinatorial on hubs); an explicit depth is always honored up to the cap.` },
-    link_type: { type: 'string', description: 'Filter to one link type (per-edge filter, traversal only follows matching edges)' },
-    direction: { type: 'string', enum: ['in', 'out', 'both'], description: "Traversal direction ('in', 'out', or 'both'). Remote callers default to 'both'; trusted local no-filter callers keep the legacy outgoing-node output." },
+    slug: { type: 'string', description: 'Start page slug.', required: true },
+    depth: { type: 'number', description: `Max depth (cap ${TRAVERSE_DEPTH_CAP}).` },
+    link_type: { type: 'string', description: 'Follow only this link type.' },
+    direction: { type: 'string', description: 'Remote default both.', enum: ['in', 'out', 'both'] },
     source_id: LINK_SOURCE_ID_PARAM,
     all_sources: LINK_ALL_SOURCES_PARAM,
   },

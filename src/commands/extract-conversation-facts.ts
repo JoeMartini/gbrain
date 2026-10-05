@@ -381,6 +381,11 @@ import {
 import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
 import { resolveModel, resolveTierDefault } from '../core/model-config.ts';
+import { FAILED_EXIT_CODE } from '../core/exit-codes.ts';
+import { usageError } from '../cli/cli-error.ts';
+import { intFlagValue } from '../cli/flag-values.ts';
+
+const ECF_HELP_HINT = 'Run `gbrain extract-conversation-facts --help` for the accepted flags and examples.';
 
 /**
  * v0.41.13.0 — back-compat shape for direct callers + the existing
@@ -411,6 +416,29 @@ export interface SplitSegmentsOpts {
   maxMessages?: number;
   /** Drop messages with timestamp <= this ISO before splitting. */
   sinceIso?: string;
+}
+
+/** Upper bound for a page's `conversation_segment_gap_minutes` (one week). */
+export const MAX_PAGE_SEGMENT_GAP_MINUTES = 10_080;
+
+/**
+ * A page's own segmentation gap: frontmatter `conversation_segment_gap_minutes`,
+ * set by a collector that knows its message cadence. Absent means the global
+ * default. Any value other than an integer from 1 to
+ * MAX_PAGE_SEGMENT_GAP_MINUTES is ignored with a warning naming the accepted
+ * range, so the page still splits on the default instead of failing.
+ */
+export function pageSegmentGapMinutes(page: Pick<Page, 'slug' | 'frontmatter'>): number | undefined {
+  const raw = page.frontmatter?.conversation_segment_gap_minutes;
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 && raw <= MAX_PAGE_SEGMENT_GAP_MINUTES) return raw;
+  process.stderr.write(
+    `[extract-conversation-facts] ${page.slug}: ignoring frontmatter conversation_segment_gap_minutes=${JSON.stringify(raw)?.slice(0, 80)}; ` +
+    `it must be a whole number of minutes from 1 to ${MAX_PAGE_SEGMENT_GAP_MINUTES} (unquoted). ` +
+    `Splitting on the default ${DEFAULT_SEGMENT_GAP_MINUTES}-minute gap instead. ` +
+    `To fix: set the key to an integer in that range, or remove it, then rerun gbrain extract-conversation-facts --slug ${page.slug}\n`,
+  );
+  return undefined;
 }
 
 export function splitIntoSegments(
@@ -999,8 +1027,9 @@ async function processPage(
       );
     }
   }
-  const allSegments = splitIntoSegments(messages);
-  const segments = splitIntoSegments(messages, { sinceIso });
+  const gapMinutes = pageSegmentGapMinutes(page);
+  const allSegments = splitIntoSegments(messages, { gapMinutes });
+  const segments = splitIntoSegments(messages, { gapMinutes, sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
     if (!declinedUnrecognizedSpeaker) {
@@ -1796,21 +1825,10 @@ function parseArgs(args: string[]): ParsedArgs {
       out.types = parts as AllowedType[];
       continue;
     }
-    if (a === '--limit') {
-      const n = parseInt(args[++i] ?? '', 10);
-      if (Number.isFinite(n) && n > 0) out.limit = n;
-      continue;
-    }
-    if (a === '--sleep') {
-      const n = parseInt(args[++i] ?? '', 10);
-      if (Number.isFinite(n) && n >= 0) out.sleepMs = n;
-      continue;
-    }
-    if (a === '--segment-limit') {
-      const n = parseInt(args[++i] ?? '', 10);
-      if (Number.isFinite(n) && n >= 0) out.segmentLimit = n;
-      continue;
-    }
+    // #5934 (D4): strict values; a bad one is a usage error (exit 2), never silently ignored.
+    if (a === '--limit') { out.limit = intFlagValue(args[++i], '--limit', { min: 1, example: 100 }); continue; }
+    if (a === '--sleep') { out.sleepMs = intFlagValue(args[++i], '--sleep', { min: 0, example: 500 }); continue; }
+    if (a === '--segment-limit') { out.segmentLimit = intFlagValue(args[++i], '--segment-limit', { min: 0, example: 50 }); continue; }
     if (a === '--max-cost-usd') {
       const n = Number(args[++i]);
       if (!Number.isFinite(n) || n <= 0) {
@@ -1894,7 +1912,7 @@ conversation_facts_backlog check counts pages without this row.
 
 function buildJobParams(args: string[]): Record<string, unknown> {
   const parsed = parseArgs(args);
-  if (parsed.error) throw new Error(parsed.error);
+  if (parsed.error) throw usageError(parsed.error, ECF_HELP_HINT);
   return {
     sourceId: parsed.sourceId,
     types: parsed.types,
@@ -1935,11 +1953,7 @@ export async function runExtractConversationFacts(
   if (backgrounded) return;
 
   const parsed = parseArgs(args);
-  if (parsed.error) {
-    console.error(parsed.error);
-    console.error(HELP);
-    process.exit(1);
-  }
+  if (parsed.error) throw usageError(parsed.error, ECF_HELP_HINT);
 
   // Chat gateway is required for non-dry-run. Recover a cold singleton before
   // reporting an availability error (#2590).
@@ -2116,9 +2130,9 @@ export async function runExtractConversationFacts(
     }
   }
 
-  // v0.41.15.0 (codex #3): exit 3 when pages were skipped due to
-  // lock-busy AND no hard failures fired. "Incomplete run, please
-  // re-run" — distinct from exit 1 (hard failure) and 0 (clean).
+  // v0.41.15.0 (codex #3): pages skipped due to lock-busy AND no hard
+  // failures fired: "incomplete run, please re-run". Exit 1 (retryable) —
+  // 3 is reserved for confirmation_required under the agent contract v1.
   // anyBudgetExhausted doesn't trigger exit 3; the budget message
   // above already tells the user what to do, and exit 0 is the right
   // signal for "ran to the cap intentionally."
@@ -2126,7 +2140,8 @@ export async function runExtractConversationFacts(
     process.exit(1);
   }
   if (aggregate.pages_lock_skipped > 0 && !anyBudgetExhausted) {
-    process.exit(3);
+    console.error(`${aggregate.pages_lock_skipped} page(s) were skipped because another writer held their lock; re-run the same command to finish them (retryable).`);
+    process.exit(FAILED_EXIT_CODE);
   }
 }
 

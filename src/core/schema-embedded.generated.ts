@@ -784,6 +784,9 @@ CREATE TABLE IF NOT EXISTS op_checkpoints (
 );
 CREATE INDEX IF NOT EXISTS op_checkpoints_updated_at_idx
   ON op_checkpoints (updated_at);
+-- #5988: read paths find the Git hold of a page by its id (migration v200).
+CREATE INDEX IF NOT EXISTS op_checkpoints_sync_hold_page_idx
+  ON op_checkpoints ((completed_keys->0->>'page_id')) WHERE op = 'sync-hold';
 
 -- #1794: append-only delta storage. One row per completed path; sync's
 -- appendCompleted INSERTs only the delta instead of rewriting the whole
@@ -1796,6 +1799,42 @@ CREATE TABLE IF NOT EXISTS extract_atoms_page_state (
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_tombstoned_idx
   ON extract_atoms_page_state (source_incarnation, content_hash, page_id) WHERE tombstoned;
 CREATE INDEX IF NOT EXISTS extract_atoms_page_state_page_idx ON extract_atoms_page_state (page_id);
+-- #5876 (migration chronicle_page_state): Life Chronicle ledger, the durable
+-- record of each page content's automatic-extraction decision and outcome.
+CREATE TABLE IF NOT EXISTS chronicle_page_state (
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  extractor_version INTEGER NOT NULL,
+  slug TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending','skipped','extracted','failed')),
+  reason TEXT,
+  trigger TEXT NOT NULL CHECK (trigger IN ('auto','backfill')),
+  principal_kind TEXT,
+  principal_id TEXT,
+  request_id UUID,
+  no_extract BOOLEAN NOT NULL DEFAULT false,
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at TIMESTAMPTZ,
+  cost_usd NUMERIC,
+  unpriced BOOLEAN NOT NULL DEFAULT false,
+  event_slugs TEXT[] NOT NULL DEFAULT '{}',
+  event_hashes TEXT[] NOT NULL DEFAULT '{}',
+  decided_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, page_id, content_hash, extractor_version)
+);
+CREATE INDEX IF NOT EXISTS chronicle_page_state_work_idx
+  ON chronicle_page_state (source_id, state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS chronicle_page_state_page_idx ON chronicle_page_state (page_id);
+CREATE TABLE IF NOT EXISTS chronicle_judge_reservations (
+  id BIGSERIAL PRIMARY KEY,
+  reserved_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source_id TEXT NOT NULL,
+  page_id INTEGER NOT NULL,
+  content_hash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chronicle_judge_reservations_at_idx ON chronicle_judge_reservations (reserved_at);
 -- Durable record that a transcript was synthesized; survives minion_jobs pruning.
 CREATE TABLE IF NOT EXISTS dream_synthesis_completions (
   source_id TEXT NOT NULL,
@@ -1923,12 +1962,16 @@ BEGIN
         IS NOT DISTINCT FROM (OLD.last_commit,OLD.last_sync_at,OLD.newest_content_at) THEN RETURN NEW; END IF;
       allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
       IF NOT (allowed ? NEW.id) THEN
-        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication';
+        RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source checkpoints require canonical owner publication',
+          TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:checkpoint',
+          DETAIL=jsonb_build_object('op',TG_OP,'relationship','checkpoint_outside_owner','target_source',NEW.id,'old_source',OLD.id,'allowed',allowed)::text;
       END IF;
       RETURN NEW;
     END IF;
     IF COALESCE(current_setting('gbrain.topology_change',true),'') <> 'on' THEN
-      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration';
+      RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: source topology must be drained and changed through writer administration',
+        TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:topology',
+        DETAIL=jsonb_build_object('op',TG_OP,'relationship','topology_outside_administration','target_source',row_data->>'id','old_source',old_data->>'id')::text;
     END IF;
     IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
   ELSIF TG_TABLE_NAME IN ('facts','takes') AND TG_OP='UPDATE' THEN
@@ -1939,20 +1982,26 @@ BEGIN
     IF (row_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at'])
       = (old_data - ARRAY['embedding','embedded_at','last_retrieved_at','retrieval_count','updated_at']) THEN RETURN NEW; END IF;
   END IF;
-  IF row_data ? 'source_id' THEN target_source := row_data->>'source_id';
-  ELSE SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
-  IF TG_OP='UPDATE' THEN
-    IF old_data ? 'source_id' THEN old_source := old_data->>'source_id';
-    ELSE SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer; END IF;
+  IF TG_TABLE_NAME NOT IN ('tags','timeline_entries','takes') THEN
+    target_source := row_data->>'source_id'; old_source := old_data->>'source_id';
+  END IF;
+  IF target_source IS NULL THEN SELECT source_id INTO target_source FROM pages WHERE id=(row_data->>'page_id')::integer; END IF;
+  IF TG_OP='UPDATE' AND old_source IS NULL THEN
+    SELECT source_id INTO old_source FROM pages WHERE id=(old_data->>'page_id')::integer;
   END IF;
   -- Cascaded projection removal after the already-guarded parent deletion.
   IF target_source IS NULL AND TG_OP='DELETE' THEN RETURN OLD; END IF;
   allowed := COALESCE(NULLIF(current_setting('gbrain.write_sources',true),''),'[]')::jsonb;
   IF target_source IS NULL OR NOT (allowed ? target_source) OR (old_source IS NOT NULL AND NOT (allowed ? old_source)) THEN
-    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator';
+    RAISE EXCEPTION USING ERRCODE='P0001', MESSAGE='writer_coordinator_required: canonical writer must use the persistence coordinator',
+      TABLE=TG_TABLE_NAME, SCHEMA=TG_TABLE_SCHEMA, CONSTRAINT='managed_writer_guard:allowlist',
+      DETAIL=jsonb_build_object('op',TG_OP,'relationship',CASE WHEN target_source IS NULL THEN 'missing_source'
+        WHEN NOT (allowed ? target_source) THEN 'different_source' ELSE 'old_source_outside' END,
+        'target_source',target_source,'old_source',old_source,'allowed',allowed)::text;
   END IF;
   IF TG_OP='DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END \$fn\$;
+
 DO \$body\$
 DECLARE target text;
 BEGIN

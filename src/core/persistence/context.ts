@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { BrainEngine } from '../engine.ts';
-import { OperationError } from '../ops/contract.ts';
+import { opError, OperationError } from '../ops/contract.ts';
 import type { WriteAttribution } from './attribution.ts';
 
 interface PublicationContext { brainId: string; sourceIds: ReadonlySet<string>; active: boolean; }
@@ -39,7 +39,11 @@ const attributionValues = (outer: string[], attribution: WriteAttribution) => ou
  */
 export async function withCoordinatedWrite<T>(engine: BrainEngine, sourceIds: string[], fn: () => Promise<T>, attribution: WriteAttribution): Promise<T> {
   const [brain] = await engine.executeRaw<{ brain_id: string }>('SELECT brain_id FROM persistence_brain WHERE singleton=1');
-  if (!brain) throw new OperationError('writer_not_initialized', 'Persistence identity is missing.');
+  if (!brain) {
+    throw opError('writer_not_initialized', 'Persistence identity is missing.',
+      'This brain has no persistence identity row, so coordinated writes cannot run and nothing was written. List the pending migrations that create it and ask the user to approve applying them.',
+      { fix: { argv: ['gbrain', 'apply-migrations', '--dry-run', '--json'], consent: [], actor: 'agent', why: 'Lists the pending migrations without applying them.', requires_exclusive: false } });
+  }
   const context: PublicationContext = { brainId: brain.brain_id, sourceIds: new Set(sourceIds), active: true };
   return withTransactionSettings(engine, ['gbrain.write_sources', ...ATTRIBUTION_SETTINGS],
     ([, ...outer]) => [JSON.stringify(sourceIds), ...attributionValues(outer, attribution)],
@@ -47,6 +51,15 @@ export async function withCoordinatedWrite<T>(engine: BrainEngine, sourceIds: st
       try { return await fn(); }
       finally { context.active = false; }
     }));
+}
+/**
+ * #5984 bulk: inside one coordinated write that publishes several requests,
+ * names the next request as the actor of the rows it writes. One statement; the
+ * enclosing coordinated write restores the outer values when it ends.
+ */
+export async function setMemberAttribution(engine: Pick<BrainEngine, 'executeRaw'>, attribution: WriteAttribution): Promise<void> {
+  await engine.executeRaw(`SELECT ${ATTRIBUTION_SETTINGS.map((name, index) => `set_config('${name}',$${index + 1},true)`).join(',')}`,
+    [attribution.requestId ?? '', attribution.principal.kind, attribution.principal.id]);
 }
 /** Attribution without coordinator capability, for unmanaged legacy transactions. */
 export function withWriteAttribution<T>(engine: Pick<BrainEngine, 'executeRaw'>, attribution: WriteAttribution, fn: () => Promise<T>): Promise<T> {

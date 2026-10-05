@@ -1,5 +1,84 @@
 # TODOS
 
+## Held files follow-ups (filed 2026-10-04, follow-up from v0.60.47.0)
+
+Context: `docs/guides/repair.md#held-files`, `docs/guides/write-refusals.md#held-files-and-content-refusals`.
+
+- [ ] **P2 — Degraded import for held files.**
+  **What:** a held file imports nothing until it is repaired: a held new file has no page, and a held modified file keeps its last good revision. **Why:** for a large backlog (hundreds of generator-written files that each need an interpretation) the agent answers from partial coverage until the user reviews every proposal. **Fix:** an opt-in degraded import that stores the body text and the keys gbrain reads exactly (never a protected or identity key, never an interpreted value), marks the page `degraded` in `get_page` and search, keeps the hold and its repair proposal, and upgrades the page in place when the file is repaired. Needs the privacy rules for protected keys (`visibility` defaults to the most restrictive value) and the drift check for degraded pages. **Effort:** M. **Priority:** P2.
+
+## Agent-first operator wave follow-ups (filed 2026-10-03, follow-up from v0.60.46.0)
+
+Spec: `docs/designs/AGENT_OPERATOR_WAVE.md` (Deferred list). Contract: `docs/protocol/AGENT_OPERATOR_v1.md`.
+
+- [ ] **P2 — Tool-call proxy for a second `gbrain serve`.**
+  **What:** a second stdio serve on a held brain answers in status-only mode with one `gbrain_status` tool. **Why:** the user has to move both harnesses to a shared `serve --http` to get memory in the second session. **Fix:** authenticated IPC forwarding to the owning serve, carrying the proxied caller's surface and scopes. **Effort:** L. **Priority:** P2.
+- [ ] **P2 — Status-only mode for `serve --http` lock contention.**
+  **What:** status-only mode covers stdio; a `serve --http` that loses the lock still exits. **Why:** an HTTP client sees a dead endpoint instead of the `gbrain_status` explanation. **Fix:** the same status-only server on the HTTP transport, re-probing with `peekLock()`. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Support policy and removal of legacy shapes.**
+  **What:** legacy JSON shapes, frozen `error` values and duplicate receipt copies stay under contract v1. **Why:** they double the surface harness authors read. **Fix:** a written support policy plus consumer evidence, then removal in `AGENT_OPERATOR_v2`. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Exit 3 for `mcp expose` and `google` under contract v2.**
+  **What:** both still exit 2 for `confirmation_required` (documented v1 legacy); `mcp expose`'s document already carries the consent fields. **Fix:** move them to 3 with the v2 contract. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — `run_doctor` and CLI `doctor` from one registry with a `remote_safe` flag.**
+  **What:** MCP `run_doctor` and CLI `doctor` agree on the same brain through parity tests, but the check lists are still two code paths. **Why:** a new check can land on one surface only. **Fix:** one registry; each entry declares `remote_safe`, and `run_doctor` runs exactly the remote-safe subset. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Submit-time job authorization and pre-upgrade queued jobs.**
+  **What:** `book-mirror`'s paid fan-out asks at the CLI, but the queued child jobs carry no authorization record, and jobs queued before the upgrade run under the configured budget with no consent record. **Fix:** persist the `Authorization` (effects, cap, cap source) on the submitted job and check it in the worker; a pre-upgrade job without one runs under the configured budget and says so. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — `consent.preapprove.paid.max_usd_per_day`.**
+  **What:** only the per-run preapproval ships. **Fix:** a daily preapproval through the durable reservation model (`src/core/minions/budget-meter.ts`, `delegated-policy.ts`) with concurrency and crash-recovery tests, plus the C9 rows. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Onboarding notices over MCP.**
+  **What:** the post-upgrade summary reaches stdio MCP sessions as a notice and the advisor carries the writeback finding, but the onboarding nudges (`onboard_opportunities`) and init's first-run decision bundle reach only CLI callers. **Why:** an agent that only talks MCP never sees them. **Fix:** emit them through the notice channel once per session, under the coaching budget and mute rules. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Connectors two-step OAuth.**
+  **What:** `connectors auth --try-oauth` refuses headless and hands over the cookie lane. **Fix:** print the authorize URL and exit awaiting consent, then a second command completes with the pasted redirect (the Google connect shape). **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Unify MCP surfaces across wiring paths.**
+  **What:** `bootstrap hooks` registers `full` (`src/commands/bootstrap.ts:~1282`) while the readiness fix and init register `--surface verbs`. **Fix:** one surface choice for every registration path. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Make `gbrain bootstrap verify` read-only, then mark it `read_only`.**
+  **What:** it is excluded from the verify-field scanner rule until it writes nothing. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — `structuredContent` with per-op `outputSchema`.**
+  **What:** emitted only as a semantic superset of `content`, after client behaviour converges. **Fix:** include Codex and VS Code scenarios proving the body reaches the model. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Re-baseline BrainBench after the wave** if notice blocks change harness behaviour. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Tier 3 carry-over: D3's remaining curated helps.**
+  **What:** B10 shipped in this release; D3's remaining curated helps are the 33 rows in `test/fixtures/cli-contract/help-baseline.json` (stub helps, `missing_yes`, `exit`). **Fix:** burn them down; the D5 baseline is shrink-only. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Backfill the last 74 suggestion-less `OperationError` sites (31 files).**
+  **What:** B10 took the scanner baseline from 1,116 sites in 143 files to 74 in 31. What remains: `src/commands/` (persistence-admin 11, repair 6, reindex-code-delegate 5, embed-facts-delegate 5, sync-persistence-delegate 4, extract-stale-delegate 4, capture 4, recall 3, and smaller), `src/cli.ts`, and single-digit core sites (effect-facts 3, effect-targets, company-brain/policy, embed-facts, shared-skills/adapter, source-local-reference-index, and 1-site files). **Fix:** the B10 pattern (`opError` + filled `fix`, receipts by `request_id` for CLI-principal rows only); `scripts/agent-contract-baselines/suggestionless-operation-error.tsv` lists them. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — Module-local `fail(code, message)` helpers carry a generic next step.**
+  **What:** `shared-skills/adapter.ts` and `shared-skills/membership.ts` funnel about 40 refusals through one suggestion-less helper each, and `persistence/administration.ts` gives its ~28 parameter checks a shared default. **Fix:** a per-code suggestion table, so each refusal names its own next step. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Ratchet burn-down of the other agent-contract scanner baselines.**
+  **What:** counts at filing (`scripts/agent-contract-baselines/`, after B10): legacy advice keys 237, hand-built command strings 51, marker literals 26, `stdio: 'inherit'` 12, flag text in MCP-visible strings 6, raw "re-run with --yes" 5, in-scope placeholders 4, `throw new Error` in ops 3, non-read-only verify 1; suggestion-less `OperationError` is the 74 above; interactive I/O and retry-on-mutating are at 0. **Fix:** shrink per file as files are touched; the baselines refuse growth. **Effort:** L. **Priority:** P3.
+- [ ] **P3 — `sync_freshness` fix placeholder.**
+  **What:** the check's fail/warn message still says ``gbrain sync --source <id>`` instead of naming each stale source's command, because `checkSyncFreshness` sits at its function-size ceiling. **Fix:** split the function, then emit one filled `fix` per stale source. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Collapse the five error classes into `opError` + the registry.** **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Harness-author community channel** linked from `AGENT_OPERATOR_v1.md`. **Effort:** XS. **Priority:** P3.
+- [ ] **P3 — Recall relevance on tiny keyless brains.** Measure first. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Trim the AGENTS.md pre-install preamble** (owner rewrite). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — MCP elicitation for consent.**
+  **What:** trigger is the first MCP op whose fix has non-empty consent and an MCP-callable re-invocation; stdio first, HTTP needs a session-bound transport. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Doctor report `schema_version: 3`** with a first-class informational status (today `ok` + `severity: 'info'`). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Retire the `--json` exit-time fallback document** once direct-exit paths reach zero. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Retire the `promptLine` / `promptLineStderr` / `promptYesNo` and legacy `readStdinBounded` shims.** **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Curated annotation titles and a `destructiveHint` / `openWorldHint` review** for every mutating op. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — HTTP session-scoped coaching dedupe** when the transport becomes session-bound (today principal + transport session id, principal only when absent). **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Status-mode recovery for clients that ignore `tools/list_changed`.** Measure per harness and document. **Effort:** S. **Priority:** P3.
+- [ ] **P3 — Keep `getStats` / `getHealth` off agent paths** (cross-ref #5061; the readiness cache is the pattern). **Effort:** S. **Priority:** P3.
+
+## auto_chronicle wave follow-ups (filed 2026-10-04, follow-up from v0.60.45.0, #5876)
+
+- [ ] **P1 — facts-backstop jobs have no executor on PGLite.**
+  **What:** `facts_backstop` effects enqueue jobs that `gbrain jobs work` refuses to run on PGLite (`commands/jobs/work.ts`), the same root cause the chronicle cycle phase fixed for events. **Fix:** run them from a cycle phase or the inline drain, bounded per run. **Effort:** M. **Priority:** P1.
+- [ ] **P2 — Drop future-dated events extracted from past pages.**
+  **What:** the measured run wrote 2 not-yet-happened events per 24 judged pages (a planned offsite date and a leave start date mentioned in past meetings) and 2 events for a launch plan stated in a chat. **Fix:** refuse proposals dated after the extraction time (or after the page's own date plus a margin) before publication, and tell the judge prompt to emit only what already happened; re-measure on the labeled fixture described in `docs/fix-wave-notes/capy-fix-wave-chronicle.md`. **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Event slug identity collapses distinct same-day proposals.**
+  **What:** an event slug hashes who, what and the depth page, so two different proposals with the same summary on one day collapse into one event (`publish.ts` `buildChronicleEvent`). **Effort:** S. **Priority:** P2.
+- [ ] **P2 — Restore retired events on revert without a model call.**
+  **What:** A to B to A re-extracts A once (at most `chronicle.job_budget_usd`). A durable proposal manifest that survives the 72 h tombstone purge would restore A's events for free. **Effort:** M. **Priority:** P2.
+- [ ] **P2 — Deterministic projection for calendar invites.**
+  **What:** an ended invite costs a chat call although its event (title, time, attendees) is fully structured. Project it without the model; an ended invite is still not proof of attendance. **Effort:** M. **Priority:** P2.
+- [ ] **P3 — One LLM pass for atoms and events on meeting pages.**
+  **What:** a meeting page pays for atom extraction and event extraction separately. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — Judge input beyond 12,000 characters.**
+  **What:** long transcripts are truncated to 12,000 characters before the judge reads them; later events are never seen. **Fix:** chunk and merge, bounded by the per-page cap. **Effort:** M. **Priority:** P3.
+- [ ] **P3 — One doctor surface for derived extraction.**
+  **What:** facts, atoms, conversation facts and events each report health in their own doctor check. **Effort:** M. **Priority:** P3.
+
 ## Foundations 1 follow-ups (filed 2026-10-03, follow-up from v0.60.37.0)
 
 - [ ] **P1 — Mutation attribution for the writers still unattributed.**
@@ -3442,12 +3521,12 @@ Deferred from the Life Chronicle wave (CEO Scope-Expansion + eng review CLEARED,
 3 codex rounds absorbed, PR #2533). Every item was an explicit review decision,
 not an oversight; each names its decision provenance.
 
-- [ ] **P1 — Eval-gated auto-emit default-flip (D5.5 fast-follow).** Auto-emission
-  ships OFF (`auto_chronicle=false`) per spend/consent posture. The headline
-  fast-follow: run `gbrain eval chronicle` + a live-LLM OFF-vs-ON agent arm on a
-  real brain, and if the lift holds, flip the default ON in the next minor with
-  an upgrade notice. Where: `src/core/chronicle/config.ts`, upgrade banner in
-  `src/commands/upgrade.ts`.
+- [ ] **P1 — Measure the auto-emit default (D5.5 fast-follow).** The #5876 wave
+  flipped `auto_chronicle` ON by default under the default-on rule for new
+  features, with an upgrade notice, a durable doctor/advisor notice and the
+  opt-out `gbrain config set auto_chronicle false`. It shipped without a measured
+  quality lift. Remaining: the live-LLM OFF-vs-ON agent arm below; if it shows no
+  lift, revisit the default. Where: `src/eval/chronicle/harness.ts`.
 - [ ] **P2 — Live-LLM OFF-vs-ON eval arm + LongMemEval temporal slice.** The
   shipped `gbrain eval chronicle` is the deterministic CI bar (6 gold tasks).
   The full North-Star proof adds (a) a live agent reconstructing a day with the

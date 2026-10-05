@@ -34,6 +34,46 @@ pointing at this switch.
 over posture. `tokenmax` only governs the default/absent case — it never overrides a
 number you typed on the command line.
 
+## Consent and caps for paid commands (agent operator contract v1)
+
+Every command that spends money asks for authorization the
+same way ([protocol](../protocol/AGENT_OPERATOR_v1.md#consent-and-preapproval)).
+Without a terminal and without authorization, nothing runs: the command exits
+3 with a `confirmation_required` payload whose `user_message` the agent relays
+to the user, and whose `fix` is the exact command to run once they agree.
+`--json` never implies consent.
+
+What authorizes paid work, and the cap it runs under:
+
+| Authorization | Cap | `cap_source` |
+|---|---|---|
+| `--max-usd <n>` / `--max-cost <n>` | `<n>` | `user` |
+| a configured cap for the command (for example `embed.backfill_max_usd`) | that value | `user` |
+| the user's preapproval `consent.preapprove.paid.max_usd_per_run <usd>` (covers runs whose estimate is at or under it) | the preapproved limit | `user` |
+| `--yes` alone | the estimate × 1.5, floor $0.25, printed before the run | `derived` |
+| `--yes` alone, no estimate and no configured cap | the default cap ($5), printed | `default` |
+| `spend.posture=tokenmax` | the derived/default cap above, except `enrich` and `reindex-code` (below) | `derived` / `default` |
+
+- **`tokenmax` on `enrich` and `reindex-code` is uncapped.** On those two
+  commands `spend.posture=tokenmax` means no ceiling: an unattended run
+  proceeds uncapped (spend still ledgered). Everywhere
+  else `tokenmax` authorizes the run under the derived cap. An explicit
+  `--max-usd` always wins.
+- **A derived cap that runs out** stops the command with exit 1, a checkpoint
+  and the exact resume command (`--max-usd <n>`); doctor's `agent_contract`
+  check then suggests the preapproval command. Raise the cap only with the
+  user's agreement.
+- **Unpriced models** (a model gbrain has no per-token rate for, for example
+  a newly released one): under a derived or default cap the run
+  **warns and proceeds** (`BUDGET_TRACKER_NO_PRICING` on stderr; the cap
+  cannot meter it). Under a cap the user set (`--max-usd`, a configured cap
+  or a preapproval) it **blocks** with `no_pricing` and nothing is spent: the
+  refusal's `fix` has `inputs` telling the agent to look up the model's
+  per-token rates (for example by web search on the provider's pricing page)
+  and register them with `gbrain pricing set` (see
+  [Registering a model price](#registering-a-model-price)), then retry the
+  same command.
+
 ## Off switches (`off` / `unlimited` / `none`)
 
 The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to mean
@@ -58,13 +98,14 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 | Backfill 24h per-source spend cap | `embed.backfill_max_usd_per_source_24h` | `25` | refuses submission | `off` (`0` → default) | bypassed (still ledgered) |
 | Backfill per-job budget | `embed.backfill_max_usd` | `10` | caps the job's tracker | `off` (`0`/garbage → default, fail-closed) | uncapped (still ledgered) |
 | Backfill cooldown | `embed.backfill_cooldown_min` | `10` | skips re-submission inside window | — (latency knob, not spend) | **not** bypassed |
-| `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 2 | `--max-cost off` | informational |
-| `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 2 | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
-| `enrich` / `onboard --auto` | `--max-usd` (per-call) | — | refuse without a cap (non-TTY) | `--max-usd off` | runs uncapped (still ledgered) |
+| `reindex-code` cost gate | — (preview before re-embed) | — | TTY prompt / non-TTY refuse + exit 3 (`confirmation_required`) | `--max-cost off` | runs uncapped (still ledgered) |
+| `migrate embeddings` consent gate | — (plan + estimate before provider migration) | — | TTY y/N prompt / non-TTY refuse + exit 3 (`confirmation_required`) | `--yes` | estimate marked informational, but **still prompts** (guards a destructive schema rebuild, not just spend) |
+| `enrich` / `onboard --auto` | `--max-usd` (per-call) | — | non-TTY without `--yes`/`--max-usd`: refuse + exit 3 (`confirmation_required`); `--yes` runs under the derived cap | `--max-usd off` | runs uncapped (still ledgered) |
 | Image-OCR per-run ceiling | `embedding_image_ocr_max_images` / `embedding_image_ocr_max_usd` | `200` images / `$1.00` (estimated) | skips OCR over-cap (import continues; skips counted in `ocr_skipped_budget`, surfaced by doctor `ocr_health`) | `0` disables that cap | **not** bypassed (per-run cap, not a tracker gate) |
 | Dream `extract_atoms` phase budget | `cycle.extract_atoms.budget_usd` | `0.30` | caps the phase's budget tracker (one tracker per drain attempt, across all its batches) | — | **not** consulted (phase budget enforces regardless) |
 | Atom auto-drain daily cap | `autopilot.auto_drain.max_usd_per_day` | `2.00` | daily cap on drain **attempts** (`floor(max / 0.30)` = 6), not a dollar ledger | `gbrain config set autopilot.auto_drain.enabled false` | **not** consulted |
 | Connector email/meeting atoms | `cycle.extract_atoms.connector_pages` | on (unset) | Gmail/Calendar `email`/`meeting` pages are extracted like other pages, under the auto-drain cap | `false` | **not** consulted |
+| Life Chronicle event extraction | `chronicle.job_budget_usd` (per page) / `chronicle.auto_daily_limit` (calls per rolling 24 h) | `0.25` / `200` | caps one extraction call; past the daily limit pending pages wait for a free slot | `gbrain config set auto_chronicle false` | **not** consulted |
 | Dream `synthesize` per-run budget | `dream.synthesize.budget_usd` | `5` | defers the transcript and the rest of the run before submission (estimate: prompt size + child output cap, x `max_turns` in agentic mode) | `unlimited` (`0` = submit nothing) | **not** consulted |
 | Dream `synthesize` daily submission cap | `dream.synthesize.max_submissions_per_source_per_day` | `0` (off) | skips whole files; a failed count query submits nothing that run | `0` | **not** consulted |
 | Dream `BudgetMeter` phases (auto_think, drift, propose/grade takes, calibration) | `dream.auto_think.budget`, `dream.drift.budget`, `cycle.<phase>.budget_usd` | per phase | refuses the next submit past the cap | `unlimited` (`0` = spend nothing) | **not** consulted |
@@ -161,6 +202,32 @@ configured `extract_atoms` chat model (`models.dream.extract_atoms`, a
 utility-tier model by default), under the caps above. Atoms already extracted
 stay; opting out only stops new extraction.
 
+### Life Chronicle: automatic event extraction
+
+**Say to your agent:** *"How much does automatic event extraction cost?"* or
+*"Turn off automatic event extraction."*
+
+`auto_chronicle` is on by default. Each eligible new or changed meeting,
+conversation or calendar page gets one chat call that turns it into timeline
+events, capped at `chronicle.job_budget_usd` ($0.25) per page. At most
+`chronicle.auto_daily_limit` (200) automatic calls run per rolling 24 hours;
+retries count, and pages past the limit wait for a free slot. The worst case
+is the product, $50 a day at the defaults, for a priced model. With a model the
+tracker cannot price, the default cap is not enforced: extraction warns and
+runs, bounded only by the call count. When you set `chronicle.job_budget_usd`
+yourself, an unpriced model refuses with `no_pricing` until you register its
+price with `gbrain pricing set`. `gbrain chronicle-backfill` (history, on
+request) is exempt from the daily limit and bounded by its `--limit`.
+
+```bash
+gbrain config set auto_chronicle false              # opt out
+gbrain config set chronicle.auto_daily_limit 50     # fewer automatic calls per day
+gbrain config set chronicle.job_budget_usd 0.10     # lower per-page cap
+```
+
+`gbrain doctor` (`auto_chronicle`) reports 24 h use of the limit, the largest
+writer's share and 7-day spend. Details: [Life Chronicle](../guides/life-chronicle.md).
+
 ## Notes & limits
 
 - **Pre-pull window:** the gate fetches before estimating, so it prices what the run
@@ -181,9 +248,9 @@ stay; opting out only stops new extraction.
 ## Dream paid-loop breaker (`dream.breaker.max_dead_submissions`)
 
 Dream synthesize and patterns pay a model for each transcript or reflection set
-they submit. When the same input keeps failing, every cycle used to pay for it
-again. The breaker stops that: once one dream key has died 3 times within 24
-hours, dream refuses to submit it again until you reset it. The refusal shows up
+they submit. Without a limit, an input that keeps failing would be paid for
+again on every cycle. The breaker stops that: once one dream key has died 3
+times within 24 hours, dream refuses to submit it again until you reset it. The refusal shows up
 in the cycle summary and the autopilot log with the exact reset command, and
 `gbrain doctor` reports it as `dream_paid_loop`.
 

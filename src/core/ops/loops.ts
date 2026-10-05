@@ -19,7 +19,9 @@
  * stale unless --stale-ok.
  */
 
-import { OperationError, type Operation, type OperationContext } from './contract.ts';
+import { opError, type Operation, type OperationContext, type OperationError } from './contract.ts';
+import type { Action } from '../agent-output.ts';
+import { hostFix, invalidParam, opTransport, paramUse, readFix } from './op-fix.ts';
 import { resolveRequestedScope, sourceScopeOpts } from './context.ts';
 import { validateSourceId } from '../utils.ts';
 import { closedLoopWithActiveFact, retireLoopFact } from '../persistence/loop-fact-retirement.ts';
@@ -64,7 +66,7 @@ interface GoogleSourceFreshness {
 async function googleSourceFreshness(
   ctx: OperationContext,
   scope: { sourceId?: string; sourceIds?: string[] },
-): Promise<{ sources: GoogleSourceFreshness[]; stale: boolean }> {
+): Promise<{ sources: GoogleSourceFreshness[]; stale: boolean; staleSources: string[] }> {
   try {
     const rows = await ctx.engine.executeRaw<{ id: string; last_sync_at: string | null; config: unknown }>(
       `SELECT id, last_sync_at, config FROM sources WHERE archived IS NOT TRUE`,
@@ -87,12 +89,16 @@ async function googleSourceFreshness(
         stale:
           r.last_sync_at === null || Date.now() - Date.parse(r.last_sync_at) > STALE_AFTER_MS,
       }));
-    return { sources, stale: sources.length > 0 && sources.every((s) => s.stale) };
+    return {
+      sources,
+      stale: sources.length > 0 && sources.every((s) => s.stale),
+      staleSources: sources.filter((s) => s.stale).map((s) => s.id),
+    };
   } catch {
     // Fail TOWARD stale: this surface's invariant is "stale-but-confident is
     // worse than nothing" — a DB error must not present confident output
     // with the stale warning suppressed.
-    return { sources: [], stale: true };
+    return { sources: [], stale: true, staleSources: [] };
   }
 }
 
@@ -252,10 +258,16 @@ function rankGroups(groups: CounterpartyGroup[], backlinks: Map<string, number>,
 }
 
 function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources: boolean,
-  coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[] }, nowMs: number): string {
+  coverage: { completeness: 'complete' | 'partial'; held: HeldItemView[] }, nowMs: number,
+  partialStaleSources: string[]): string {
   const lines: string[] = [];
   const { held } = coverage;
   if (stale) lines.push('⚠ google sources have not synced recently — this may be out of date.');
+  else if (partialStaleSources.length > 0) {
+    lines.push(
+      `⚠ some google sources have not synced recently — this may be out of date: ${partialStaleSources.join(', ')}.`,
+    );
+  }
   const partial = coverage.completeness === 'partial';
   const what = held.length ? `${held.length} held item(s) could not be imported:` : 'the held-item state could not be read.';
   if (partial && groups.length === 0) {
@@ -297,6 +309,8 @@ function renderText(groups: CounterpartyGroup[], stale: boolean, noGoogleSources
 
 const open_loops: Operation = {
   name: 'open_loops',
+  mutating: false,
+  idempotent: true,
   outputRedaction: 'retrieval',
   description:
     'The open-loop engine\'s killer output: who is waiting on you, what you promised, and the context ' +
@@ -323,7 +337,8 @@ const open_loops: Operation = {
     const trusted = ctx.remote === false;
     const nowMs = p.as_of === undefined ? Date.now() : Date.parse(String(p.as_of));
     if (!Number.isFinite(nowMs)) {
-      throw new OperationError('invalid_params', `open_loops: as_of must be an ISO 8601 timestamp, got ${JSON.stringify(p.as_of)}`);
+      throw invalidParam(ctx, 'open_loops', 'as_of', `open_loops: as_of must be an ISO 8601 timestamp, got ${JSON.stringify(p.as_of)}`,
+        { def: open_loops.params.as_of, example: '2026-04-03T09:00:00Z' });
     }
     const groupBy = (p.group_by as string | undefined) ?? 'counterparty';
     const status = ((p.status as string | undefined) ?? 'open') as LoopStatus;
@@ -349,9 +364,11 @@ const open_loops: Operation = {
         (allowed && allowed.length > 0 && allowed.includes(p.source_id)) ||
         (!(allowed && allowed.length > 0) && ctx.sourceId === p.source_id);
       if (!inGrant) {
-        throw new OperationError(
+        throw opError(
           'permission_denied',
           `open_loops: source '${p.source_id}' is outside your granted sources`,
+          `Pass source_id as one of your granted sources (${grantedSources(ctx).join(', ') || 'none'}), or omit it to read your default scope.`,
+          { fix: sourcesFix('Lists the sources this connection can read.') },
         );
       }
     }
@@ -360,9 +377,11 @@ const open_loops: Operation = {
     // the op must not rely on them — an unscoped remote read here would span
     // every source (the cross-source leak class).
     if (!trusted && !scope.sourceId && !scope.sourceIds) {
-      throw new OperationError(
+      throw opError(
         'permission_denied',
         'open_loops: remote callers need a resolved source scope',
+        'Pass source_id naming one of your granted sources (fix lists them).',
+        { fix: sourcesFix('Lists the sources this connection can read.') },
       );
     }
     const loops = await listOpenLoops(ctx.engine, {
@@ -375,6 +394,7 @@ const open_loops: Operation = {
     });
     const freshness = await googleSourceFreshness(ctx, scope);
     const noGoogleSources = freshness.sources.length === 0;
+    const partialStaleSources = freshness.stale ? [] : freshness.staleSources;
     const coverage = await heldCoverage(ctx, freshness.sources, trusted);
     const deepLinks = trusted ? await deepLinksFor(ctx, loops) : new Map<string, string>();
 
@@ -387,6 +407,7 @@ const open_loops: Operation = {
         truncated,
         stale: freshness.stale,
         sources: freshness.sources,
+        ...(partialStaleSources.length > 0 ? { stale_sources: partialStaleSources } : {}),
         completeness: coverage.completeness,
         held: coverage.held,
         no_google_sources: noGoogleSources,
@@ -468,18 +489,57 @@ const open_loops: Operation = {
       truncated,
       stale: freshness.stale,
       sources: freshness.sources,
+      ...(partialStaleSources.length > 0 ? { stale_sources: partialStaleSources } : {}),
       completeness: coverage.completeness,
       held: coverage.held,
       no_google_sources: noGoogleSources,
       redacted: !trusted,
       as_of: new Date(nowMs).toISOString(),
-      ...(trusted ? { text: renderText(groups, freshness.stale, noGoogleSources, coverage, nowMs) } : {}),
+      ...(trusted ? { text: renderText(groups, freshness.stale, noGoogleSources, coverage, nowMs, partialStaleSources) } : {}),
     };
   },
 };
 
+function grantedSources(ctx: OperationContext): string[] {
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0) return [...allowed];
+  return ctx.sourceId ? [ctx.sourceId] : [];
+}
+
+function sourcesFix(why: string): Action {
+  return readFix(why, { argv: ['gbrain', 'sources', 'list', '--json'], mcp: { tool: 'sources_list', arguments: {} } });
+}
+
+function closeFix(ctx: OperationContext, p: Record<string, unknown>): { fix?: Action } {
+  if (typeof p.id !== 'number' || !Number.isSafeInteger(p.id)) return {};
+  return { fix: hostFix(ctx, ['gbrain', 'loops', p.status === 'dropped' ? 'drop' : 'done', String(p.id)],
+    'The trusted local CLI closes loops in any source; a remote caller closes only inside its bound write source.') };
+}
+
+const MUTE_VALUE = /^[A-Za-z0-9][A-Za-z0-9._%+@-]{0,253}$/;
+
+function muteScopeError(ctx: OperationContext, verb: 'mute' | 'unmute', p: Record<string, unknown>,
+  sourceId: string, writeSource: string | undefined): OperationError {
+  const kind = p.kind === 'sender' || p.kind === 'thread' ? p.kind : undefined;
+  const value = typeof p.value === 'string' && MUTE_VALUE.test(p.value) ? p.value : undefined;
+  return opError('permission_denied', `loops_${verb}: source "${sourceId}" is outside the caller's write scope`,
+    writeSource
+      ? `Nothing changed. This connection writes only to source '${writeSource}': pass source_id '${writeSource}', or have the user run the ${verb} from the trusted local CLI (command in fix).`
+      : `Nothing changed. This connection has no bound write source; the user can run the ${verb} from the trusted local CLI (command in fix).`,
+    kind && value ? { fix: hostFix(ctx, ['gbrain', 'loops', verb, kind, value, '--source', sourceId],
+      'A suppression is a write; remote callers write only inside their bound source.') } : {});
+}
+
+function noGoogleContent(ctx: OperationContext, message: string): OperationError {
+  const param = opTransport(ctx) === 'cli' ? paramUse(ctx, 'source') : '`source_id`';
+  return opError('invalid_params', message,
+    `Nothing changed. Pass ${param} naming the google source (fix lists sources with their kind).`,
+    { fix: sourcesFix('Lists sources with their kind, so you can pick the google one.') });
+}
+
 const loops_close: Operation = {
   name: 'loops_close',
+  idempotent: true,
   outputRedaction: 'no_stored_text',
   description:
     "Close an open loop by id: status 'done' (handled) or 'dropped' (not going to). Closing is a state " +
@@ -513,15 +573,19 @@ const loops_close: Operation = {
       if (!writeSource) {
         // Enumerated error envelope (dispatch classifies + request-logs it),
         // never a success-shaped { closed:false } payload.
-        throw new OperationError(
+        throw opError(
           'permission_denied',
           'loops_close: remote callers need a bound write source',
+          'Nothing was closed. This connection has no bound write source; the user can close the loop from the trusted local CLI (command in fix).',
+          closeFix(ctx, p),
         );
       }
       if (requested && requested !== writeSource) {
-        throw new OperationError(
+        throw opError(
           'permission_denied',
           `loops_close: source "${requested}" is outside the caller's write scope`,
+          `Nothing was closed. This connection writes only to source '${writeSource}': omit source_id to close there, or have the user close it from the trusted local CLI (command in fix).`,
+          closeFix(ctx, p),
         );
       }
       // No cross-source SELECT: the close runs scoped to the write source,
@@ -553,6 +617,7 @@ const loops_close: Operation = {
 
 const loops_mute: Operation = {
   name: 'loops_mute',
+  idempotent: true,
   outputRedaction: 'no_stored_text',
   description:
     'Suppress a sender (email address) or thread id from opening NEW loops — the detector feedback ' +
@@ -575,10 +640,7 @@ const loops_mute: Operation = {
     if (ctx.remote !== false) {
       const writeSource = (ctx.auth?.sourceId ?? ctx.sourceId) as string | undefined;
       if (!writeSource || sourceId !== writeSource) {
-        throw new OperationError(
-          'permission_denied',
-          `loops_mute: source "${sourceId}" is outside the caller's write scope`,
-        );
+        throw muteScopeError(ctx, 'mute', p, sourceId, writeSource);
       }
     }
     // A suppression is only consulted inside a google source — when the
@@ -586,10 +648,7 @@ const loops_mute: Operation = {
     // content, the row can never match. Refuse instead of planting a dead
     // mute (remote callers bound to a non-google source hit exactly this).
     if (p.source_id === undefined && !(await sourceHasGoogleContent(ctx, sourceId))) {
-      throw new OperationError(
-        'invalid_params',
-        `loops_mute: source "${sourceId}" holds no Google content — a suppression there can never match; pass source_id naming the google source`,
-      );
+      throw noGoogleContent(ctx, `loops_mute: source "${sourceId}" holds no Google content — a suppression there can never match; pass source_id naming the google source`);
     }
     if (ctx.dryRun) return { dry_run: true, action: 'loops_mute', kind: p.kind, value: p.value };
     await addSuppression(ctx.engine, sourceId, p.kind as 'sender' | 'thread', p.value as string);
@@ -599,6 +658,7 @@ const loops_mute: Operation = {
 
 const loops_unmute: Operation = {
   name: 'loops_unmute',
+  idempotent: true,
   outputRedaction: 'no_stored_text',
   description:
     'Remove a sender/thread suppression added by loops_mute, so the detector can open NEW loops for ' +
@@ -620,20 +680,14 @@ const loops_unmute: Operation = {
     if (ctx.remote !== false) {
       const writeSource = (ctx.auth?.sourceId ?? ctx.sourceId) as string | undefined;
       if (!writeSource || sourceId !== writeSource) {
-        throw new OperationError(
-          'permission_denied',
-          `loops_unmute: source "${sourceId}" is outside the caller's write scope`,
-        );
+        throw muteScopeError(ctx, 'unmute', p, sourceId, writeSource);
       }
     }
     // Mirrors loops_mute: an omitted source_id resolving to a source with no
     // Google content can never hold a live suppression — refuse rather than
     // answer removed:false on a row that should never have existed.
     if (p.source_id === undefined && !(await sourceHasGoogleContent(ctx, sourceId))) {
-      throw new OperationError(
-        'invalid_params',
-        `loops_unmute: source "${sourceId}" holds no Google content — pass source_id naming the google source`,
-      );
+      throw noGoogleContent(ctx, `loops_unmute: source "${sourceId}" holds no Google content — pass source_id naming the google source`);
     }
     if (ctx.dryRun) return { dry_run: true, action: 'loops_unmute', kind: p.kind, value: p.value };
     const removed = await removeSuppression(

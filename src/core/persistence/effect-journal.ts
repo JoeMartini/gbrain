@@ -6,14 +6,16 @@ import { OperationError } from '../ops/contract.ts';
 import type { PreparedMutation } from './coordinator.ts';
 import { sha256 } from './digest.ts';
 import { PARK_AFTER_FAILURES, type EffectKind, type PersistenceEffect, type EffectRequest } from './effect-model.ts';
-import type { SqlEngine } from './model.ts';
+import type { SqlEngine, WriteRequest } from './model.ts';
+import { recordChronicleDecision } from '../chronicle/ledger.ts';
 import { isFactsExtractionEnabled } from '../facts/extract.ts';
+import { loadConfig } from '../config.ts';
 import { resolveDefaultVisibility } from '../facts/visibility.ts';
 import { declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 
 /** `snapshot` is the publication's final read of the page, including deleted rows, in this transaction. */
-export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest, snapshot: PageSnapshot | null,
+export async function queuePublicationEffects(tx: BrainEngine, row: EffectRequest & Partial<Pick<WriteRequest, 'operation' | 'intent' | 'authority' | 'principal_kind' | 'principal_id'>>, snapshot: PageSnapshot | null,
   outcome: Record<string, unknown>, prepared?: PreparedMutation): Promise<void> {
   if (prepared?.noop || prepared?.target === 'skill_bundle') return;
   await declarePersistenceProtocol(tx);
@@ -33,12 +35,26 @@ export async function queuePublicationEffects(tx: BrainEngine, row: EffectReques
   }
   if (snapshot && !snapshot.page.deleted_at) {
     if (!prepared?.deferEmbedding) await queue('embedding');
-    outcome.embedding_state = prepared?.deferEmbedding ? 'deferred' : 'queued';
+    outcome.embedding_state = await embeddingDisabled(tx) ? 'disabled' : prepared?.deferEmbedding ? 'deferred' : 'queued';
     if ((outcome.facts_backstop as { queued?: boolean } | undefined)?.queued) {
       if (!(await isFactsExtractionEnabled(tx))) outcome.facts_backstop = { skipped: 'extraction_disabled' };
       else await queue('facts-backstop', { visibility: await resolveDefaultVisibility(tx) });
     }
+    // #5876: the Life Chronicle decision is a ledger row, not an effect; the `chronicle` cycle phase executes it.
+    await recordChronicleDecision(tx, row, snapshot, outcome);
   }
+}
+
+/**
+ * A keyless brain (`init --no-embedding`: `embedding_disabled` on the file or
+ * DB plane, the same pair the embedding effect refuses on) reports
+ * `embedding_state: "disabled"` (agent-first operator wave E5): its
+ * embedding effect settles as skipped, so "queued" would promise vectors that
+ * never arrive.
+ */
+async function embeddingDisabled(tx: BrainEngine): Promise<boolean> {
+  if (loadConfig()?.embedding_disabled === true) return true;
+  return (await tx.getConfig('embedding_disabled')) === 'true';
 }
 
 /** Claims release their database connection before waiting for a filesystem lock/provider. Nothing on a refresh-fenced worktree is claimed. */

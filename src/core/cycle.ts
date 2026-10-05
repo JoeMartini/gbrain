@@ -80,6 +80,8 @@ export type CyclePhase =
   // soft-band takes against recent timeline evidence; report-only in v1
   // (writes reports/drift-<date>; auto_update mutates nothing).
   | 'drift'
+  // #5876 — Life Chronicle events from meeting/conversation/calendar pages (default ON).
+  | 'chronicle'
   | 'embed' | 'orphans' | 'purge'
   // v0.39 T12: schema-suggest passive trigger (D3 + D4 plan-eng-review).
   // Wraps runSuggest() — same library the CLI verb + EIIRP call.
@@ -169,6 +171,8 @@ export const ALL_PHASES: CyclePhase[] = [
   // the calibration trio (fresh take resolutions) and BEFORE embed so the
   // drift report page gets embedded same-cycle. Report-only in v1.
   'drift',
+  // #5876 — Life Chronicle events (global). BEFORE embed so event pages embed same-cycle.
+  'chronicle',
   // v0.41.11.0 — opt-in conversation-facts backfill. Default OFF; reads
   // cycle.conversation_facts_backfill.enabled gate inside the wrapper.
   // Ordered AFTER calibration_profile (matches the runCycle dispatch
@@ -327,6 +331,8 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'calibration_profile',
   // #2653 — writes the reports/drift-<date> page.
   'drift',
+  // #5876 — writes event pages, projections and the chronicle ledger.
+  'chronicle',
   // v0.41 T9 — extract_atoms writes atom-typed pages via put_page;
   // synthesize_concepts writes concept-typed pages + tier updates. Both
   // mutate DB state and need the lock.
@@ -367,6 +373,8 @@ export interface PhaseResult {
   summary: string;
   details: Record<string, unknown>;
   error?: PhaseError;
+  code?: string; // agent contract v1: canonical registry code for `error` (sibling, additive)
+  fix?: import('./agent-output.ts').RenderedAction; // agent contract v1: the next step for `error`
 }
 
 export type CycleStatus = 'ok' | 'clean' | 'partial' | 'skipped' | 'failed';
@@ -1004,7 +1012,7 @@ function checkAborted(signal?: AbortSignal): void {
 // keyword is the minimal seam that lets behavioral tests drive the
 // wrapper's result-mapping (counter → status enum + summary) without
 // going through runCycle's full setup cost.
-export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal): Promise<PhaseResult> {
+export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: BrainEngine | null, signal?: AbortSignal, sourceId?: string): Promise<PhaseResult> {
   try {
     const { runLintCore } = await import('../commands/lint.ts');
     // issue #1678: pass the cycle's live engine so lint's content-sanity
@@ -1012,7 +1020,7 @@ export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: B
     // competing module-style engine that nulls the shared db singleton
     // mid-cycle (which broke every phase after lint with a misleading
     // "connect() has not been called").
-    const result = await runLintCore({ target: brainDir, fix: !(engine && await isManagedBrain(engine)), dryRun, engine: engine ?? undefined, signal });
+    const result = await runLintCore({ target: brainDir, fix: true, dryRun, engine: engine ?? undefined, signal, sourceId }); // #5180: sourceId scopes the managed-brain coordinator write path
     const issues = result.total_issues ?? 0;
     const fixed = result.total_fixed ?? 0;
     const remaining = Math.max(0, issues - fixed);
@@ -1029,7 +1037,7 @@ export async function runPhaseLint(brainDir: string, dryRun: boolean, engine?: B
       summary: dryRun
         ? `${issues} issue(s) found (dry-run, no writes)`
         : `${fixed} fix(es) applied, ${remaining} remaining`,
-      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun },
+      details: { issues, fixed, pages_scanned: result.pages_scanned, dryRun, write_path: result.write_path, fix_pending: result.fix_pending },
     };
   } catch (e) {
     return {
@@ -1288,13 +1296,10 @@ async function runPhaseSync(
     // sync overruns into the next cron tick. Report it as a skip.
     const { SyncLockBusyError } = await import('../commands/sync.ts');
     if (e instanceof SyncLockBusyError) {
-      return {
-        phase: 'sync',
-        status: 'skipped',
-        duration_ms: 0,
-        summary: 'sync already in progress elsewhere — skipped',
-        details: { syncStatus: 'lock_busy' },
-      };
+      return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: 'sync already in progress elsewhere — skipped', details: { syncStatus: 'lock_busy' } };
+    }
+    if ((e as { code?: unknown } | null)?.code === 'sync_not_applicable') {
+      return { phase: 'sync', status: 'skipped', duration_ms: 0, summary: (e as Error).message, details: { reason: 'sync_not_applicable' } };
     }
     return {
       phase: 'sync',
@@ -2141,7 +2146,7 @@ export async function runCycle(
         phaseResults.push(skipNoBrainDir('lint'));
       } else {
         progress.start('cycle.lint');
-        const { result, duration_ms } = await timePhase(() => runPhaseLint(brainDir, dryRun, engine, cycleSignal), 'lint');
+        const { result, duration_ms } = await timePhase(() => runPhaseLint(brainDir, dryRun, engine, cycleSignal, cycleSourceId), 'lint');
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -2731,6 +2736,20 @@ export async function runCycle(
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // #5876 Life Chronicle (default ON): executes write-time ledger decisions and backfill rows, bounded per run.
+    if (phases.includes('chronicle')) {
+      checkAborted(cycleSignal);
+      if (!engine) phaseResults.push({ phase: 'chronicle', status: 'skipped', duration_ms: 0, summary: 'no database connected', details: { reason: 'no_database' } });
+      else {
+        progress.start('cycle.chronicle');
+        const { runPhaseChronicle } = await import('./cycle/chronicle.ts');
+        const { result, duration_ms } = await timePhase(() => runPhaseChronicle(engine, { dryRun, signal: cycleSignal,
+          yieldDuringPhase: opts.yieldDuringPhase, deadlineAtMs: opts.deadlineAtMs ?? null }), 'chronicle');
+        result.duration_ms = duration_ms; phaseResults.push(result); progress.finish();
       }
       await safeYield(opts.yieldBetweenPhases);
     }

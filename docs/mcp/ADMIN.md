@@ -250,7 +250,7 @@ gbrain auth rescope --client CLIENT_ID --sources workspace,default --operations 
 | `--sources` | `a,b` or `none` | Source grant; the first id is the write source, the list is the read set. `default` is the source named `default`; to restore the no-grant floor use `--reset-default sources`. Tokens: `none` grants no source, so reads and writes to every source are refused (`permission_denied`, `fence=no_source_grant`), including writes accepted before the change. Clients: `none` refuses (`client_sources_none_unsupported`); cut a client off with `gbrain auth revoke-client <client_id>`. |
 | `--read-sources` | `a,b` | Client only: a read set that differs from `--sources`. |
 | `--takes-holders` | `a,b` or `none` | Token only: takes-holder allow-list; `none` hides every take. |
-| `--operations` | `op,...` or `none` | Operation snapshot; `none` refuses every operation. |
+| `--operations` | `op,...`, `none` or `all` | Operation snapshot; `none` refuses every operation. Client only: `all` stores no snapshot and clears the profile, so the scopes and the surface alone decide, including operations later upgrades add (tokens: `--reset-default operations`). |
 | `--scopes` | `read,write,...` | Replaces the scopes. |
 | `--reset-default` | `sources,takes-holders,operations` | Token only: restores the `auth create` default for those axes: no source grant (the historical `default` floor), holders `world`, no operation snapshot. |
 | `--refresh-operations` | with optional `--add op,...` or `--all-new` | Token only: previews operations added since the snapshot. Without `--add` or `--all-new` nothing is widened. |
@@ -363,7 +363,7 @@ Who can read it:
   version only for the local CLI and `admin` holders. A `read` or `write` grant
   gets the same version rows without any attribution field.
 
-Rows written before this release start `unrecorded`. Fill the ones the write
+Rows written before v0.60.37.0 read `unrecorded`. Fill the ones the write
 journal proves exactly, after you agree; it is free and changes no content:
 
 ```bash
@@ -382,7 +382,7 @@ that inserted it. Everything else stays `unrecorded`; nothing is inferred.
 registers `gbrain serve --access read-only` as its stdio MCP command.
 
 ```bash
-claude mcp add gbrain -- gbrain serve --access read-only
+claude mcp add gbrain -- "$(command -v gbrain)" serve --access read-only
 gbrain serve --surface starter --access read-only
 ```
 
@@ -396,7 +396,8 @@ mutations; owner maintenance on the same process (startup migrations, hook
 IPC banking) is a separate control. The default is `--access full`.
 `gbrain serve --http --access read-only` refuses: narrow HTTP access per token
 with `gbrain auth rescope-token <name> --operations <op,...>` or
-`gbrain auth rescope-client <client_id> --allowed-operations <op,...>`.
+`gbrain auth rescope-client <client_id> --allowed-operations <op,...>`
+(`all` removes a client's snapshot again).
 
 ## Invalidate tokens, revoke, or delete
 
@@ -428,31 +429,33 @@ promise erasure of historical logs/backups. Revoking a client cannot undo an
 external operation already running. Removing a client configuration alone does
 not revoke server access.
 
-Previously accepted jobs continue under their existing grant checks after
-token invalidation. Revocation or deletion denies those jobs at their next
+Jobs accepted before token invalidation continue under their existing grant
+checks. Revocation or deletion denies those jobs at their next
 authority check; external work already admitted may complete. All three actions
 retain request history, audit records, spending reservations, and settlement.
 
 ## Recover a failed step
 
-| Symptom | What to do |
-| --- | --- |
-| Owner credential missing or refused | Use the server's protected credential mechanism; an MCP token cannot substitute. See owner credential recovery above. |
-| Service unreachable or wrong URL | Verify the configured endpoint and existing service health; do not start a second brain. |
-| Admin command unsupported by this server | Upgrade/restart the intended running server through its normal maintenance process. No local database fallback. |
-| Rate limited | Respect the retry timing; do not repeatedly mint login links or retry failed credentials. |
-| Login link consumed/expired | Ask the authorized administrator for a new one; preserve the pending request ID when still valid. |
-| Consent expired/restarted/permissions changed | Restart authorization in the native client, then review its new request. |
-| Redirect or PKCE/authentication-method mismatch | Compare setup metadata with the native client's actual callback and method. The native client owns its verifier. |
-| Duplicate client name | Inspect the reported existing client ID; recover its setup instead of creating another client. |
-| Mutation response lost or timed out | Outcome may be unknown. Inspect the client/list before retrying; a transport error does not prove nothing changed. |
-| `grant_conflict` | Inspect the current revision and preview the intended action again. |
-| `permission_denied` with `fence=no_source_grant` | The legacy token's source grant is an explicit empty list. Grant sources with `gbrain auth rescope --token <name> --sources <id,...>` ([legacy token grants](#legacy-token-grants)). |
-| Client/source list failed | Retry the failed request; an error is not an empty registration list or a missing source. |
-| Public OAuth setup has no secret | Expected for authentication method `none`. Connect using native PKCE. |
-| Confidential secret delivery interrupted | Use `mcp admin setup … --credentials-out PRIVATE_FILE` to recover the retained delivery; never expose it in ordinary output. |
-| Recovery journal unavailable or secret no longer matches | Use an existing private handoff if available. Otherwise choose an explicit maintenance/reprovisioning action; do not silently rotate or duplicate. |
-| Server probe passes but harness does not connect | Check the actual native configuration, reload/authorization state, and observed tool call. Report native verification as incomplete. |
+<a id="admin-symptoms"></a>
+
+| Symptom | What to do | Who acts | Consent | Verify |
+| --- | --- | --- | --- | --- |
+| Owner credential missing or refused | Use the server's protected credential mechanism; an MCP token cannot substitute. See owner credential recovery above. | brain host | `credentials` | a fresh login link opens the panel |
+| Service unreachable or wrong URL | Verify the configured endpoint and existing service health; do not start a second brain. | brain host | none | the server's `/health` |
+| Admin command unsupported by this server | Upgrade/restart the intended running server through its normal maintenance process. No local database fallback. | brain host | none | the server's reported version |
+| Rate limited | Respect the retry timing; do not repeatedly mint login links or retry failed credentials. | provider | none | retry after the stated delay |
+| Login link consumed/expired | Ask the authorized administrator for a new one; preserve the pending request ID when still valid. | brain host | `credentials` | the new link opens the panel |
+| Consent expired/restarted/permissions changed | Restart authorization in the native client, then review its new request. | user (re-authorizes in the native client) | `credentials` | the client's tool list |
+| Redirect or PKCE/authentication-method mismatch | Compare setup metadata with the native client's actual callback and method. The native client owns its verifier. | brain host | none | setup metadata matches the client's callback |
+| Duplicate client name | Inspect the reported existing client ID; recover its setup instead of creating another client. | brain host | none | the client list |
+| Mutation response lost or timed out | Outcome may be unknown. Inspect the client/list before retrying; a transport error does not prove nothing changed. | brain host | none | the client list |
+| `grant_conflict` | Inspect the current revision and preview the intended action again. | brain host | none | the preview of the intended action |
+| `permission_denied` with `fence=no_source_grant` | The legacy token's source grant is an explicit empty list. Grant sources with `gbrain auth rescope --token <name> --sources <id,...>` ([legacy token grants](#legacy-token-grants)); the refusal's `fix` names the token by `--id`. | brain host | none | the token's grant in the client list |
+| Client/source list failed | Retry the failed request; an error is not an empty registration list or a missing source. | agent | none | the same list request |
+| Public OAuth setup has no secret | Expected for authentication method `none`. Connect using native PKCE. | user | none | a native PKCE connection |
+| Confidential secret delivery interrupted | Use `mcp admin setup … --credentials-out PRIVATE_FILE` to recover the retained delivery; never expose it in ordinary output. | brain host | `credentials` | the private credentials file exists |
+| Recovery journal unavailable or secret no longer matches | Use an existing private handoff if available. Otherwise choose an explicit maintenance/reprovisioning action; do not silently rotate or duplicate. | brain host | `credentials` | the client list |
+| Server probe passes but harness does not connect | Check the actual native configuration, reload/authorization state, and observed tool call. Report native verification as incomplete. | user (reloads the harness) | none | an observed tool call in the harness |
 
 The host journal is private material under `.gbrain/credential-deliveries` and
 is excluded from default backups. Recovery validates the live registration;

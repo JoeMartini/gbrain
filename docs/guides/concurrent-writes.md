@@ -171,19 +171,61 @@ reasons without page content. Whole-source audit requires a CLI grant without a
 slug-prefix restriction. `sources writer activate --dry-run` includes a bounded
 drift sample and identifies incomplete samples without authorizing repairs.
 
-Atom scan/failure bookkeeping now lives outside canonical note metadata so
+### Many drifted pages: classify, then resolve additive drift
+
+When an audit finds many drifted pages, something outside GBrain is usually
+editing the canonical files. Classify before repairing anything:
+
+```bash
+gbrain sources reconcile workspace --brain host --audit --classify --limit 25 --json
+```
+
+Each drifted finding gets a `classification` and its `drift_paths` (paths, rule
+outcomes and reasons, never values), and `classified` counts the batch:
+
+| Classification | Meaning | Next step |
+| --- | --- | --- |
+| `structurally_additive` | Only additive metadata changed: a `contacts` list with entries appended after every stored entry (order and repeats kept), an activity date that moved forward (`updated`, `last_*`, `*_last_used`), or a field present on one side only. | Preview with `--auto-additive`, then apply. |
+| `additive_with_suggestions` | The above, plus body or timeline lines inserted without changing or removing any stored line. | Read the inserted lines, then preview with `--auto-additive --accept-suggested`. |
+| `review_required` | Stored text changed or was removed; or a policy, privacy, title, type, tag, alias or fence change; or a date that moved backward, changed format or is in the future. | Resolve manually as above, after asking the user. |
+| `formatting_only` | The parsed content already agrees. | Preview; the result is the database content. |
+
+`file_modified_after_database` says whether the file changed after the page's
+last database write, a hint for finding the process that edits files directly.
+
+```bash
+gbrain sources reconcile workspace people/example --brain host \
+  --preview --auto-additive --out ~/.gbrain/repair/example.auto.json --json
+```
+
+`--auto-additive` writes `take_file` decisions only for the paths its rules
+cover and lists them in `auto_decided_paths`. Inserted body and timeline lines
+are never decided automatically, because an added line can still contradict an
+older one ("Correction: the earlier note is wrong"). The structure rules cannot
+see that. Read the inserted lines in the private artifact (show them to the
+user when the page is private or the claims matter), then add
+`--accept-suggested`. If any path needs review, the preview stays
+`needs_resolution` and `next_action` says what to ask.
+
+The artifact (format version 2) records each automatic decision with its rule
+and an evidence digest of the exact values it judged. Apply and the owner both
+re-run the rules against the pinned file and database copies; any change means
+a fresh preview. Apply, backups and the retry of the blocked write work exactly
+as above.
+
+Atom scan/failure bookkeeping lives outside canonical note metadata so
 processing progress does not create new disagreements. Managed atom extraction
 checks trusted local source-wide authority and, for filesystem writes, owner
 readiness before model work, then journals publication and completion. Retained
 accepted output replays without
-another model call. This does not restore every legacy maintenance writer; see
+another model call. Not every legacy maintenance writer runs on the managed path; see
 [supported managed work and explicit repair](../architecture/topologies.md#supported-managed-work-and-explicit-repair).
 
 ### Roll back safely
 
 Stop submitting new reconciliation requests first. Keep a compatible upgraded
 owner running until all accepted requests are terminal and recovery has drained;
-inspect the durable receipts before disabling the new command or reverting the
+inspect the durable receipts before disabling the reconcile command or reverting the
 binary. Never downgrade an active reconciliation queue to a version that does
 not understand its intents. Leave the additive processing-state table and private
 backups in place. Do not automatically restore an old preimage over later edits,
@@ -202,10 +244,10 @@ and do not disable guards or change ownership as part of rollback.
 | `cancelled` | Cancelled before publication began. |
 
 On Windows, publication flushes each staged file through the handle it was
-written with and skips the directory flush Windows does not provide. Older
-releases flushed through a read-only handle, which Windows refuses (`EPERM`), so
-a restoration could stay `recovering` and hold every later write on that source
-behind it. After upgrading, the owner retries it on its own; confirm with
+written with and skips the directory flush Windows does not provide. A
+restoration that an older gbrain left `recovering` (it flushed through a
+read-only handle, which Windows refuses with `EPERM`) holds every later write
+on that source behind it; the current owner retries it on its own. Confirm with
 `gbrain doctor --json` (`canonical_content_writes` reports `ok` once recovery
 has drained).
 
@@ -265,13 +307,13 @@ UUID, without fabricating a queued receipt or opening another PGLite engine.
 Legacy callers that omit a request ID and lose the entire acknowledgment cannot
 recover exact replay identity from the content alone.
 
-Local Unix listeners keep their existing socket addresses when they fit the
+Local Unix listeners use their standard socket address when it fits the
 portable 103-byte limit. Longer addresses use a deterministic private directory
 under `/private/tmp` on macOS or `/tmp` on Linux, independent of `HOME` and
 `TMPDIR`. Both CLI discovery and resident servers derive it without opening the
 database. The directory must belong to the current OS user with mode `0700`;
-clients require a socket with mode `0600`. Unsafe entries are refused. Existing
-credentials and hook-secret locations are unchanged. A native binding lock
+clients require a socket with mode `0600`. Unsafe entries are refused.
+Credentials and hook secrets stay in their own locations. A native binding lock
 serializes startup and remains held until the listener has actually closed.
 
 
@@ -290,8 +332,8 @@ retrying the whole transaction after a confirmed abort.
 
 ## Frozen memory verbs
 
-`remember` and `forget` accept optional `request_id`. Their frozen success enums
-and `protocol_version: 1` are unchanged. Accepted pending memory writes use the
+`remember` and `forget` accept optional `request_id` and keep their frozen
+success enums and `protocol_version: 1`. Accepted pending memory writes use the
 existing `unavailable` error with a populated suggestion and additive
 `write_request`/`write_error` metadata. A pending response never claims
 `status: "inserted"` or `expired: true`.
@@ -325,9 +367,9 @@ bytes, revisions, chunks and embedding signatures remain unchanged. Managed
 withdrawals retain a versioned target manifest for the mirror, Git and embedding
 workers; each worker checkpoints one affected page at a time.
 
-A withdrawal mirror or Git scan no longer parks on a page whose file is a
+A withdrawal mirror or Git scan does not park on a page whose file is a
 sync-skip metafile (`RESOLVER.md`, which carries the managed durability block
-by design) or whose file holds an uncoordinated local edit (#5396): the
+by design) or whose file holds an uncoordinated local edit: the
 withdrawal is recorded in the database, the page is listed in the effect's
 `data.skipped` with reason `metafile` or `file_database_drift`, and the
 request's Git and embedding effects proceed. Reconcile a `file_database_drift`
@@ -648,7 +690,7 @@ content digest and `file_count`, not a per-file map, so `sources add`, `claim`,
 `rebind`, `archive`, `remove`, clone, reclone and writer transfer work the same
 at 50,000 files as at 50. Rows written by older releases, which also carry a
 per-file map, stay valid and are compacted on their next rewrite. Every command
-still hashes each file once while holding the root's native lock and before it
+hashes each file once while holding the root's native lock and before it
 opens a database transaction; in human output it reports `files hashed of total`
 on stderr for worktrees above 5,000 files. Measured on a 4-vCPU cloud machine
 with a 50,000-file, 3.4 MB worktree: `sources add`, `claim` and transfer

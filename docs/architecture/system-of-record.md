@@ -208,6 +208,7 @@ or a physical projection that leaves attribution untouched):
 
 <!-- write-attribution-covered:start -->
 - `src/commands/migrate-engine.ts` (5): engine copy keeps the source rows' attribution values verbatim.
+- `src/core/chronicle/publish.ts` (3): Life Chronicle event generations: maintenance requests on managed brains; the unmanaged event write, retirement soft delete and retired stamp run in `maintenanceTransaction`.
 - `src/core/cycle/extract-takes.ts` (2): coordinated per page on managed brains; the unmanaged batch upsert runs in `maintenanceTransaction`.
 - `src/core/embed-facts.ts` (1): embedding columns only (physical projection).
 - `src/core/embedding-dim-check.ts` (1): embedding columns only (physical projection).
@@ -221,6 +222,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/persistence/connector-sync.ts` (2): connector publication inside `withCoordinatedWrite`.
 - `src/core/persistence/derived-facts.ts` (1): `withDerivedFactsWrite` (managed derived facts).
 - `src/core/persistence/facts-prepare.ts` (3): managed `extract_facts` request preparer.
+- `src/core/persistence/file-repair.ts` (2): `managed_file_repair` request preparer (#5988).
 - `src/core/persistence/grandfather.ts` (2): request preparer.
 - `src/core/persistence/links-maintenance.ts` (1): coordinated maintenance.
 - `src/core/persistence/loop-fact-retirement.ts` (1): request preparer.
@@ -231,6 +233,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/persistence/semantic-pages.ts` (1): `add_timeline_entry` request preparer.
 - `src/core/persistence/sync-prepare.ts` (4): managed sync request preparer.
 - `src/core/persistence/takes-prepare.ts` (3): takes request preparer.
+- `src/core/repair/frontmatter.ts` (1): a `managed_file_repair` request on managed sources; the unmanaged rename runs in `maintenanceTransaction`.
 - `src/core/repair/stale-atoms.ts` (3): a request on managed brains; the unmanaged retirement runs in `maintenanceTransaction`.
 <!-- write-attribution-covered:end -->
 
@@ -241,9 +244,9 @@ these write with `NULL` attribution):
 - `src/commands/extract-conversation-facts.ts` (3): the conversation fact index calls the engine directly through `writeDerivedFacts`.
 - `src/commands/extract-timeline-db.ts` (2): `gbrain extract timeline --source db` batch insert.
 - `src/commands/extract.ts` (4): `gbrain extract` timeline walks (file, incremental, stale) and the per-entry fallback.
+- `src/commands/sync/holds.ts` (1): legacy full sync moves a held rename's page once its file screens clean (`updateSlug`).
 - `src/commands/sync/renames.ts` (1): legacy sync rename (`updateSlug`).
 - `src/core/calibration/undo-wave.ts` (1): calibration wave undo of take resolutions.
-- `src/core/chronicle/extract-events.ts` (1): event page write.
 - `src/core/company-brain/profile.ts` (1): company-brain sync soft deletes.
 - `src/core/cycle/dream-provenance.ts` (1): dream provenance frontmatter stamp.
 - `src/core/cycle/drift.ts` (1): drift report page.
