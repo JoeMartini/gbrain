@@ -23,7 +23,7 @@ gbrain config set spend.posture gated      # default — gates enforce
 | Value | Effect |
 |-------|--------|
 | `gated` (default) | Every cost gate enforces its limit as documented below. |
-| `tokenmax` | Every embedding-spend gate in the table below prints its estimate and **proceeds** — informational only. Spend is still recorded to the ledger; posture removes the *ceiling*, not the *accounting*. (Commands with their own LLM cost caps outside this doc's embedding scope — e.g. `extract-conversation-facts --max-cost-usd`, `dream retriage --max-usd` (an estimate-based soft stop), `facts relink --max-usd` (default $1.00; its free tiers and moved rows spend nothing) — don't resolve posture; their per-call flags govern.) |
+| `tokenmax` | Every embedding-spend gate in the table below prints its estimate and **proceeds** — informational only. Spend is still recorded to the ledger; posture removes the *ceiling*, not the *accounting*. (Commands with their own LLM cost caps outside this doc's embedding scope — e.g. `extract-conversation-facts --max-cost-usd`, `dream retriage --max-usd` (an estimate-based soft stop), `facts relink --max-usd` (default $1.00; its free tiers and moved rows spend nothing), the automatic facts drain (`facts.drain_budget_usd` $1.00 per run, `facts.drain_daily_budget_usd` $5.00 per rolling day; [guide](../guides/facts-drain.md)) — don't resolve posture; their per-call flags govern.) |
 
 `spend.posture` is deliberately separate from `search.mode=tokenmax` (which governs
 retrieval payload size, not embedding spend). When a gate fires and
@@ -73,6 +73,34 @@ What authorizes paid work, and the cap it runs under:
   and register them with `gbrain pricing set` (see
   [Registering a model price](#registering-a-model-price)), then retry the
   same command.
+
+## Queued paid work
+
+Paid commands that queue jobs carry the approval onto the jobs, and the
+worker enforces it:
+
+| Producer | Jobs | Basis stored | Budget the worker enforces |
+|---|---|---|---|
+| `book-mirror` | one `subagent` per chapter | `authorized`, one group | the approved total, shared by the chapters |
+| `enrich --background` (Postgres) | one `enrich` per source | `authorized`, one group | the approved total, shared by the sources |
+| `jobs submit enrich\|subagent` | one | `authorized` | the approved cap |
+| jobs of those commands queued before submit-time authorization | as above | `legacy_default`, one group per job | `enrich`: the job's `--max-usd`, else $5; `subagent`: $5 |
+| everything else (`agent run`, MCP `submit_agent`/`submit_job`, `doctor --remediate`, autopilot and dream phases, `skillopt`, `import`, `reindex`, `sync`, embedding backfills) | various | none (`unrecorded`) | the producer's own budget: client daily budget, cycle budget, embedding caps, write-path embedding as configured, `--max-usd` for remediation |
+
+Each provider attempt reserves its maximum cost against the group in the
+durable spend meter and settles its measured usage; an attempt that never
+reports usage stays charged. When other jobs' attempts are in flight the job
+waits (delayed, no attempt burned, at most 6 times); when settled spend
+reaches the cap the job dies with `derived_cap_exhausted` or
+`cost_cap_exceeded`, the group amounts and the rerun command. `--max-usd off`
+(or `spend.posture=tokenmax` on `enrich`) stores an uncapped approval: nothing
+is reserved and spend is still ledgered. Group controls:
+`gbrain jobs list --group <id> --json`, `gbrain jobs cancel --group <id>`.
+
+Spend-authorized jobs need upgraded workers: an older worker cannot claim
+them (and stops claiming at the first one in its queue order), so restart
+every worker after upgrading. Rolling the binary back leaves those queued rows
+unclaimable; cancel them first (`gbrain jobs cancel --group <id>`).
 
 ## Off switches (`off` / `unlimited` / `none`)
 

@@ -194,7 +194,9 @@ hybrid recall + fusion:
    ├── vector  (HNSW on chunk embeddings, per-page max-pool)
    ├── keyword (BM25 via tsvector)
    ├── title-phrase arm
-   ├── relational (typed-edge recall arm — relational queries only)
+   ├── relational (typed-edge recall arm — relational queries only; 2-3
+   │      relationship questions walk typed hop chains when
+   │      search.relational_planner is on)
    ├── source-aware re-rank (CASE in SQL)
    ├── role-tagged arms; variant/clause lists weighted by search.expansion_variant_budget INSIDE the fusion (fusion-lists.ts)
    └── page-grain RRF fusion → cosine re-score → post-fusion boosts
@@ -211,6 +213,10 @@ deduplication (4-layer: per-page cap, same-page Jaccard, type diversity)
        │
        ▼
 reranker (cross-encoder — balanced/tokenmax; fail-open)
+       │
+       ▼
+feedback (use-attributed page weights × the ordering score, bounded ±λ;
+   no-op when no page was rated — src/core/search/feedback-boost.ts)
        │
        ▼
 relational re-pin (relational-arm rows back above the reranked text rows, in
@@ -283,6 +289,21 @@ Two cross-cutting seams sit around the pipeline rather than inside it:
   a near-identical candidate set. `search.crag_think=true` (local callers)
   escalates a still-weak result to `think`.
 
+### Use-attributed feedback
+
+Answers from `query`, `search`, `think`, `synthesize` and `recall` record the
+pages they used (with the revision read) and the typed edges on their
+relational paths. A rating (`rate_answer`, or a `think` citation for the brain
+owner) moves each element's weight `w` by `w + α·(r − w)`; the feedback stage
+then multiplies the ordering score by `1 + λ·2·(w − 0.5)`. It runs after the
+reranker, on the reranker's score when it reordered the list, because a boost
+applied before the cross-encoder would be erased; raw scores stay untouched,
+so autocut and evidence grading are unchanged. No retrieval path runs a
+query-language string: the relational arm
+and `traverse_graph` take only typed parameters into fixed SQL, and
+`test/raw-query-routing-guard.test.ts` pins that no op accepts query text as
+SQL or graph syntax. Guide: [retrieval feedback](../guides/retrieval-feedback.md).
+
 ### Relational re-pin: edge answers bypass reranker demotion
 
 The cross-encoder scores chunk TEXT against the query. The relational arm's
@@ -314,6 +335,44 @@ fail-open runs. The pin trusts the arm: a false-positive arm puts as many edge
 pages at the top as the pin allows, where an unpinned run would place one at
 `limit`. Turn it off per brain with `gbrain config set search.relational_rerank_pin off`.
 The knob folds into the query-cache key (`rrp=`).
+
+### Multi-hop relationship chains
+
+A question that chains two or three relationships ("who founded the companies
+Alice invested in?") is planned by `parseRelationalPlan`
+(`src/core/search/relational-plan.ts`): a bounded lexer, a fixed relationship
+vocabulary, exactly one named entity, hops ordered from that entity outward
+(the main-clause verb is outermost), page types checked along the chain.
+Coordination, negation, time constraints, counting, quoted names and
+multi-entity questions are refused with a reason; single-relationship
+questions stay on `parseRelationalQuery`. With `search.relational_planner` on,
+the relational arm resolves the entity, runs `runRelationalChain`
+(`src/core/search/relational-chain.ts`) and emits answers first, then the
+intermediate and origin pages of every retained path, each row carrying a
+`relational` evidence field (role, seed, hop, path count, up to three edges).
+Up to `search.relational_chain_slots` (default 10) chain rows lead page 1.
+A chain that finds nothing falls back to the one-hop path; a refused question
+runs no relational arm. `meta.relational_plan` and a `relational_chain`
+notice report the outcome.
+
+Execution is one bounded query per hop (`BrainEngine.relationalChainHop`, SQL
+in `src/core/search/read-enrichment.ts`): at most 50 frontier pages, 100
+logical edges per page (lowest link id first) and 10 retained paths per page.
+Links are read by each relationship's page-type signature (`stored`,
+`flipped`, `uncertain` at half weight; canonical frontmatter, manual and
+attendance-section links keep stored direction), duplicate rows between a
+pair collapse into one logical edge, and every endpoint, origin and degree
+contributor passes the read policy before scoring. Path weight is the product
+of hub weights of the intermediate pages (`hubWeight`,
+`src/core/search/hub-dampening.ts`; degree saturates at 300 link rows);
+ties order by source and slug. The same executor serves `traverse_graph`
+`hops` and `gbrain graph-query --hop`.
+
+Chain evidence is page-level through fusion: whichever chunk of a page
+survives carries the page's `relational` field. Only answers count toward the
+relational re-pin and the page-1 evidence slot; intermediate and origin pages
+never claim them. The planner keys fold into the query-cache key only when on
+(`rp=1`, `ro=1`). Guide: [multi-hop relationship questions](../guides/multi-hop.md).
 
 ### Metadata boost gate: vector-only voters keep the vector order
 
@@ -458,11 +517,17 @@ built from (`content_chunks.embedding_input_hash`: column, model, dimensions,
 wrapping tier and wrapped text), and a rebuild keeps it only when the current
 page would produce the same input, so an unchanged contextual page keeps its
 vectors and a synopsis-mode body edit nulls every synopsis-tier chunk. Vectors
-written before that record existed are kept on non-contextual pages and nulled
-once on contextual ones. Remaining NULL vectors still need an explicitly
-authorized `gbrain embed --stale` run. A text-ready index is not a promise that
-every page has a vector. Diagnostics do not disclose private or foreign-source
-pending pages and never start repair themselves.
+written before that record existed are grandfathered on pages whose mode
+is still NULL; contextual-mode repair and reindex stamp compatible raw inputs
+when moving those pages to explicit `none`. An explicit `none` page may have
+inherited a title-wrapped vector, so a rebuild clears unstamped vectors there,
+and switching from title or synopsis to `none` clears active text vectors
+immediately. Genuine old raw vectors on explicit `none` pages may need a
+one-time re-embed; it never starts automatically. Remaining NULL vectors
+still need an explicitly authorized `gbrain embed --stale` run. A text-ready
+index is not a promise that every page has a vector. Diagnostics do not
+disclose private or foreign-source pending pages and never start repair
+themselves.
 
 Markdown chunk creation applies the strict protected-body sanitizer before
 splitting text. For remote reads, all existing chunks of every page kind are

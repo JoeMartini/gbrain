@@ -4,7 +4,7 @@
  * Ubicloud VMs.
  *
  *   bun run ci:ubicloud                 # gitleaks + verify + serial + slow + unit + ALL E2E
- *   bun run ci:ubicloud:diff            # same, E2E narrowed by select-e2e (doc-only: gitleaks only)
+ *   bun run ci:ubicloud:diff            # doc-only diff: doc checks + gitleaks; any other diff: the full gate
  *
  * Options:
  *   --vms N            VMs to provision in parallel (default 4: 64 vCPUs of the
@@ -13,7 +13,7 @@
  *   --slots N          concurrent work slots per VM (default: half of --size's vCPUs)
  *   --location LOC     Ubicloud location (default eu-central-h1)
  *   --lanes a,b        subset of gitleaks,verify,serial,slow,unit,e2e (default all)
- *   --diff             select E2E files from the branch diff (ci:local --diff)
+ *   --diff             doc-only diffs run only the doc checks and gitleaks (ci:local --diff)
  *   --record-weights   write measured durations to scripts/ubicloud/weights.json
  *   --keep             leave the VMs running (destroy with ubi-runner.sh down NAME)
  *
@@ -30,11 +30,17 @@
  * from (scripts/ubicloud/schedule.ts); items run through the same wrappers
  * ci:local uses (scripts/ubicloud/ci-item.sh). Durations of every run are
  * merged into .context/ci-ubicloud/weights.json, which weights the next run.
- * All VMs are destroyed on exit, including Ctrl-C.
+ *
+ * VMs are named ubirun-<owner>-<epoch>-ciNN<hex> (owner: UBI_OWNER or the
+ * runner's per-machine id). Each name is appended to <run>/vms.txt before its
+ * create request is sent. On exit, including SIGINT, SIGTERM, SIGHUP (a
+ * dropped terminal, a cancelled background operation) and SIGQUIT, in-flight
+ * `up` calls are allowed to finish (they destroy their own VM), then every
+ * recorded name is destroyed and polled until it is confirmed gone.
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { createReadStream, createWriteStream, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, createReadStream, createWriteStream, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
@@ -133,13 +139,13 @@ function sh(cmd: string, args: string[]): string {
 }
 const lines = (text: string) => text.split(/\s+/).map((l) => l.trim()).filter(Boolean);
 
-const children = new Set<ReturnType<typeof spawn>>();
+const children = new Map<ReturnType<typeof spawn>, string>();
 
 /** Run the runner script; stdout goes to `out` (a path) or is returned. */
 function runner(args: string[], opts: { out?: string; input?: string; timeoutMs?: number } = {}): Promise<{ code: number; stdout: string }> {
   return new Promise((resolvePromise) => {
     const child = spawn("bash", [RUNNER, ...args], { cwd: ROOT, stdio: ["pipe", "pipe", "pipe"] });
-    children.add(child);
+    children.set(child, args[0]!);
     let stdout = "";
     let stderr = "";
     const sink = opts.out ? createWriteStream(opts.out) : null;
@@ -166,7 +172,7 @@ const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 interface Vm {
   name: string;
   state: "provisioning" | "setup" | "ready" | "failed" | "destroyed";
-  created: boolean;
+  requested: boolean;
   infraErrors: number;
   setupMs?: number;
   busySlots: number;
@@ -186,16 +192,16 @@ async function main() {
   mkdirSync(join(runDir, "failures"), { recursive: true });
 
   // ── Inventory: the same discovery the ci:local wrappers use ───────────────
-  let e2eFiles = lines(sh("bash", ["scripts/run-e2e.sh", "--dry-run-list"]));
+  const e2eFiles = lines(sh("bash", ["scripts/run-e2e.sh", "--dry-run-list"]));
   if (opts.diff) {
     const classification = spawnSync("bun", ["run", "scripts/select-e2e.ts", "--classify-only"], { cwd: ROOT, encoding: "utf8" }).stdout?.trim();
     if (classification === "DOC_ONLY") {
-      log("--diff: doc-only diff — running gitleaks only (ci:local Tier 2 fast-path)");
+      log("--diff: doc-only diff — running the doc checks locally, then gitleaks (ci:local doc-only fast-path)");
+      if (spawnSync("bash", ["scripts/ci-doc-checks.sh"], { cwd: ROOT, stdio: "inherit" }).status !== 0) process.exit(1);
       opts.lanes = new Set(["gitleaks"]);
       opts.vms = 1;
     } else {
-      log(`--diff: classification ${classification || "unknown"} — full unit lanes + selected E2E`);
-      e2eFiles = lines(sh("bun", ["run", "scripts/select-e2e.ts"]));
+      log(`--diff: E2E narrowing is retired; running the full E2E corpus (see docs/TESTING.md#e2e-selection). Classification: ${classification || "unknown"}`);
     }
   }
   const exclusive = lines(sh("bash", ["scripts/run-serial-tests.sh", "--dry-run-list-exclusive"]));
@@ -239,35 +245,49 @@ async function main() {
     ?? "1.4.2";
 
   // ── Teardown on every exit path ──────────────────────────────────────────
+  const owner = sh("bash", [RUNNER, "owner"]).trim();
+  const ledger = join(runDir, "vms.txt");
   const vms: Vm[] = Array.from({ length: opts.vms }, (_, i) => ({
-    name: `ubirun-${Math.floor(Date.now() / 1000)}-ci${String(i + 1).padStart(2, "0")}${Math.random().toString(16).slice(2, 6)}`,
+    name: `ubirun-${owner}-${Math.floor(Date.now() / 1000)}-ci${String(i + 1).padStart(2, "0")}${Math.random().toString(16).slice(2, 6)}`,
     state: "provisioning",
-    created: false,
+    requested: false,
     infraErrors: 0,
     busySlots: 0,
     heavy: 0,
   }));
-  let tornDown = false;
-  const teardown = async () => {
-    if (tornDown) return;
-    tornDown = true;
-    for (const child of children) child.kill("SIGKILL");
+  // Memoized: the signal handler and main's finally must await the same
+  // teardown, or main exits while its `down` calls are still running.
+  let tornDown: Promise<void> | null = null;
+  const teardown = () => (tornDown ??= destroyAll());
+  const destroyAll = async () => {
+    // An `up` gets SIGTERM, records its create answer and destroys its own VM;
+    // waiting for it means no create request is in flight when `down` runs.
+    const ups = [...children].filter(([, sub]) => sub === "up").map(([child]) => child);
+    for (const [child, sub] of children) child.kill(sub === "up" ? "SIGTERM" : "SIGKILL");
+    await Promise.all(ups.map((child) => new Promise((done) => (child.exitCode !== null || child.signalCode !== null ? done(null) : child.once("exit", done)))));
     rmSync(tarball, { force: true });
-    const live = vms.filter((vm) => vm.state !== "destroyed");
+    const live = vms.filter((vm) => vm.requested && vm.state !== "destroyed");
     if (opts.keep) {
       log(`--keep: leaving ${live.map((vm) => vm.name).join(" ")} running; destroy with: scripts/ubicloud/ubi-runner.sh down NAME`);
       return;
     }
-    log(`destroying ${live.length} VM(s)`);
+    log(`destroying ${live.length} VM(s): ${live.map((vm) => vm.name).join(" ")}`);
     await Promise.all(live.map(async (vm) => {
-      // A VM whose create call may be in flight is looked up by name.
-      const r = await runner(["down", vm.name]);
-      if (r.code === 0 || !vm.created || /not found/.test(r.stdout)) vm.state = "destroyed";
-      else console.error(`ci-ubicloud: WARNING failed to destroy ${vm.name}; run: scripts/ubicloud/ubi-runner.sh down ${vm.name}`);
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        if ((await runner(["down", vm.name, "-l", opts.location])).code === 0) {
+          vm.state = "destroyed";
+          return;
+        }
+      }
+      console.error(`ci-ubicloud: WARNING could not confirm ${vm.name} is gone; run: scripts/ubicloud/ubi-runner.sh down ${vm.name} -l ${opts.location}`);
     }));
+    const left = live.filter((vm) => vm.state !== "destroyed").length;
+    log(left ? `teardown left ${left} VM(s) unconfirmed (names in ${ledger})` : `teardown confirmed ${live.length} VM(s) gone`);
   };
   let interrupted = false;
-  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  // After SIGHUP the terminal may be gone: a failed log write must not abort teardown.
+  for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {});
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"] as const) {
     process.on(signal, () => {
       if (interrupted) return;
       interrupted = true;
@@ -360,11 +380,17 @@ async function main() {
   const vmLifecycle = async (vm: Vm, index: number) => {
     const started = Date.now();
     const setupLog = join(runDir, "logs", `setup-${vm.name}.log`);
+    if (tornDown) return;
+    vm.requested = true;
+    appendFileSync(ledger, `${vm.name} ${opts.location}\n`);
     const up = await runner(["up", "-n", vm.name, "-s", opts.size, "-l", opts.location], { out: setupLog });
-    vm.created = true;
+    if (tornDown) return;
     if (up.code !== 0) {
       vm.state = "failed";
-      log(`VM ${index + 1} failed to provision (see ${setupLog}): ${readFileSync(setupLog, "utf8").trim().split("\n").slice(-2).join(" | ")}`);
+      const setupText = readFileSync(setupLog, "utf8").trim();
+      const quota = setupText.indexOf("ubi-runner: quota refused");
+      if (quota >= 0) log(`VM ${index + 1} refused by the Ubicloud vCPU quota; the run continues on the VMs that started:\n${setupText.slice(quota)}`);
+      else log(`VM ${index + 1} failed to provision (see ${setupLog}): ${setupText.split("\n").slice(-2).join(" | ")}`);
       return;
     }
     vm.state = "setup";
