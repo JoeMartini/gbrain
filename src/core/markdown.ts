@@ -1,11 +1,12 @@
 import { dataFrontmatter as matter, FrontmatterLanguageError } from './data-frontmatter.ts';
-import { safeLoad as yamlSafeLoad } from 'js-yaml';
+import { load as yamlLoad } from 'js-yaml';
 import type { Page, PageType } from './types.ts';
 import { resolveSlugForPath, slugifyPath } from './sync.ts';
 import {
   commentValueKeys, frontmatterKeyHazard, recoverFrontmatter, unclosedFenceProtectedKey, yamlLocationMessage,
   RECOVERY_VERSION, type FrontmatterRecovery, type RecoveryKind,
 } from './frontmatter-recovery.ts';
+import { findLineOutsideFencedCode } from './fence-scan.ts';
 
 export {
   recoverFrontmatter, RECOVERY_VERSION, PROTECTED_FRONTMATTER_KEYS, IDENTITY_FRONTMATTER_KEYS,
@@ -673,7 +674,7 @@ function collectValidationErrors(
     // genuinely broken. Parse the value to disambiguate.
     let isValidYaml = false;
     try {
-      yamlSafeLoad(value);
+      yamlLoad(value);
       isValidYaml = true;
     } catch {
       // YAML parse failed — line is genuinely broken
@@ -698,7 +699,7 @@ function collectValidationErrors(
   let detectedYamlParseError = looksLikeFrontmatter ? ctx.yamlParseError : null;
   if (!detectedYamlParseError && looksLikeFrontmatter) {
     try {
-      yamlSafeLoad(fmBody);
+      yamlLoad(fmBody);
     } catch (e) {
       detectedYamlParseError = e as Error;
     }
@@ -752,7 +753,7 @@ function collectValidationErrors(
 /** Where js-yaml refuses a raw block: its reason phrase and the file line and column. */
 function yamlFailureLocation(block: string, lineOffset: number): { reason: string; line: number; column: number } | null {
   try {
-    yamlSafeLoad(block);
+    yamlLoad(block);
     return null;
   } catch (e) {
     const err = e as { reason?: string; mark?: { line?: number; column?: number } };
@@ -826,30 +827,34 @@ export function splitBody(body: string): { compiled_truth: string; timeline: str
  * shape) so the frontmatter's `---` delimiters can't false-positive rule 3.
  */
 export function findTimelineSplitIndex(lines: string[]): number {
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
+  // A sentinel quoted inside a fenced code block (a markdown example) is not
+  // a separator. Mispaired fences (see MarkdownCodeMap) leave every candidate
+  // live, as before.
+  return findLineOutsideFencedCode(lines, (i) => isTimelineSentinelLine(lines, i));
+}
 
-    if (trimmed === '<!-- timeline -->' || trimmed === '<!--timeline-->') {
-      return i;
-    }
+function isTimelineSentinelLine(lines: string[], i: number): boolean {
+  const trimmed = lines[i].trim();
 
-    if (trimmed === '--- timeline ---' || /^---\s+timeline\s+---$/i.test(trimmed)) {
-      return i;
-    }
+  if (trimmed === '<!-- timeline -->' || trimmed === '<!--timeline-->') {
+    return true;
+  }
 
-    if (trimmed === '---') {
-      const beforeContent = lines.slice(0, i).join('\n').trim();
-      if (beforeContent.length === 0) continue;
+  if (trimmed === '--- timeline ---' || /^---\s+timeline\s+---$/i.test(trimmed)) {
+    return true;
+  }
 
-      for (let j = i + 1; j < lines.length; j++) {
-        const next = lines[j].trim();
-        if (next.length === 0) continue;
-        if (/^##\s+(timeline|history)\s*$/i.test(next)) return i;
-        break;
-      }
+  if (trimmed === '---') {
+    const beforeContent = lines.slice(0, i).join('\n').trim();
+    if (beforeContent.length === 0) return false;
+
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j].trim();
+      if (next.length === 0) continue;
+      return /^##\s+(timeline|history)\s*$/i.test(next);
     }
   }
-  return -1;
+  return false;
 }
 
 /** A timeline entry line: a bullet whose text starts with a 4-digit year

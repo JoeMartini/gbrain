@@ -842,11 +842,14 @@ describe('session-end', () => {
     expect(readdirSync(corpusDir).filter((f) => f.includes('.tmp-'))).toEqual([]);
   });
 
-  test('retention prune: corpus files past the default 30d window are removed [G15]', async () => {
+  test('retention prune: extracted corpus files past the default 30d window are removed [G15]', async () => {
     const corpusDir = join(home(), 'transcripts', 'corpus');
     mkdirSync(corpusDir, { recursive: true });
     const oldFile = join(corpusDir, 'ancient.txt');
     writeFileSync(oldFile, 'old corpus\n');
+    // E-N1 (D16): only an extracted file goes at plain retention; an
+    // unextracted one is kept to 3x (test/corpus-retention-uningested.serial.test.ts).
+    writeFileSync(oldFile + '.ingested', '{}\n');
     const old = (Date.now() - 40 * 24 * 3600 * 1000) / 1000;
     utimesSync(oldFile, old, old);
     const freshFile = join(corpusDir, 'fresh.txt');
@@ -1259,6 +1262,24 @@ describe('stop-hook per-turn push [D3]', () => {
     expect((await lastHeartbeat())?.reason).toBe('push_clean');
     // #5558: stop no longer writes a live buffer
     expect(existsSync(join(home(), 'transcripts', 'live', 'sess-stop-push.txt'))).toBe(false);
+  });
+
+  test('#5371: tree whose only change is the managed ownership stamp: push_clean, no spawn', async () => {
+    const repo = bootRepo('stop-stamp-only', { clean: true });
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toEqual([]);
+    expect((await lastHeartbeat())?.reason).toBe('push_clean');
+  });
+
+  test('#5371: a real change beside the ownership stamp still spawns the push', async () => {
+    const repo = bootRepo('stop-stamp-dirty', { clean: true });
+    writeFileSync(join(repo, '.gbrain-owner.json'), '{}');
+    writeFileSync(join(repo, 'note.md'), 'unpushed\n');
+    const spawned: string[] = [];
+    await runHook(['stop'], stopIo(repo, spawned));
+    expect(spawned).toHaveLength(1);
   });
 
   test('corrupt per-root state file is treated as due (fail-open)', async () => {

@@ -66,9 +66,11 @@
 
 import type { BrainEngine, NewFact } from '../core/engine.ts';
 import type { Page } from '../core/types.ts';
+import { observationDateFrom, resolveObservationDate, type ObservationDate } from '../core/ai/date-grounding.ts';
 import {
   extractFactsFromTurnWithOutcome,
   isFactsExtractionEnabled,
+  type ExtractFailureReason,
   type ExtractInput,
   type ExtractedFact,
 } from '../core/facts/extract.ts';
@@ -99,6 +101,7 @@ import { writeReceipt, shortRunId } from '../core/extract/receipt-writer.ts';
 import { upsertExtractRollup, classifyRunStop } from '../core/extract/rollup-writer.ts';
 import { ALLOWED_TYPES, ALLOWED_TYPE_ALIASES, isConversationFactsEligiblePage, pageTypesForAllowed, requireParseableConversationFlag, type AllowedType } from '../core/facts/conversation-types.ts';
 import { TERMINAL_AUDIT_SOURCE, NON_EXTRACTABLE_AUDIT_SOURCE } from '../core/facts/audit-sources.ts';
+import { resolveDefaultVisibility, type FactVisibility } from '../core/facts/visibility.ts';
 import {
   emptySaveTimeResolutionCounts,
   formatSaveTimeResolutionCounts,
@@ -379,6 +382,7 @@ import {
   type ParseConversationOpts as OrchestratorParseOpts,
 } from '../core/conversation-parser/parse.ts';
 import { readConversationBodyForParsing } from '../core/conversation-parser/body.ts';
+import { conversationSkip } from '../core/facts/conversation-skip.ts';
 import { runLlmFallback } from '../core/conversation-parser/llm-fallback.ts';
 import { resolveModel, resolveTierDefault } from '../core/model-config.ts';
 import { FAILED_EXIT_CODE } from '../core/exit-codes.ts';
@@ -497,6 +501,31 @@ export function splitIntoSegments(
 // ---------------------------------------------------------------------------
 // Segment rendering with topical/temporal header.
 // ---------------------------------------------------------------------------
+
+/**
+ * Observation date of a conversation segment (date-grounding.ts): the
+ * segment's own timestamp when it came from the transcript itself or the
+ * page's frontmatter date — never the synthetic epoch fallback, and never a
+ * timestamp the parser derived from effective_date (which may be an event
+ * date). Otherwise the page's observation date, or null (unknown).
+ */
+/**
+ * A conversation fact's valid_from: a validated event date the extractor
+ * stated (date-grounding variant) wins; else the segment start, except the
+ * epoch fallback (no trustworthy date → the insert's now() default).
+ */
+function segmentValidFrom(extracted: Date | undefined, startIso: string | undefined): { valid_from?: Date } {
+  if (extracted) return { valid_from: extracted };
+  return startIso && !startIso.startsWith('1970-') ? { valid_from: new Date(startIso) } : {};
+}
+
+export function segmentObservationDate(page: Pick<Page, 'slug' | 'frontmatter' | 'effective_date'>, startIso: string | undefined): ObservationDate | null {
+  const day = startIso?.slice(0, 10);
+  const context = deriveDateContext({ page: page as Page });
+  const explicit = !!day && !day.startsWith('1970-')
+    && (context.source === 'explicit' || context.source === 'frontmatter_date' || day !== context.fallbackDate);
+  return explicit ? observationDateFrom(startIso) : resolveObservationDate({ slug: page.slug, frontmatter: page.frontmatter });
+}
 
 export function renderSegmentForExtraction(
   pageTitle: string,
@@ -723,6 +752,7 @@ interface ExtractCoreState {
   sleepMs: number;
   segmentLimit: number;
   types: AllowedType[];
+  factVisibility: FactVisibility;
   signal: AbortSignal | undefined;
   /**
    * Injected per-segment extractor (BrainBench decision 15). ONLY set when a
@@ -1022,20 +1052,32 @@ async function processPage(
       );
     }
   }
-  const gapMinutes = pageSegmentGapMinutes(page);
+  // #5025 / N2: undated time-only turns, a single email or a prose
+  // meeting/email page end in a not-extractable outcome instead of
+  // epoch-dated facts or a rescan every run.
+  const skip = conversationSkip(page, body, parseResult, messages, { llmFallback: Boolean(state.llmFallbackModel), managed: state.managed });
+  const terminalSkip = skip?.durable ? skip : null;
+  if (skip) {
+    process.stderr.write(`[extract-conversation-facts] SKIP ${page.slug}: ${skip.message}\n`);
+    messages = [];
+  }
+  // An email thread is one conversation even when replies are hours apart;
+  // a frontmatter conversation_segment_gap_minutes still wins.
+  const gapMinutes = pageSegmentGapMinutes(page) ??
+    (parseResult.matched_pattern_id === 'email-thread-heading' ? MAX_PAGE_SEGMENT_GAP_MINUTES : undefined);
   const allSegments = splitIntoSegments(messages, { gapMinutes });
   const segments = splitIntoSegments(messages, { gapMinutes, sinceIso });
   if (segments.length === 0) {
     state.result.pages_skipped++;
-    if (!declinedUnrecognizedSpeaker) {
+    if (!declinedUnrecognizedSpeaker && !terminalSkip) {
       if (messages.length === 0) state.result.pages_skipped_unparsed++;
       else if (allSegments.length === 0) state.result.pages_skipped_insufficient_turns++;
       else state.result.pages_skipped_since++;
     }
     if (
       !state.dryRun &&
-      parseResult.phase !== 'no_match' &&
-      allSegments.length === 0 &&
+      (parseResult.phase !== 'no_match' || terminalSkip !== null) &&
+      allSegments.length === 0 && !(skip && !skip.durable) &&
       // #4136 — a decline must stay NON-TERMINAL. The audit row is keyed by
       // a content versionToken and skips the page on every future run; a
       // declined page must retry once the parser learns the label instead.
@@ -1043,9 +1085,9 @@ async function processPage(
       // orphan cleanup below until the page re-extracts.)
       !declinedUnrecognizedSpeaker
     ) {
-      const reason = messages.length === 0
+      const reason = terminalSkip?.reason ?? (messages.length === 0
         ? 'no conversation messages found'
-        : 'fewer than two eligible messages';
+        : 'fewer than two eligible messages');
       if (await snapshotIsCurrent(state.engine, state.sourceId, snapshot)) {
         if (state.managed) {
           await replacePageFacts(state, snapshot, async tx => [
@@ -1121,6 +1163,7 @@ async function processPage(
         source: PER_SEGMENT_SOURCE_PREFIX,
         engine: state.engine,
         abortSignal: state.signal,
+        observationDate: segmentObservationDate(page, seg.startIso),
       });
       if (!extraction.ok) {
         // #3669 — rethrow BudgetExhausted UNWRAPPED. Wrapping it in a plain
@@ -1132,9 +1175,9 @@ async function processPage(
         const detail = extraction.error instanceof Error
           ? `: ${extraction.error.message}`
           : '';
-        throw new Error(
+        throw Object.assign(new Error(
           `segment ${seg.startIso}..${seg.endIso} extraction failed (${extraction.reason})${detail}`,
-        );
+        ), { extractionReason: extraction.reason });
       }
       extracted = extraction.facts;
     }
@@ -1164,7 +1207,7 @@ async function processPage(
       // so master's per-row resolveEntitySlug mapper (#4567's independent fix for
       // the same issue) is superseded rather than layered on top.
       const rows = extracted.map((fact, i) => ({
-        ...fact,
+        ...fact, visibility: state.factVisibility,
         row_num: rowNum + i,
         source_markdown_slug: page.slug,
         source: PER_SEGMENT_SOURCE_PREFIX,
@@ -1172,9 +1215,7 @@ async function processPage(
         // Preserve the conversation's valid time instead of defaulting every
         // extracted fact to extraction time. Epoch-anchored parses have no
         // trustworthy date, so they retain the existing now() fallback.
-        ...(seg.startIso && !seg.startIso.startsWith('1970-')
-          ? { valid_from: new Date(seg.startIso) }
-          : {}),
+        ...segmentValidFrom(fact.valid_from, seg.startIso),
         context:
           fact.context ?? `from ${page.slug} segment ${seg.startIso}..${seg.endIso}`,
       }));
@@ -1196,10 +1237,10 @@ async function processPage(
   }
 
   // Eng-v2 C7 / E16: write terminal audit row after all segments commit
-  // successfully. Only run when we got through every
-  // segment (no break on segmentLimit; that's an explicit partial run).
-  const fullyProcessed =
-    state.segmentLimit === 0 || segmentsThisPage < state.segmentLimit;
+  // successfully. Only run when every segment was processed — including a
+  // page whose segment count equals --segment-limit exactly, which
+  // previously missed the terminal row and re-extracted on every run.
+  const fullyProcessed = segmentsThisPage === segments.length;
   if (
     fullyProcessed &&
     newestEnd !== null &&
@@ -1357,6 +1398,7 @@ export async function runExtractConversationFactsCore(
 
   const types = await resolveTypesFromConfig(engine, opts.types);
   const strictEligibility = await requireParseableConversationFlag(engine);
+  const factVisibility = await resolveDefaultVisibility(engine);
   const dryRun = !!opts.dryRun;
   const sleepMs = opts.sleepMs ?? DEFAULT_INTER_CALL_SLEEP_MS;
   const segmentLimit = opts.segmentLimit ?? 0;
@@ -1396,6 +1438,7 @@ export async function runExtractConversationFactsCore(
     sleepMs,
     segmentLimit,
     types,
+    factVisibility,
     signal,
     extractor: opts.extractor,
     cpMap: new Map(),
@@ -1494,7 +1537,12 @@ export async function runExtractConversationFactsCore(
           result.pages_skipped_type_mismatch++;
           continue;
         }
-        await processPageWithLock(page);
+        try {
+          await processPageWithLock(page);
+        } catch (error) {
+          if (isAbortError(error) || error instanceof BudgetExhausted) throw error;
+          recordPageFailure(result, sourceId, slug, error);
+        }
       }
     } else if (opts.slug) {
       const page = await engine.getPage(opts.slug, { sourceId });
@@ -1577,15 +1625,7 @@ export async function runExtractConversationFactsCore(
               name: 'AbortError',
             });
           }
-          result.pages_failed += poolResult.errored;
-          for (const failure of poolResult.failures) {
-            const message = failure.error instanceof Error
-              ? failure.error.message
-              : String(failure.error);
-            process.stderr.write(
-              `[extract-conversation-facts] ${failure.label} failed: ${message}\n`,
-            );
-          }
+          for (const failure of poolResult.failures) recordPageFailure(result, sourceId, failure.label, failure.error);
 
           processedPagesCount += claimable.length;
           offset += batch.length;
@@ -2158,6 +2198,13 @@ function pickLaterIso(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The log names only the closed extraction reason, never provider or error text.
+function recordPageFailure(result: ExtractConversationFactsResult, sourceId: string, slug: string, error: unknown): void {
+  result.pages_failed++;
+  const reason = (error as { extractionReason?: ExtractFailureReason } | null)?.extractionReason ?? 'page_error';
+  process.stderr.write(`[extract-conversation-facts] ${slug} failed (${reason}) and stays unfinished; retry: gbrain extract-conversation-facts --source-id ${sourceId} --slug ${slug}\n`);
 }
 
 export function isAbortError(err: unknown): boolean {

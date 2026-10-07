@@ -485,7 +485,10 @@ in-word dots, so "C++", "C#", ".NET" and "Node.js" stay distinct from
 end of the claim follows it. Rows recorded before v174 keep their exact fingerprint and keep
 matching; v174 adds a folded row wherever a fact row still holds the claim text
 and expires active facts that became matching. A paraphrase with different
-words is a different claim.
+words is a different claim to the ledger: `forget` returns its close
+rewordings as `similar_active` for the agent to confirm with the user, and
+the optional overnight withdrawal review proposes the ones it judges to
+restate the claim for the owner to accept (`gbrain decide proposals list`).
 
 Already queued source-wide effects are converted using the same bounded exact
 discovery and retain their individual progress cursors. An over-capacity or
@@ -527,6 +530,20 @@ intent committed with the page; the `facts-backstop` effect becomes
 is checked by that worker. The handoff is idempotent and rechecks the source,
 page revision and current writer grant. Confined writers, unchanged pages,
 disabled extraction and dream-generated content do not enqueue work.
+Extraction reads only `compiled_truth`, so a write that leaves it unchanged on
+a live page that was already eligible records
+`facts_backstop: { skipped: "body_unchanged" }` and queues nothing. Title,
+tag, frontmatter and timeline edits fall in this case, as does
+`gbrain repair timeline` writing back rows the database already holds. If an
+extraction of that page is still pending (its effect not yet handed off, or
+its job not yet finished), the write queues anyway, because its new revision
+supersedes the pending one. A page that becomes eligible, or a deleted page
+written again, is extracted even with the same body. A body-preserving write
+does not extract an eligible page that was never extracted; its facts are
+extracted when the body next changes. For conversation-shaped pages
+(`conversation`, `meeting`, `slack`, `email`, `imessage`), `gbrain
+extract-conversation-facts --dry-run` previews a backfill without model calls,
+and `--max-cost-usd` caps its spend.
 Managed jobs retain the committed page request as their authority and publish
 through the coordinator. Legacy jobs without that request skip with
 `missing_write_authority`; raw queue/fence paths remain unsupported. Activation

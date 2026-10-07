@@ -76,12 +76,16 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   const failures = await engine.executeRaw<{ request_id: string; operation: string; source_id: string; state: WriteRequestState;
     error_code: string | null; error_detail: Record<string, unknown>; completed_at: Date | string | null }>(
     `SELECT request_id,operation,source_id,state,error_code,error_detail,completed_at FROM persistence_requests
-    WHERE error_detail IS NOT NULL ORDER BY sequence DESC LIMIT 20`);
+    WHERE error_detail IS NOT NULL AND COALESCE(error_detail->>'origin','')<>'fence' ORDER BY sequence DESC LIMIT 20`);
   const limits = await readJournalLimits(engine);
   const { persistenceConsumerStatus } = await import('./service.ts');
-  const ingress = persistenceConsumerStatus(engine);
+  // C-NEW-4: the consumer is per process, so this is the answering process's own ingress, never proof the brain's owner is down.
+  const local = persistenceConsumerStatus(engine);
+  const local_process_ingress = { ...local, scope: local.state === 'not_running'
+    ? 'The process that answered has no resident consumer (a one-shot CLI, for example); another process may own writes. See worktrees and bindings for ownership.'
+    : 'The resident consumer of the process that answered this status.' };
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
-    ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits),
+    local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits),
     recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
     blockers: blockers.map(row => {
       const health = writeHealth(row);

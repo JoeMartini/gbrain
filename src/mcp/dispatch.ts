@@ -264,6 +264,8 @@ export interface DispatchOpts {
   surfaceCeiling?: 'verbs' | 'starter' | 'full';
   /** The stdio session surface (OperationContext.stdioSurface); its allow-set is the one `allowedOps` mirrors. */
   stdioSurface?: OperationContext['stdioSurface'];
+  /** Threaded into OperationContext.revealTools (stdio session tool reveal). */
+  revealTools?: (names: string[]) => void;
   /** #5232: commit wait for coordinated writes (OperationContext.writeWaitMs); unset = agent default. */
   writeWaitMs?: number;
   /** C1: search/query row shape chosen by the transport (OperationContext.resultRows); unset = lean for remote callers. */
@@ -631,6 +633,16 @@ const stderrLogger: OperationContext['logger'] = {
 const SESSION_ID_MAX_CHARS = 256;
 
 /**
+ * CX2-11: the request-level session — MCP carries `_meta.session_id` as a sibling of `arguments` in
+ * `request.params`. Every transport threads it the same way, so a fact `remember`s the session over
+ * HTTP exactly as over stdio. Non-string / empty values are ignored; dispatch clamps the length.
+ */
+export function requestMetaSessionId(requestParams: unknown): string | undefined {
+  const raw = (requestParams as { _meta?: { session_id?: unknown } } | undefined)?._meta?.session_id;
+  return typeof raw === 'string' && raw.length > 0 ? raw : undefined;
+}
+
+/**
  * Read `_meta.session_id` out of the tool arguments when present. The MCP
  * spec carries `_meta` as a sibling of `arguments`, but several clients (and
  * proxies) fold it into the arguments object — this is the dispatch-level
@@ -674,6 +686,7 @@ export function buildOperationContext(
     ...(opts.explicitReadBinding ? { explicitReadBinding: opts.explicitReadBinding } : {}),
     ...(opts.surfaceCeiling ? { surfaceCeiling: opts.surfaceCeiling } : {}),
     ...(opts.stdioSurface ? { stdioSurface: opts.stdioSurface } : {}),
+    ...(opts.revealTools ? { revealTools: opts.revealTools } : {}),
     ...(opts.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
     ...(opts.resultRows ? { resultRows: opts.resultRows } : {}),
     auth: opts.auth,

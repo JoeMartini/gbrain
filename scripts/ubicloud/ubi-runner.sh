@@ -30,7 +30,7 @@
 # Stale-VM sweeps are off by default. With UBI_GC_HOURS set to a positive
 # number, every `up` first destroys this owner's VMs older than that; `gc HOURS`
 # runs the same sweep on demand. Neither ever touches another owner's VMs.
-set -euo pipefail
+set -Eeuo pipefail
 # Keep heredoc bodies on temp files, not the pipe window (test/heredoc-pipe-deadlock.test.ts).
 BASH_COMPAT=50
 
@@ -47,6 +47,24 @@ PREFIX="ubirun"
 
 die() { echo "ubi-runner: $*" >&2; exit 1; }
 log() { echo "ubi-runner: $*" >&2; }
+
+# Bash 5.2 can lose a signal trap: when the signal lands just before the shell
+# parses a $(...), the trap runs inside that parse, fails to parse itself
+# ("trap: line 2: unexpected EOF while looking for matching `)'") and the shell
+# exits 2 without running it (fixed in bash 5.3). The EXIT trap still runs.
+# The only other exit 2 here is a failed command, which sets FAILED through
+# the ERR trap, so finish reports an exit 2 without FAILED as the signal's 130.
+FAILED=""
+trap 'FAILED=1' ERR
+
+# finish STATUS NAME: EXIT handler of `up` and `run`. Destroys NAME unless it
+# is empty, then exits with STATUS.
+finish() {
+  local rc=$1
+  [ "$rc" != 2 ] || [ -n "$FAILED" ] || rc=130
+  [ -z "$2" ] || cmd_down "$2" || log "WARNING: failed to destroy $2; run: $0 down $2"
+  exit "$rc"
+}
 
 for bin in curl python3 ssh ssh-keygen tar; do
   command -v "$bin" >/dev/null || die "$bin is required"
@@ -337,20 +355,43 @@ cmd_down() {
   done
 }
 
+# slim_git SRC DIR: build DIR/.git holding only the objects HEAD and
+# origin/master reach, with SRC's branch, index and config, so a checkout that
+# fetched many branches does not upload all of them to every VM. Fails (and
+# the caller ships SRC's own .git) on anything unexpected.
+slim_git() {
+  local src=$1 dir=$2 git_dir common branch specs
+  git_dir=$(git -C "$src" rev-parse --absolute-git-dir) || return 1
+  common=$(cd "$src" && cd "$(git rev-parse --git-common-dir)" && pwd) || return 1
+  branch=$(git -C "$src" symbolic-ref -q HEAD) || branch=""
+  specs=("+HEAD:${branch:-refs/heads/ubi-pack-head}")
+  if git -C "$src" rev-parse -q --verify refs/remotes/origin/master >/dev/null; then
+    specs+=("+refs/remotes/origin/master:refs/remotes/origin/master")
+  fi
+  git init -q "$dir" &&
+    git -C "$dir" fetch -q --update-shallow --no-tags --no-write-fetch-head "$src" "${specs[@]}" &&
+    cp "$common/config" "$dir/.git/config" &&
+    { [ ! -f "$git_dir/index" ] || cp "$git_dir/index" "$dir/.git/index"; } &&
+    if [ -n "$branch" ]; then git -C "$dir" symbolic-ref HEAD "$branch"; else git -C "$dir" update-ref --no-deref HEAD "$(git -C "$src" rev-parse HEAD)"; fi
+}
+
 # pack SRC: write a gzipped checkout tarball to stdout (tracked + untracked
-# files that are not ignored, plus .git; a non-git directory is taken whole).
+# files that are not ignored, plus a slim .git; a non-git directory is taken whole).
 cmd_pack() {
-  local src
+  local src tmp
   src=$(cd "${1:-.}" && pwd)
   if git -C "$src" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    tmp=$(mktemp -d)
     (
       cd "$src"
-      { git ls-files -z -co --exclude-standard; printf '.git\0'; } \
+      if slim_git "$src" "$tmp/repo" >&2; then git_from=(-C "$tmp/repo" .git); else git_from=(.git); fi
+      git ls-files -z -co --exclude-standard \
         | while IFS= read -r -d '' f; do
-            if [ -e "$f" ] || [ -L "$f" ]; then printf '%s\0' "$f"; fi
+            if { [ -e "$f" ] || [ -L "$f" ]; } && [ "$f" != .git ]; then printf '%s\0' "$f"; fi
           done \
-        | tar --null -T - -czf -
+        | tar --null -T - "${git_from[@]}" -czf -
     )
+    rm -rf "$tmp"
   else
     tar -C "$src" -czf - .
   fi
@@ -408,11 +449,11 @@ cmd_run() {
   RUN_VM=$name
   # Armed before the create request: an interrupted `up` still destroys its VM.
   # A second signal must not cut teardown short, so the EXIT handler ignores them.
-  trap 'trap "" INT TERM HUP QUIT; cmd_down "$RUN_VM" || log "WARNING: failed to destroy $RUN_VM; run: $0 down $RUN_VM"' EXIT
+  trap 'rc=$?; trap "" INT TERM HUP QUIT; finish "$rc" "$RUN_VM"' EXIT
   trap 'exit 130' INT TERM HUP QUIT
   cmd_up "${up_args[@]}" >/dev/null
   if [ "$keep" = 1 ]; then
-    trap - EXIT
+    RUN_VM=""
     log "--keep: leaving $name running; destroy with: $0 down $name"
   fi
 
@@ -453,7 +494,7 @@ usage: ubi-runner.sh <command> [args]
                          create a VM and wait for SSH; prints its name
   ssh NAME [COMMAND]     shell or login-shell command on the VM (user ubi, passwordless sudo)
   sync NAME [SRC] [DEST] stream a checkout (tracked + untracked-unignored + .git)
-  pack [SRC]             write that checkout tarball to stdout
+  pack [SRC]             write that checkout tarball to stdout (with a slim .git: HEAD + origin/master)
   unpack NAME DEST       extract a tarball from stdin into DEST on the VM
   pull NAME REMOTE_GLOB LOCAL_DIR
                          copy matching remote entries into LOCAL_DIR
@@ -480,7 +521,7 @@ case $cmd in
 esac
 case $cmd in
   run) cmd_run "$@" ;;
-  up) trap 'trap "" INT TERM HUP QUIT; [ -z "$UP_NAME" ] || [ -n "$UP_READY" ] || cmd_down "$UP_NAME" || log "WARNING: failed to destroy $UP_NAME; run: $0 down $UP_NAME"' EXIT
+  up) trap 'rc=$?; trap "" INT TERM HUP QUIT; [ -z "$UP_READY" ] || UP_NAME=""; finish "$rc" "$UP_NAME"' EXIT
       trap 'exit 130' INT TERM HUP QUIT
       cmd_up "$@" ;;
   ssh) name=$1; shift; load "$name"

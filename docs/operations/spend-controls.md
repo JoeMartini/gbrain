@@ -107,6 +107,25 @@ unclaimable; cancel them first (`gbrain jobs cancel --group <id>`).
 The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to mean
 "no limit", so no sentinel value like `100000` is needed.
 
+On the command line, `--max-usd off` is the canonical way to run uncapped.
+`brainstorm`, `lsd`, `skillopt`, `enrich`, `onboard` and `eval longmemeval`
+parse their cap flag through one parser (`src/core/budget/cap-flag.ts`), so
+the rules match everywhere:
+
+| Command | Canonical | Legacy spellings still accepted |
+|---|---|---|
+| `brainstorm`, `lsd` | `--max-usd N\|off` | `--max-cost N\|off` |
+| `skillopt` | `--max-usd N\|off` | `--max-cost-usd N` (`0` = uncapped, deprecated), `--no-max-cost` |
+| `enrich` | `--max-usd N\|off` | `--max-cost-usd N\|off` |
+| `onboard`, `eval longmemeval` | `--max-usd N\|off` | none |
+
+A malformed value, a bare `0` (ambiguous: free or uncapped?) and two cap flags
+that disagree are refused before any paid call. `eval longmemeval --max-usd 0`
+keeps its meaning, a $0 judge cap. Runtime, call and token bounds stay in
+force when the USD cap is off. `brainstorm`, `lsd` and `skillopt` print one
+line naming the cap, its source and how to remove it, e.g.
+`cap: $5.00 (default; change it with --max-usd <usd>, remove it with --max-usd off)`.
+
 - `0` is **not** "off". On `sync.cost_gate_min_usd`, `0` means "block on any nonzero
   spend" (a real choice). On the backfill caps, `0` falls back to the default — and on
   `embed.backfill_max_usd` specifically, any present-but-invalid value (`0`, a
@@ -134,6 +153,7 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 | Atom auto-drain daily cap | `autopilot.auto_drain.max_usd_per_day` | `2.00` | daily cap on drain **attempts** (`floor(max / 0.30)` = 6), not a dollar ledger | `gbrain config set autopilot.auto_drain.enabled false` | **not** consulted |
 | Connector email/meeting atoms | `cycle.extract_atoms.connector_pages` | on (unset) | Gmail/Calendar `email`/`meeting` pages are extracted like other pages, under the auto-drain cap | `false` | **not** consulted |
 | Life Chronicle event extraction | `chronicle.job_budget_usd` (per page) / `chronicle.auto_daily_limit` (calls per rolling 24 h) | `0.25` / `200` | caps one extraction call; past the daily limit pending pages wait for a free slot | `gbrain config set auto_chronicle false` | **not** consulted |
+| Fence model repair (Tier 3) caps | `fences.repair.max_usd_per_page` / `fences.repair.max_usd_per_day` | `0.05` / `1.00` | per page and per UTC day across every process, through the durable USD ledger (`llm_repair`/`fences`); validated at `config set` and shown with today's spend by `gbrain doctor --only fence_integrity`. No release ships the model repair that spends under them yet | `0` = no model spend | **not** consulted |
 | Dream `synthesize` per-run budget | `dream.synthesize.budget_usd` | `5` | defers the transcript and the rest of the run before submission (estimate: prompt size + child output cap, x `max_turns` in agentic mode) | `unlimited` (`0` = submit nothing) | **not** consulted |
 | Dream `synthesize` daily submission cap | `dream.synthesize.max_submissions_per_source_per_day` | `0` (off) | skips whole files; a failed count query submits nothing that run | `0` | **not** consulted |
 | Dream `BudgetMeter` phases (auto_think, drift, propose/grade takes, calibration) | `dream.auto_think.budget`, `dream.drift.budget`, `cycle.<phase>.budget_usd` | per phase | refuses the next submit past the cap | `unlimited` (`0` = spend nothing) | **not** consulted |
@@ -312,6 +332,23 @@ always works. Proxy routes hit the explicit-cap refusal by design: a LiteLLM
 endpoint can front a paid provider, so `litellm:*` models are deliberately
 absent from both the pricing tables and the free-local sets.
 
+`brainstorm` / `lsd` and `skillopt` follow the same rule. With no cap flag the
+$5 default is a default cap: an unpriced model warns and runs, priced calls
+in the same run stay metered, and brainstorm's estimate, mid-run and pre-judge
+checks count the unpriced model at Sonnet rates so an oversized run still
+stops. With `--max-usd N` a run that would call an unpriced chat, judge or
+embedding model is refused before any work (skillopt: before any spend, in the
+preflight). The skillopt preflight never invents a rate: an unpriced model
+shows `Est. cost: unpriced (...)`. `brainstorm_health` in `gbrain doctor`
+names an unpriced brainstorm chat or judge model.
+
+Shipped rates are list rates. DeepSeek bills half its peak rate off-peak;
+gbrain's DeepSeek rows are the peak rate so caps bound the worst case, and
+estimates that use them say `(DeepSeek at peak rates, an upper bound)`.
+
+Every model a recipe lists is either priced or declared in the recipe's
+`unpriced_models`; `bun run check:recipe-pricing` enforces it in CI.
+
 ### Registering a model price
 
 The `no_pricing` refusal tells the agent what to do: look up the provider's
@@ -363,7 +400,18 @@ gbrain config set pricing.overrides \
 
 Semantics:
 
-- Keys are full `provider:model` strings (case-insensitive, exact match).
+- Keys are full `provider:model` strings (case-insensitive, exact match). An
+  override keyed by a model alias also prices the id the provider serves for it.
+- **Provider wildcard (subscription providers only).** `<provider>:*` prices
+  every model of a provider whose recipe bills by subscription, today only
+  `claude-cli`: `gbrain pricing set 'claude-cli:*' --rate 0`. Precedence is
+  exact model entry, then the wildcard, then the shipped tables. This is a
+  cap bypass by design: at $0 every claude-cli call counts as free against
+  every cap, including models gbrain ships a rate for. It is an operator
+  assumption, labelled as such by `gbrain pricing list`, which also names the
+  models the wildcard prices. A bare `*` and a wildcard on a per-token API
+  provider (`openai:*`) are refused by `pricing set` and ignored if written
+  into the config directly.
 - Overrides win over shipped tables — you own your bill (negotiated rates,
   markup-charging proxies).
 - Models with neither a table row nor an override stay fail-closed under a cap.

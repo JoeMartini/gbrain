@@ -201,8 +201,8 @@ export interface GBrainConfig {
       /** Enable the nightly probe in the autopilot loop. Defaults to false. */
       enabled?: boolean;
       /**
-       * Cost cap (USD) per probe invocation. Defaults to 5.
-       * Worst case: 5 × 30 nights ≈ $150/month per brain.
+       * Run-level cap (USD) over every paid call of one probe run (LongMemEval
+       * and judges). Default 5; a set value is a user cap (unpriced → no_pricing).
        */
       max_usd?: number;
     };
@@ -554,6 +554,8 @@ export interface GBrainConfig {
      * over this file slot. Always bounded by the server ceiling (D2).
      */
     default_surface_dcr?: 'verbs' | 'starter' | 'full';
+    /** Tools listed to agents (callable set unchanged; request_tools reaches the rest). Dual-plane, DB > file. */
+    advertised_surface?: 'verbs' | 'starter' | 'full';
     /** Search/query row shape for remote MCP callers: 'lean' (default) | 'full'. Dual-plane, DB > file. */
     result_rows?: 'lean' | 'full';
     /** Stdio `request_tools {surface}` widens the session's tool surface (default true). Dual-plane, DB > file. */
@@ -1271,6 +1273,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'agent.use_gateway_loop',
   // #2778: per-turn output-token cap for the subagent loop (default 8192).
   'agent.max_output_tokens',
+  // #4921: subagent per-turn chat timeout (minions/handler-timeouts.ts, default 30 min).
+  'ai.chat.per_turn_timeout_ms',
   // File-plane bootstrap hook-lane keys (routed to ~/.gbrain/config.json by
   // `config set` — engine-free hook/push children read loadConfigFileOnly).
   'push.allow_unverified_remote',
@@ -1390,6 +1394,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.dream.synthesize',
   'models.dream.extract_atoms',
   'cycle.extract_atoms.budget_usd',
+  // #4907: synthesize_concepts phase budget (finite USD > 0, default 1.5); cycle/phase-config-values.ts.
+  'cycle.synthesize_concepts.budget_usd',
   'cycle.extract_atoms.max_source_chars',
   'cycle.extract_atoms.page_discovery_budget',
   // #4540: per-item extractor caps (defaults 50000 chars / 4096 tokens) plus
@@ -1411,7 +1417,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'models.contextual_synopsis',
   'models.chat',
   'models.brainstorm.judge',
-  'models.eval.longmemeval',
+  'models.eval.longmemeval', 'models.eval.cross_modal.slot_a', 'models.eval.cross_modal.slot_b', 'models.eval.cross_modal.slot_c', // #5872 D12 probe judge slots
   'facts.extraction_model',
   // Brain-wide kill switch for fact extraction, read by
   // src/core/facts/extract.ts:isFactsExtractionEnabled and honored by
@@ -1438,6 +1444,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // B-16: confidence stored for an extracted candidate whose confidence is
   // missing or non-numeric (a number in 0..1). Unset keeps the legacy 1.0.
   'facts.extraction_missing_confidence',
+  'extraction.date_grounding', 'facts.attribution', // extraction prompt variants (facts/extract.ts getExtractorVariant)
   // [ENG-8] Brain-level default visibility for facts writes when the caller
   // didn't specify one: 'private' (default) | 'world'. Resolved by
   // src/core/facts/visibility.ts; explicit caller values always win.
@@ -1456,6 +1463,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Fire-once sentinel for the ambient-writeback consent nudge (WP8):
   // stamped 'true' after the init/post-upgrade ask has been shown once.
   'memory.auto_writeback_notice_shown',
+  // Always-loaded core memory + context-pressure notice (docs/guides/core-memory.md#configuration).
+  'memory.core.enabled', 'memory.core.max_chars', 'memory.core.remote_edit',
+  'memory.pressure.enabled', 'memory.pressure.warn_ratio', 'memory.pressure.context_window',
   // Declared brain audience: 'personal' | 'shared'. Set by the operator, by
   // company-brainify's Phase-5 handoff (shared), or from the bootstrap
   // interview. Declaration beats the conservative client-count heuristic in
@@ -1487,6 +1497,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'dream.synthesize.mode',
   'dream.synthesize.link_manifest',
   'dream.synthesize.quote_verify',
+  'dream.quote_verify',
+  'think.quote_verify',
   'dream.synthesize.inline_concurrency',
   // #4152 triage knobs. The triage model's preferred key is
   // `models.dream.triage` (models.* prefix, registered via the models.dream.*
@@ -1504,6 +1516,8 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // inside maxTokens, so the hardcoded defaults truncated every dense page.
   'dream.propose_takes.max_tokens',
   'dream.propose_takes.retry_max_tokens',
+  // #5958: per-call extractor timeout (whole ms 1000..300000; unset scales with the output cap); cycle/phase-config-values.ts.
+  'dream.propose_takes.call_timeout_ms',
   'dream.patterns.lookback_days',
   'dream.patterns.min_evidence',
   // #2782-family: patterns-phase subagent timeouts (mirror of the
@@ -1520,6 +1534,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // #4348: IANA timezone that owns the dream-cycle calendar day (summary
   // bucketing). Unset → host timezone → UTC. Validated at set time.
   'cycle.timezone',
+  'cycle.consolidate.cluster_threshold', // #5363: (0, 1], default 0.85; read + validated in cycle/phases/consolidate.ts
   // A11: IANA timezone for offset-less frontmatter datetimes in effective_date.
   // Unset → UTC (date-only values are always UTC calendar dates). Validated at set time.
   'brain.timezone',
@@ -1585,12 +1600,27 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // reconcile-links, and sweep. The documented off-switch is `gbrain config
   // set auto_link false` — same unregistered-key class as auto_chronicle.
   'auto_link',
-  // Entity mention index (core/mentions/policy.ts): off switch, +type/-type linkable types, names never linked.
-  'mentions.auto_link', 'mentions.entity_types', 'mentions.ignore',
+  // Entity mention index (core/mentions/policy.ts): off switch, +type/-type linkable types, names never linked, pages never linked (#5829).
+  'mentions.auto_link', 'mentions.entity_types', 'mentions.ignore', 'mentions.exclude_slugs',
   // #4987: the write-path timeline extractor's off switch (read by
   // isAutoTimelineEnabled); registered so `gbrain config set auto_timeline off`
   // works without --force, as the compiled-truth guide documents.
   'auto_timeline',
+  // Wanted pages: record unresolved authored links and wake their origins
+  // when the target appears (src/core/wanted-links.ts). On by default; the
+  // off switch is `gbrain config set wanted_pages.enabled false`.
+  'wanted_pages.enabled',
+  // Remote writes (the persistence `links` effect) record missing mention targets too. On by default (held-out verdict H8).
+  'wanted_pages.remote',
+  // Line grammar (src/core/line-grammar.ts): typed relation lines, off by default
+  // (held-out verdict H3); undeclared relation types fall back to inference unless allowed.
+  'line_grammar.enabled',
+  'line_grammar.allow_undeclared_types',
+  // Validity ranges on typed relation lines stored as dated edge transitions
+  // (core/link-effective.ts). On by default (held-out verdict H7); applies while line_grammar.enabled is on.
+  'line_grammar.effective_ranges',
+  // put_page "did you mean an existing page?" advisory on creates (core/similar-pages.ts). Off by default (held-out verdict H5b).
+  'put_page.similar_pages',
   // #5584: skillopt optimizer output cap (default 32000 thinking / 4096 otherwise).
   'skillopt.reflect_max_tokens',
   // #5585: skillopt strict model provenance (true|1|yes|on; other values count as on).
@@ -1640,6 +1670,9 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'sync.hold_escalate_count',
   'sync.hold_escalate_pct',
   'sync.parser_regression',
+  'fences.normalize', // #6188: inline Tier 1 fence normalization (fence-repair/config.ts); default on
+  'fences.repair.max_usd_per_page', // #6188: Tier 3 fence repair caps (fence-repair/config.ts); 0 = no model spend
+  'fences.repair.max_usd_per_day',
   // #2179: clamp window for DCR-requested per-client token TTLs. Read by
   // `gbrain serve --http` at startup; unset min defaults to 300s, unset max
   // defaults fail-closed to max(--token-ttl, min).
@@ -1683,7 +1716,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
  * Levenshtein suggestion in `gbrain config set`.
  */
 export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
-  'search.',           // search.* (mode, cache.*, etc.)
+  'search.',           // search.* (mode, cache.*, etc.); config set refuses unregistered leaves (commands/config/enumerated-keys.ts)
   'graph.',            // graph.edge_validity (temporal typed-edge read policy, src/core/link-validity.ts)
   'models.',           // models.* (tier, aliases, per-task)
   'dream.',            // dream.synthesize.*, dream.patterns.*
@@ -1691,7 +1724,7 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
   'embedding_columns.', // per-column overrides
   'provider_base_urls.', // per-provider base URL overrides
   'provider_chat_options.', // per-provider / per-model chat providerOptions
-  'content_sanity.',    // v0.41 content-sanity tunables
+  'content_sanity.',    // v0.41 content-sanity tunables; enumerated like search.
   'mcp.',               // mcp.publish_skills, mcp.skills_dir (PR1 skill catalog)
   'autopilot.',         // autopilot.nightly_quality_probe.*, autopilot.auto_drain.* (#1685)
   'chronicle.',         // Life Chronicle knobs; config set refuses leaves outside CHRONICLE_CONFIG_KEYS (#5876)

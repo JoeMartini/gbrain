@@ -30,7 +30,7 @@ import { replaceDerivedFactsForPage } from '../src/core/persistence/derived-fact
 import type { Principal } from '../src/core/persistence/model.ts';
 import { renderFactsTable } from '../src/core/facts-fence.ts';
 import { renderTakesFence } from '../src/core/takes-fence.ts';
-import { configureGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
+import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../src/core/ai/gateway.ts';
 import { LEGACY_EMBEDDING_CONFIG } from './helpers/legacy-embedding-config.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
@@ -60,6 +60,7 @@ beforeAll(async () => {
   }
 }, 120_000);
 afterAll(async () => {
+  resetGateway(); // R5: restore the preload baseline for later files in this shard
   for (const engine of engines) { await disposePersistenceConsumer(engine); await engine.disconnect(); }
   await closePostgres?.();
   rmSync(home, { recursive: true, force: true });
@@ -71,8 +72,11 @@ interface Brain {
   principals: { oauth: Principal; token: Principal; local: Principal };
 }
 /** A managed brain with a database-only source and three principals that can write it. */
-async function managedBrain(engine: BrainEngine): Promise<Brain> {
+/** `embedding`: the supersession case needs fact vectors, so its brain must not opt out of embedding (no embedder call otherwise). */
+async function managedBrain(engine: BrainEngine, opts: { embedding?: boolean } = {}): Promise<Brain> {
   const sourceId = `attr-${randomUUID().slice(0, 8)}`;
+  // Each brain's consumer starts under this brain's config, not an earlier test's (the consumer keeps its first config).
+  await disposePersistenceConsumer(engine);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
   await engine.executeRaw('INSERT INTO sources(id,name) VALUES($1,$1)', [sourceId]);
   await registerLocalWriter(engine, 'cli'); await registerLocalWriter(engine, 'stdio');
@@ -86,7 +90,7 @@ async function managedBrain(engine: BrainEngine): Promise<Brain> {
     token: { kind: 'legacy_token', id: minted.id } as Principal,
     local: { kind: 'local_cli', id: (await readLocalWriter(engine, 'cli')).id } as Principal,
   };
-  const base = { engine, config: { engine: engine.kind, embedding_disabled: true }, sourceId, dryRun: false, logger: quiet };
+  const base = { engine, config: { engine: engine.kind, embedding_disabled: !opts.embedding }, sourceId, dryRun: false, logger: quiet };
   const [{ now }] = await engine.executeRaw<{ now: string }>('SELECT now()::text AS now');
   return {
     engine, sourceId, startedAt: now, principals,
@@ -191,7 +195,7 @@ describe('write attribution on a managed brain', () => {
   test('remember from two principals, duplicate remember and supersession keep created_by and move last_mutated_by', async () => {
     await withFixedEmbeddings(async () => {
       for (const engine of engines) {
-        const brain = await managedBrain(engine);
+        const brain = await managedBrain(engine, { embedding: true });
         await run(brain.local, 'put_page', { slug: 'people/alice-example', content: page('Alice', 'Profile') });
         await run(brain.local, 'put_page', { slug: 'people/charlie-example', content: page('Charlie', 'Profile') });
         const byOauth = await submitRememberMutation(brain.oauth, { fact: 'Prefers written updates', provenance: 'test', entity: 'people/alice-example', request_id: randomUUID() }, 30_000);

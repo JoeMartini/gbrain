@@ -18,7 +18,7 @@ import { WINDOW_CANCEL_MESSAGE } from '../src/core/persistence/sync-window.ts';
 import { acquireShared, leaseDraining, leaseWounded, yieldLease } from '../src/core/persistence/worktree-lease.ts';
 import type { NativeLockHandle } from '../src/core/persistence/native-lock.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { awaitLaneTurn, closeLaneRun, laneOf, laneRoots, laneTask, openLanes } from '../src/core/persistence/sync-lanes.ts';
+import { awaitLaneTurn, closeLaneRun, laneClaim, laneOf, laneRoots, laneTask, openLanes } from '../src/core/persistence/sync-lanes.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-lanes-'));
 let engine: BrainEngine | undefined;
@@ -81,6 +81,43 @@ test('a lease is shared by lanes; an exclusive writer drains and wounds it and g
   expect(leaseDraining(path)).toBe(false);
 });
 
+test('lanes that start together share one native lock instead of all but one reporting busy', async () => {
+  let held = false, locks = 0;
+  const native = async (): Promise<NativeLockHandle | null> => {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    if (held) return null;
+    held = true; locks++;
+    let done = false;
+    return { get released() { return done; }, async release() { held = false; done = true; } };
+  };
+  const path = join(home, 'lease-start-race');
+  const lanes = await Promise.all([acquireShared(path, native), acquireShared(path, native), acquireShared(path, native)]);
+  expect(lanes.every(Boolean)).toBe(true);
+  expect(locks).toBe(1);
+  for (const lane of lanes) await lane!.release();
+  expect(held).toBe(false);
+});
+
+test('a lane that joins while the last holder is still releasing the native lock waits for it instead of reporting busy', async () => {
+  let held = false, locks = 0;
+  const native = async (): Promise<NativeLockHandle | null> => {
+    if (held) return null;
+    held = true; locks++;
+    let done = false;
+    return { get released() { return done; }, async release() { await new Promise(resolve => setTimeout(resolve, 50)); held = false; done = true; } };
+  };
+  const path = join(home, 'lease-release-gap');
+  const first = (await acquireShared(path, native))!;
+  const releasing = first.release();
+  const next = await acquireShared(path, native);
+  await releasing;
+  expect(next).not.toBeNull();
+  expect(locks).toBe(2);
+  expect(held).toBe(true);
+  await next!.release();
+  expect(held).toBe(false);
+});
+
 test('a lane waits for its predecessor to commit, yields to a requeued or unadmitted one and stops after a failed one', async () => {
   openLanes('wt-turn', 'run-turn', 4, null);
   const state = laneOf({ worktree_id: 'wt-turn', intent: { lane: 'run-turn' } } as never)!;
@@ -108,6 +145,23 @@ test('closing a lane run stops new lane claims and waits for the lane tasks stil
   await closing;
   expect(state.tasks).toBe(0);
   expect(laneOf({ worktree_id: 'wt-close', intent: { lane: 'run-close' } } as never)).toBeNull();
+});
+
+test('closing a lane run waits for a claim still in flight to count its lane task', async () => {
+  openLanes('wt-claim', 'run-claim', 4, null);
+  const state = laneOf({ worktree_id: 'wt-claim', intent: { lane: 'run-claim' } } as never)!;
+  const claimed = laneClaim();
+  let closed = false;
+  const closing = closeLaneRun('run-claim').then(() => { closed = true; });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect(closed).toBe(false);
+  const release = laneTask(state);
+  claimed();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect(closed).toBe(false);
+  release();
+  await closing;
+  expect(laneOf({ worktree_id: 'wt-claim', intent: { lane: 'run-claim' } } as never)).toBeNull();
 });
 
 test('lanes publish several groups at once and every page still commits, attributed to its own request, in manifest order', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_BULK_SIZE: '4' }, async () => {
