@@ -10,6 +10,180 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.105.0] - 2026-10-07
+
+**Fix wave 11: asking for help never deletes anything, "off" means off, and your files stop getting quietly rewritten.**
+
+About 40 bug reports and 24 contributor PRs arrived in two days. Each bug was reproduced on master first. The good contributor ideas were rewritten in our own code with tests that fail before the fix and pass after; no contributor lines were merged. The worst ones: `--help` on some commands ran the real action (`pages purge-deleted help` hard-purged pages, `search modes --reset --help` deleted settings), chat capture kept going with writeback switched off, `harness --remove` left its hooks behind, `frontmatter --fix` rewrote valid YAML, a page save without its Timeline silently deleted every dated row, and moving a brain hashed `.env` files.
+
+### How to use it
+
+```bash
+gbrain pages purge-deleted --dry-run --json      # what a purge would remove; the real purge now asks first (--yes)
+gbrain bootstrap harness --remove --dry-run      # preview which hooks removal deletes, including ones Claude Code stripped
+gbrain repair timeline-comments --source <id>    # preview: timeline rows filed from HTML comments, then --apply
+gbrain transcripts audit-secrets --json          # transcript pages imported before label redaction, by slug and count
+gbrain chronicle-backfill --max-usd 5            # a hard spend bound, retries included
+gbrain config set cycle.lint_exclude attachments,drafts.md
+```
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| `--help` anywhere | Prints usage and exits 0 without running anything, connecting, checking for updates or nagging about backups. |
+| Destructive subcommands | `pages purge-deleted`, `cache clear\|prune`, `schema use\|downgrade\|init\|remove-*`, `integrity auto\|reset-progress` and `search modes --reset` refuse an argument they would ignore (exit 2, `invalid_params`) and name a read-only command instead. `pages purge-deleted --source <id>` used to purge every source. |
+| `gbrain pages purge-deleted` | Asks before a hard purge; without a terminal it exits 3 with an ask_user payload naming the `--yes` command. The autopilot purge is unchanged. |
+| `gbrain apply-migrations` | Exits 1 (`migrations_pending`) whenever it leaves the schema behind, with a reason: rerun with `--yes` (`not_applied`) or run `gbrain doctor --json` (`still_behind`, `schema_unreadable`). |
+| `memory.auto_writeback off` | An explicit `off` stops every capture lane, including the compaction harvest and SessionEnd transcripts, and text banked while off is never extracted later. Unset keeps today's behavior. |
+| `bootstrap harness` | Recognizes its own hooks by the exact command it wrote, even after Claude Code strips the `_gbrain` marker; a re-run converges to one hook per event; `--remove` never claims "fully removed" while a lookalike survives (`harness_hook_unowned`); doctor warns `harness_hook_duplicates`. |
+| Remote `put_page` / `put_pages` | Content with no Timeline section is refused (`timeline_rows_would_be_removed`) when it would delete dated rows; keep the section or pass `drop_timeline: true`. Every delete reports `timeline_rows_removed` (count and dates). |
+| Frontmatter | Validation, `--fix`, lint and `repair frontmatter` parse the whole block first, so valid folded YAML is never flagged or re-quoted. |
+| Writer manifests | Only Git-tracked files are compared, so ignored files such as `.env.local` are never opened or hashed; upgrading drops the path-to-hash maps older releases stored. |
+| Managed sync | A bulk group whose head was already admitted no longer wedges on `idempotency_conflict`; a Git edit racing a database-only write is held as `concurrent_write` with `gbrain sources reconcile --preview` as the fix. |
+| Doctor | New `persistence_write_stall`, `transcript_secret_exposure` and retrieval-feedback checks; `harness_wiring` counts an enabled plugin lane; `pack_upgrade_available` is honest on managed brains. |
+| `waiting --json` / `open_loops` | Loops with no counterparty move to `no_counterparty`; each group lists at most 5 loops with `loops_omitted`. |
+
+### Things to watch
+
+- **Scripts:** the exit-code changes above (strict arguments, purge consent, apply-migrations, `schema active --json`) and the `waiting --json` shape are the breaking ones. Each refusal names its replacement command.
+- **The MCP instructions are reordered** so Claude Code, which reads only the first 2,048 characters, gets the writeback contract and the error protocol. A Cat 40 smoke on the newest Opus, GPT, Sonnet and Fable models compared it with the previous order before release.
+- **Filtered vector search** now uses pgvector's relaxed order: on real 1024- and 1536-dimension embeddings, recall at a 50% filter rose about 2 points with no latency change. `gbrain config set search.hnsw_iterative_scan strict_order` restores the old mode.
+- **CJK keyword search** falls back to any-term matching and has a time budget (`search.cjk_keyword_deadline_ms`, default 3000); multi-term questions that returned nothing now return partial matches in about 2.7 s on a 400k-chunk brain.
+- **Dream patterns** sizes in-cycle runs from the last run's recorded cost and skips before spending when the budget can't fit a useful run. The sizing model is not yet measured on a paid run.
+- **Not fixed here:** a hard ceiling for a stuck publication (detection ships; the ceiling is next), the free relabel for legacy embedding settings (#6113), and #6131 (not reproduced on macOS 26). See TODOS.md.
+
+### Itemized changes
+
+- CLI help and arguments (#6114): help is decided once in `cli.ts` before startup side effects; every subcommand router exports `SUBCOMMANDS` and prints usage before dispatch; `src/cli/strict-args.ts` is the per-subcommand argument table; a serial gate runs `--help`/`-h` on every command and subcommand offline and checks the database and home tree are unchanged.
+- `apply-migrations` exit matrix (#6089) with `connectAtSchemaVersion`; `migration_lease_lost` when a lease row still names this runner (#6028, diagnostic); `edge-proposals --json` handles Postgres BigInt ids (#6193); `schema active --source` resolves the source's own pack (#6090); `schema add-type --no-prefix` (#6135).
+- Linear-time qualifier, citation and link parsing on the page-write path (#6186); `regen-all` passes `--timeout` to every `bun test` (#6187).
+- Writeback consent (#6091): capture-time retirement per brain, a re-check at managed fact admission, and an inventory test of every capture lane. Hook ownership by anchored command shape (#6092, #6171); plugin-lane wiring (#6082); `skillpack reference --harness` without a slug (#5912); enrich Person template matches the schema doc (#6162); MCP instruction order for 2,048-character harnesses (#6170).
+- Bundled skills (#6197, #6198): headless commands are runnable and ask before paid work; the operator protocol ships as a drift-checked copy under the skills tree; links that leave the skills root become absolute URLs honoring `LLMS_REPO_BASE`; the skill lint checks inline code and relative links. Managed worktrees stop running a refused `sources push` (#6083); `skills/migrations/v0.40.3.0.md` drops a flag that never existed.
+- Persistence: `claim_phase` on running requests and doctor `persistence_write_stall` (#6176); pre-activation claims are listed and released by `writer deactivate` (#6122); Git-tracked writer manifests through a hardened git runner, `writer_manifest_rescope_required`, and a migration purging old manifests (#6099); code-import read-back inside the transaction (#6011); `git_dirty` reconcile previews (#6138).
+- Repair and writes: repair applies use the CLI write wait (#6185); reconcile identifies private fact rows by row number and claim (#6137); Timeline omission refusal and removal reporting (#5969); `repair failed-writes` replays subagent and restricted-namespace writes under the stored authority while the live fence stays fail-closed (#5994); comment-safe citation parsing, write-back guard and `repair timeline-comments` (#6184); `files upload-raw` refuses before creating anything on a managed root (#5963); owner exceptions keep their class, errno and source frame, and `write-request` names an owner/CLI build mismatch (#5929).
+- Content and dream: frontmatter whole-block parse (#6157); sweep facts dated by the session file's write time (#6159); `waiting` buckets (#5871); `cycle.lint_exclude` (#6134); inline-code-aware lint (#6133); no `works_at`/`founded` toward person, meeting or calendar pages (#6191); lowercase multi-word names volunteer (#6195); one-shot synthesis namespaces (#6160); concept merges survive republish (#6161); dream patterns budget sizing (#6177); `chronicle-backfill --max-usd` with a stamped queue-time bound and `no_pricing` under a user cap (#6199); a clearer `junk_entity_hubs` message (#6158).
+- Search and providers: visible `rate_answer` line and a doctor warning (#6192); CJK any-term fallback and deadline (#6043, #5989); relaxed-order iterative scans (#6132); gateway-only Voyage output width (#6061); a private `native/locks/package.json` for OpenClaw load time (#6026); transcript `labeled_credential` redaction and `transcripts audit-secrets` (#6147).
+- PGLite stale link drains refresh planner statistics before and during large drains: at 10,000 pages the drain goes from 30 to 3.6 ms/page, or from 80 to 29 ms/page on managed brains. Postgres is unchanged. (GBRA-49)
+- A core-memory lock test retries the topology step on the retryable `writer_pool_capacity` instead of failing at random. (GBRA-54)
+
+### Contributors
+
+Contributed by @andreineacsu (#6140, #6155, #6152, #6182, #6166, #6148, #6200, #6145, #6141, #6180, #6174), @MarvinDontPanic (#6186, #6187, #6147, #6132), @javieraldape (#6172, #6151), @Masashi-Ono0611 (#6175, #6181, #6179, #5371). Each idea was re-implemented and widened; their PRs are superseded.
+
+## [0.60.104.0] - 2026-10-07
+
+**Ontology observations stay in the ontology: the maintenance sweep no longer moves them onto a page's Facts table and loses them.**
+
+Since v0.60.53.0 the facts step of the maintenance run (the sweep `gbrain serve` runs after about 3 seconds of quiet, and the dream cycle) moved every fact without a table row onto its entity page's `## Facts` table. That included ontology observations from `ontology_propose`, such as "Alder's location is Example City from 2026". Each one took the page as its source, and the next ordinary rewrite of the page, which didn't list it, plus one more sweep, retired it: `ontology_get` returned nothing for a write gbrain had acknowledged. The same step republished the page, so a client that had just read the page and was writing it back got `revision_conflict`, and the page kept serving its previous Facts value. Observations are now never moved, and they no longer hold up the reconcile of their page. Found by gbrain-evals N1-ci under CPU load (ledger N1-7, #6264).
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| Maintenance sweep, dream cycle | The `extract_facts` step leaves rows with a `dimension` (ontology observations) alone and doesn't count them as rows waiting for a table. It doesn't rewrite a page for them. |
+| `gbrain doctor` | New `ontology_facts_fenced` check: how many observations an earlier release moved (still on a page table, or already retired by a page write), and the repair that brings them back. |
+| `gbrain repair ontology-facts` | Explicit-only and preview-bound. The preview lists every moved observation (`fenced`, `retired`, or excluded as `withdrawn`, `consolidated` or `duplicate`); `--apply --expect <hash>` gives each one its own source back, takes it off the table and makes a retired one active again. Database only: page text isn't rewritten, so a line the old step added to a page's Facts table stays there as an ordinary page fact. |
+
+### For contributors
+
+- `planUnfencedFacts` (`src/core/facts/unfenced-facts.ts`) and the empty-fence guard in `src/core/cycle/extract-facts.ts` select `dimension IS NULL` rows only. The fence step stays source-wide: the rows it fences are the inline writer's database-only facts, which mostly land on pages the run's slug list doesn't name.
+- `src/core/repair/ontology-facts.ts` finds ontology rows with a fence row number or a `source_markdown_slug` other than their `source` (ontology writes produce neither) and restores them through `ontology_propose`'s coordinated database-only write on managed brains.
+- `test/ontology-fence-sweep.test.ts` (PGLite, Postgres through `test/e2e/ontology-fence-sweep-postgres.test.ts`) runs the N1-7 repro (observation, sweep, page rewrite, sweep) on managed and unmanaged brains, a page write bound to a revision read before the sweep (it failed with `revision_conflict` before the fix), the reconcile guard, and the repair from damage made by the old fence step.
+
+## To take advantage of v0.60.104.0
+
+`gbrain upgrade` stops new losses. If you used `ontology_propose` on v0.60.53.0 or later, check what was moved and restore it:
+
+```bash
+gbrain doctor --only ontology_facts_fenced
+gbrain repair ontology-facts                 # preview: read-only, prints the apply command
+gbrain repair ontology-facts --apply --expect <hash>
+```
+
+## [0.60.103.0] - 2026-10-07
+
+**A legacy access token's first burst of reads converts it to the unified grant columns reliably, and the last nightly Test reds are fixed at their cause.**
+
+On Postgres, a legacy access token still on the old permissions shape is converted to the grant columns by its first read. Every read also fires a debounced `last_used_at` write, and that write held the token's row lock while the conversion skipped locked rows, so a burst of concurrent first reads could leave the token unconverted (it still authorized correctly from the same grant computed in memory, and a later read converted it). The `last_used_at` write now leaves an unconverted row to the conversion, which records first use itself.
+
+| After upgrading | Before | After |
+| --- | --- | --- |
+| Several concurrent first reads of a legacy-shape token | could leave it unconverted until a later read | the first read converts it once and records `last_used_at` |
+
+For contributors and agents working on gbrain:
+
+- `test/e2e/access-token-grants.test.ts` gains a forced probe for #6230: a `last_used_at` touch held in an open transaction while the first read converts. It fails on the previous release (`grant_revision` 0, the flake's signature) and passes now.
+- `test/list-pages-truncation.test.ts` counted the one-time `behavior_changes` disclosure as an extra content block whenever its shard restored the aged PGLite snapshot first (nightly Test run 37588995327). The test now uses a fresh brain in its own `GBRAIN_HOME`, so it counts only the listing notice.
+
+## To take advantage of v0.60.103.0
+
+`gbrain upgrade` installs the binary. There are no schema migrations.
+
+## [0.60.102.0] - 2026-10-07
+
+**Broken facts and takes tables in your notes now get repaired by themselves.**
+
+The last three releases stopped a broken table from blocking a sync, fixed the ones with only one possible meaning, and made `gbrain doctor` count the rest. This release repairs the rest. The background maintenance run now works through every broken table it finds, each with the cheapest method that is exactly right: fixed rules first, then holder names checked against your own people and company pages, and only for a table whose columns are scrambled, a chat model. The model sees only that table's header and the rows it has to move, never the rest of the page; it may move cells but never change what they say, and it says HOLD instead of guessing when a row could be read two ways. By default gbrain uses a model it measured as accurate enough on this job, and only if you have that provider's key; otherwise the model step stays off until you pick one. Model spend has a hard cap of $0.30 per page and $1.00 per day. Every repair is committed with a message naming the file, so `git revert` undoes it.
+
+### How to use it
+
+```bash
+gbrain doctor --only fence_integrity          # how many broken tables per source, and what would fix each
+gbrain repair fences --source <id>            # preview: read-only, no model call, prints the apply command
+gbrain repair fences --source <id> --apply --expect <hash>   # apply exactly what the preview showed
+gbrain config set fences.repair.enabled false # pause the automatic repair
+gbrain config set fences.repair.llm false     # keep table rows away from the model; the free fixes keep running
+```
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| Maintenance run | A new `fence_repair` step runs right after sync, on the computer that owns the source. Its first run after upgrading repairs every broken table it finds in each source. |
+| `gbrain repair fences` | The preview shows one sample diff per fix method (`--diff` shows all), what the model would cost against what is left of today's cap, and an apply command bound to exactly that plan. Applying skips anything that changed since the preview. `--only`/`--skip` pick files, `--slug` picks stored pages, `--no-llm` stays free, `--max-usd` lowers the cap for one run. The result says what was repaired and what is left, and why. |
+| Managed sources | Each repaired file is committed as `gbrain: repair fence in <path> (<classes>)`. |
+| Other sources | The original file is backed up under `~/.gbrain/backups/fences/` before the write, and `gbrain sources status` plus doctor show the repair until you commit it. |
+| Held files | Every `invalid_fence` hold and the doctor `fence_integrity` fix point at the `gbrain repair fences` preview (`--only <path>` for one file). A table only a person can decide still names the exact edit. |
+| Model choice | `models.fence_repair` picks the model, and a model you set always runs. Unset, gbrain uses `openai:gpt-6.1-sol` when it has an OpenAI key, else `anthropic:claude-opus-5-5` when it has an Anthropic key, else no model (those tables wait as `no_measured_model`). `gbrain models` shows which. |
+| Stray cells | A row with an extra empty cell is lined up by a free rule when exactly one cell can go. A row whose extra cells hold text, or a facts kind cell that holds a sentence, is held for a person: usually an unescaped `\|` cut the claim in two, and no check can tell that from a misplaced cell. |
+
+### Things to watch
+
+- Measured on 40 held-out synthetic broken tables over three runs, the default models (`openai:gpt-6.1-sol`, `anthropic:claude-opus-5-5`) each repaired 95 of 99 attempts with no cell in the wrong column and answered HOLD on the other 4. The checks cannot tell which of two free-text columns a moved cell belongs in, so only models measured this way are defaults.
+- Each model call reserves its worst case, including room for a reasoning model to think, so the per-page cap is $0.30; measured spend was about $0.003 (`openai:gpt-6.1-sol`) and $0.008 (`anthropic:claude-opus-5-5`) per repaired table.
+- A model gbrain has no price for still runs under the default caps, metered at the highest chat rate gbrain knows; under a cap you set, it waits until you register its price with `gbrain pricing set`.
+- When the daily cap runs out, repair stops and the remaining tables wait until 00:00 UTC; the run says when and how many.
+- Turning the settings off stops future repairs and does not undo past ones. A broken table you restore is held again on the next sync and repaired again by the next maintenance run, so pause first if you want to keep it.
+
+### Itemized changes
+
+- `src/core/repair/fences.ts`: the `fences` repair kind (preview-bound, `spends: 'llm'`). Candidates come from the fence census after a bounded scan (`GBRAIN_FENCE_REPAIR_SCAN_MS`, default 10 s); `--only`, `--skip` and `--slug` also reach files and pages the census has not judged yet. A candidate whose source is owned by another host (`owner_unavailable`) or mid-sync (`sync_in_progress`) is skipped, and every candidate is re-read before any fix runs.
+- Holder names (`src/core/fence-repair/repair-tiers.ts`) resolve strictly, without same-name guessing, only to `people/` and `companies/` pages, and never to a private page from a world-visible one. A model repair claims the attempt memo, checks the per-page cap and the run's allowance, reserves on the daily ledger before each call and settles the real tokens after; a rewrite the checks rejected, or a HOLD (`llm_declined`), is never paid for again for unchanged bytes. The call (`src/core/fence-repair/llm.ts`, prompt version 2) uses no tools, no fallback model and no temperature; its output ceiling adds 2,048 tokens for a model whose reasoning the call cannot turn off, and the estimate uses the ceiling the gateway sends. It gets one corrective re-ask only when the answer does not parse or changes the row count; any other gate rejection is final. A headerless table of 14-cell rows is sent with the wide header.
+- The model default (`src/core/fence-repair/model.ts`, `measured.ts`): `models.fence_repair` when set; else the first of the measured models (`openai:gpt-6.1-sol`, `anthropic:claude-opus-5-5`, `anthropic:claude-fable-5-1`; the models that met the eval's bar on its round 1 fixtures and its held-out set) whose provider key the brain has; else none (`no_measured_model`, a paid hold whose fix sets `models.fence_repair`). `openai:gpt-6.1-sol` joins the price table at $2/$10 per million tokens and stays out of OpenAI tier-default discovery. `fences.repair.max_usd_per_page` defaults to $0.30 (was $0.05), the largest worst-case page estimate of the measured models on the eval's fixtures being $0.27.
+- Tier 1 `stray_empty_cell` (`src/core/fence-repair/stray-cells.ts`) removes empty cells from a row with too many only when exactly one removal makes every checked column valid. `extra_cells` is now manual, and a facts `kind_map` reads only a kind word (at most three words, no sentence punctuation, link or strikethrough); anything else is `claim_split`, manual. A fence with no header gets the same checks for every row that starts with a row number, read by position, so a cut claim there is held instead of sent to the model. `FENCE_RULES_VERSION` is 2, so older holds are screened again.
+- Every rewrite passes the same validation gates as the inline repair, plus a fixed-point check, before it is written. A misaligned cell whose text is unchanged is now moved to the column it belongs to rather than rejected.
+- Write-back (`src/core/fence-repair/repair-io.ts`): managed sources go through `managed_file_repair` with a location-only `fence_repair` receipt checked at submission and again when prepared (remote callers are refused); other checkouts are confined, re-hashed (`changed_since_read`), backed up, written and imported, with the backup restored if the import refuses; database-only pages and mirrors get a revision-bound write.
+- Repair kinds can carry a per-item model cost (the preview estimate follows `--limit`, and an apply stops before an item it cannot afford), a deadline and an early stop. `--expect` works for every preview-bound kind; `--max-usd` only for kinds that call a paid model, and only lowers the cap.
+- The `fence_repair` cycle phase (`src/core/cycle/fence-repair.ts`) runs after `sync` within min(300 s, a third of the job's remaining time), honors both switches and reports what it verified.
+- Holds carry the fence location and the last repair state; `docs/guides/fence-format.md` is generated from the parser's own tables, and `docs/guides/repair.md#fences` walks through a real run.
+
+### For contributors
+
+- `test/repair-fences.test.ts` (PGLite, and Postgres through `test/postgres-unit-arms.txt`) covers preview then the printed apply across all three fix methods, rejected rewrites never paid twice, transient errors, `--no-llm`, unpriced models under default and user caps, the budget stop, every skip reason, mirrors, remote refusal, backups and the uncommitted notice, doctor remediation budgets, the time budget, two concurrent appliers at the cap and the cycle phase across ticks, with a privacy sentinel throughout. `test/fence-repair-llm.test.ts` pins the prompt bytes and covers HOLD, the structural-only re-ask, the wide headerless layout and the reasoning allowance; `test/fence-repair-normalize.test.ts` covers stray empty cells and split claims; `test/fence-walkthrough.test.ts` checks the guide's walkthrough line by line against a local provider stand-in. `evals/fence-repair-tier3/` is the Tier 3 measurement instrument (78 hand-written fixtures, a production-path runner, a $0 oracle and the scorer); `test/eval-fence-repair-tier3.test.ts` guards it without a key.
+
+## [0.60.101.0] - 2026-10-07
+
+**The nightly CI runs green again: E2E shard weights are re-mined from a full green E2E run on master.**
+
+No user-facing behavior changes. For contributors and agents working on gbrain:
+
+- **`scripts/e2e-weights.json`** is re-mined from full-corpus E2E run 37553155517 on master 9cc7c4677 (all 459 measured files). 59 of 462 E2E files had no weight (12.8%, over the 10% bound), mostly the files the long-pole splits created, so the scheduled `check:weight-coverage` failed every Test and macOS nightly. It passes under `GITHUB_EVENT_NAME=schedule`.
+
+## To take advantage of v0.60.101.0
+
+Nothing to do: this release changes CI data only.
+
 ## [0.60.100.0] - 2026-10-07
 
 **`gbrain doctor` now counts every broken facts or takes table still waiting in your brain, and says what would fix each one.**

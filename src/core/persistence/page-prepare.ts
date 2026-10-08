@@ -31,12 +31,13 @@ import type { SqlEngine, WriteRequest } from './model.ts';
 import { isUnboundSourcePage } from './unbound-source.ts';
 import { sealPageTextProjection } from '../page-state/projections.ts';
 import { overlayCanonicalBodies } from '../page-state/snapshot.ts';
-import { materializeTimeline, prepareCanonicalProjections } from './canonical-projections.ts';
+import { materializeTimeline, prepareCanonicalProjections, type TimelineRowsRemoved } from './canonical-projections.ts';
+import { assertTimelineNotOmitted, timelineWritePolicy } from './timeline-omission.ts';
 import { preserveProtectedTakes } from './protected-takes.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
-import { preparePageAdvisories, remoteLinkHint, pageNoopAdvisories } from './page-advisories.ts';
+import { preparePageAdvisories, remoteLinkHint, pageNoopAdvisories, timelineRowsRemovedAdvisory } from './page-advisories.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget, nativeFileTarget } from './native-file-target.ts';
 import { isSourceDbOnlySlug } from './source-storage.ts';
@@ -48,6 +49,8 @@ import { applyPageEdits, editDiff, parsePageEdits } from './page-edit.ts';
 import { carryCoreMarking, prepareCoreGuard } from './core-guard.ts';
 import { fenceWhere } from '../fence-repair/refusal.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
+import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
+import { fenceRepairCommit } from './effect-model.ts';
 
 const PURGE_RESIDUALS = 'Brain-repo git history, synced working-tree copies, exports, compiled context files and slug-keyed derived rows (takes, open loops, file records) may still hold the content — rotate the credential and rewrite or regenerate those copies.';
 
@@ -286,6 +289,9 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
         recoverable_until: 'now + 72h via restore_page (remove immediately instead: gbrain delete <slug> --purge, local CLI only)' };
     } };
   }
+  // #6188: a trusted local fence repair's receipt (admission refuses it from every other caller) rides the outcome and the file's commit.
+  const fenceRepair = row.operation === 'put_page' && !row.authority.remote ? parseFenceRepairReceipt(p.fence_repair) : null;
+  const fenceRepairOutcome = fenceRepair ? { fence_repair: fenceRepair } : {};
   // #5616: edits apply to the caller's view of the locked snapshot (revision checked above).
   const edited = row.operation === 'edit_page' ? editLockedPage(row, snapshot) : undefined;
   let content = edited?.content ?? preparedIntent?.content ?? p.content as string;
@@ -334,11 +340,15 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
   const projected = !(row.operation === 'remember' || row.operation.startsWith('takes_') || (row.operation === 'extract_facts' && p.kind === 'managed_facts_entity'));
   const writer = (row.operation === 'put_page' || row.operation === 'edit_page') && p.kind !== 'managed_maintenance_page'
     && (preparedIntent !== undefined || typeof p.expected_revision === 'string') ? 'editing' : 'preserving';
+  // #5969 (D3): only an ordinary put_page intent carries a timeline section; every other writer keeps the shared policy.
+  const timelinePolicy = row.operation === 'put_page' ? timelineWritePolicy(p, row.authority.remote, writer) : undefined;
+  if (timelinePolicy && typeof content === 'string') await assertTimelineNotOmitted(engine, { intent: p, remote: row.authority.remote, writer,
+    slug: row.slug, sourceId: row.source_id, content, prior: snapshot });
   // #5567: database-only timeline rows are written back into the page before
   // the no-op check, digest, rendering and chunking see the body.
   if (projected && snapshot && typeof content === 'string') {
     const parsed = parseMarkdown(content,row.slug);
-    const { timeline, materialized } = await materializeTimeline(engine,parsed,row.slug,snapshot,writer);
+    const { timeline, materialized } = await materializeTimeline(engine,parsed,row.slug,snapshot,writer,timelinePolicy);
     if (materialized) content = serializePageToMarkdown({...snapshot.page,...parsed,timeline,type:parsed.typeExplicit ? parsed.type : snapshot.page.type},parsed.tags);
   }
   // Detect an exact canonical no-op before ingestion can invoke any provider.
@@ -351,7 +361,7 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
       const file=await prepareFileTarget(engine,row,snapshot,targetDeleted ? null : serializePageToMarkdown(snapshot.page,snapshot.tags),undefined,{ activePack, remote: row.authority.remote });
       return {observedRevision,noop:true,file,...await pageDatabaseOnlyPublication(engine,row,file),
         apply:async()=>({...pageNoopAdvisories(row),status:'skipped',slug:row.slug,source_id:row.source_id,noop:true,chunks:0,chunk_skip_reason:'write_skipped',
-          ...(row.operation==='capture'?{channel:'capture',content_hash:p.capture_hash}:{})})};
+          ...(row.operation==='capture'?{channel:'capture',content_hash:p.capture_hash}:{}),...fenceRepairOutcome})};
     }
   }
   let prepared: PreparedContentImport | undefined;
@@ -405,7 +415,7 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
   const rendered = serializePageToMarkdown(renderedPage, tags);
   const logicalNoop = snapshot !== null && digest(canonical(snapshot.page, snapshot.tags)) === digest(canonical(ready.parsedPage, tags));
   const noop = logicalNoop && (snapshot?.page.deleted_at != null) === targetDeleted;
-  const project = projected ? await prepareCanonicalProjections(engine,ready.parsedPage,row.slug,row.source_id,snapshot,writer) : undefined;
+  const project = projected ? await prepareCanonicalProjections(engine,ready.parsedPage,row.slug,row.source_id,snapshot,writer,timelinePolicy) : undefined;
   const ordinaryPage = ['put_page','capture','restore_page','revert_version','edit_page'].includes(row.operation);
   const advisories = noop || targetDeleted ? pageNoopAdvisories(row) : !ordinaryPage ? remoteLinkHint(row) : await preparePageAdvisories(engine,row,ready.parsedPage,snapshot);
   // A managed maintenance page (e.g. the dream write-back after grounding
@@ -419,7 +429,8 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
   const shownFixes = (ready.result.fences_normalized ?? []).filter(fix => !row.authority.remote || fix.fence !== 'takes');
   const fencesNormalized = shownFixes.length ? { fences_normalized: pageFencesNormalized({ sourceId: row.source_id, slug: row.slug, fixes: shownFixes,
     writer: row.principal_kind, path: snapshot?.page.source_path ?? null, remote: row.authority.remote }) } : {};
-  const file = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile, activePack, remote: row.authority.remote });
+  const target = await prepareFileTarget(engine, row, snapshot, targetDeleted ? null : rendered, undefined, { capture, allowMissing: options.allowMissingFile, activePack, remote: row.authority.remote });
+  const file = target && fenceRepair ? { ...target, commit: fenceRepairCommit(relative(target.root, target.path).split(sep).join('/'), fenceRepair.classes) } : target;
   const mintMode = file && !snapshot?.page.source_path ? await scannerSlugRootMode(engine, row.source_id, file.root) : undefined;
   const sourcePath = file && mintMode ? scannerSourcePath(file.root, file.path, mintMode) : undefined;
   // An inferred mode is pinned with the first origin it mints, so later pages cannot flip the inference (#5610).
@@ -430,6 +441,7 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     ...(core ? { exclusiveSources: core.exclusiveSources } : {}),
     validate: async tx => { await ready.validate(tx); await core?.validate(tx); }, apply: async tx => {
     let autoLinks: Awaited<ReturnType<NonNullable<typeof links>['apply']>> | undefined;
+    let removedTimeline: TimelineRowsRemoved | null = null;
     if (!noop) {
       const applied = await ready.apply(tx);
       // Mandatory metadata shares publication rollback; exact no-ops never heal it.
@@ -450,7 +462,7 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
         for (const tag of versionTags) await tx.addTag(row.slug, tag, source);
       }
       // #6007: the page the import just wrote live is the page the projections describe; no re-read.
-      await project?.(tx, row.operation === 'restore_page' ? undefined : applied?.pageId);
+      removedTimeline = (await project?.(tx, row.operation === 'restore_page' ? undefined : applied?.pageId))?.timelineRowsRemoved ?? null;
       autoLinks = await links?.apply(tx);
       if (targetDeleted) await tx.softDeletePage(row.slug, source);
       // Index installation and terminal receipt share this transaction. The import sealed the projection
@@ -460,12 +472,13 @@ export async function preparePageMutation(engine: BrainEngine, row: WriteRequest
     }
     const coreUsage = core?.usage();
     return { ...advisories, ...(autoLinks ? {auto_links:autoLinks} : {}), ...(coreUsage ? { core: coreUsage } : {}),
+      ...(removedTimeline ? { timeline_rows_removed: timelineRowsRemovedAdvisory(row, removedTimeline) } : {}),
       status: noop ? 'skipped' : row.operation === 'restore_page' ? 'restored' : row.operation === 'revert_version' ? 'reverted' : 'created_or_updated',
       slug: row.slug, source_id: row.source_id, chunks: ready.result.chunks, noop,
       ...(ready.result.chunks === 0 ? {chunk_skip_reason: noop ? 'write_skipped'
         : isEmbedSkipped(ready.parsedPage.frontmatter) || isQuarantined(ready.parsedPage.frontmatter) ? 'embed_skip' : 'empty_body'} : {}),
       ...(row.operation === 'capture' ? { channel: 'capture', content_hash: p.capture_hash } : {}),
-      ...(edited ? editDiff(row.slug, edited.before, edited.after) : {}), ...fencesNormalized };
+      ...(edited ? editDiff(row.slug, edited.before, edited.after) : {}), ...fencesNormalized, ...fenceRepairOutcome };
   } };
 }
 

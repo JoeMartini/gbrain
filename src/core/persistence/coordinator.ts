@@ -23,6 +23,7 @@ import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
@@ -31,7 +32,7 @@ import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePer
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { databaseRefusal, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
 import { fenceFailureDetail } from '../fence-repair/refusal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
 import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
@@ -62,8 +63,11 @@ interface PreparedMutationBase {
   postimage?: PageSnapshot | null;
   validate?(tx: BrainEngine): Promise<void>;
 }
-/** A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700. */
-export type PageMutationFile = MutationFile & { publishMode?: number };
+/**
+ * A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700.
+ * `commit` (trusted local preparers only) rides the Git effect into the commit message.
+ */
+export type PageMutationFile = MutationFile & { publishMode?: number; commit?: GitCommitNote };
 export type PreparedMutation = PreparedMutationBase & (
   | { target?: 'page'; file?: PageMutationFile; files?: never }
   | { target: 'skill_bundle'; file?: never; files: MutationFile[]; validate(tx: BrainEngine): Promise<void> }
@@ -127,7 +131,7 @@ function requestError(error: unknown): PublicationFailure {
   }
   // #5216: the row still awaits its revision backfill; the error names the resume command.
   if (code === 'revision_backfill_pending' && error instanceof Error) return { code, message: error.message };
-  return { code: 'storage_error', message: `Publication failed${code ? ` (${code})` : ''}. Inspect owner diagnostics.` };
+  return ownerExceptionFailure(error);
 }
 function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed'].includes(code); }
 export function transientDatabaseFailure(error: unknown): boolean {
