@@ -1,4 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
+import { isQuarantined } from '../quarantine.ts';
 import type { ParsedPage } from '../import-file.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { pipelined } from '../page-state/transactions.ts';
@@ -7,7 +8,7 @@ import { TAKES_FENCE_BEGIN, TAKES_FENCE_END, parseTakesFence } from '../takes-fe
 import { extractFactsFromFenceText } from '../facts/extract-from-fence.ts';
 import { takesPreparation } from '../takes-write.ts';
 import { parseTimelineEntries } from '../link-extraction.ts';
-import { extractTimelineFromContent, type ExtractedTimelineEntry } from '../timeline-extract.ts';
+import { extractTimelineFromContent, hasExtractorDetail, supersededCitationTimeline, type ExtractedTimelineEntry } from '../timeline-extract.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { sanitizeForJsonb } from '../batch-rows.ts';
 import { materializedMarker, materializedMarkerHash, timelineKey, timelineKeyHash } from '../timeline-marker.ts';
@@ -51,10 +52,13 @@ export type ProjectionWriter = 'editing' | 'preserving' | 'file' | 'immutable';
  * How one stored timeline row relates to the write, judged at preparation:
  * `in_body` exactly matches a new bullet, `drifted` matches one only after
  * normalization, `removed` / `removed_marked` had an unmarked / materialized
- * bullet in the prior body that the new body dropped, and `database_only`
- * has no bullet in either body.
+ * bullet in the prior body that the new body dropped, `superseded` is what
+ * the citation reading before #6226 filed for a citation either body still
+ * or once carried (with no detail beyond what the extractor writes) and the
+ * current reading replaces, `superseded_annotated` is such a row someone gave
+ * its own detail, and `database_only` has no bullet in either body.
  */
-export type TimelineRowState = 'in_body' | 'drifted' | 'removed' | 'removed_marked' | 'database_only';
+export type TimelineRowState = 'in_body' | 'drifted' | 'removed' | 'removed_marked' | 'superseded' | 'superseded_annotated' | 'database_only';
 export type TimelineRowAction = 'refresh_detail' | 'delete' | 'keep' | 'materialize';
 
 /**
@@ -64,6 +68,8 @@ export type TimelineRowAction = 'refresh_detail' | 'delete' | 'keep' | 'material
  *   drifted        | delete         | delete         | delete         | delete
  *   removed        | delete         | delete         | delete         | delete
  *   removed_marked | delete         | materialize    | delete         | keep
+ *   superseded     | delete         | delete         | delete         | delete
+ *   superseded_ann.| keep           | keep           | keep           | keep
  *   database_only  | materialize    | materialize    | keep           | keep
  *
  * A coordinated write deletes only rows whose bullet the writer can see in the
@@ -71,16 +77,18 @@ export type TimelineRowAction = 'refresh_detail' | 'delete' | 'keep' | 'material
  * a revision or file preimage that contained it; a preserving writer renders it
  * again. Writers that render from the database write bullet-less rows back into
  * the page (`materialize`); rows that fail the render round trip, and every
- * `materialize` row a caller did not render, are kept. `put_page` with the
+ * `materialize` row a caller did not render, are kept. A superseded row is
+ * never written back (it would re-file the older, misdated reading); one
+ * carrying its own detail stays in the database only (#6226, taste T3). `put_page` with the
  * current revision is the supported way to delete a materialized row. Deletes
  * and detail refreshes also require the row id and detail pinned at
  * preparation, so rows that change afterwards are left alone.
  */
 const TIMELINE_DECISIONS: Record<ProjectionWriter, Record<TimelineRowState, TimelineRowAction>> = {
-  editing: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'delete', database_only: 'materialize' },
-  preserving: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'materialize', database_only: 'materialize' },
-  file: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'delete', database_only: 'keep' },
-  immutable: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'keep', database_only: 'keep' },
+  editing: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'delete', superseded: 'delete', superseded_annotated: 'keep', database_only: 'materialize' },
+  preserving: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'materialize', superseded: 'delete', superseded_annotated: 'keep', database_only: 'materialize' },
+  file: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'delete', superseded: 'delete', superseded_annotated: 'keep', database_only: 'keep' },
+  immutable: { in_body: 'refresh_detail', drifted: 'delete', removed: 'delete', removed_marked: 'keep', superseded: 'delete', superseded_annotated: 'keep', database_only: 'keep' },
 };
 
 /**
@@ -178,10 +186,12 @@ function classifyTimeline(rows: StoredTimelineRow[], body: CanonicalBody, prior:
   const exactIncoming = new Map([...timeline.values()].map(t => [exactTimelineKey(t), sanitizeForJsonb(t.detail ?? '')]));
   const priorTimeline = prior ? new Set(canonicalTimeline(prior, slug).keys()) : new Set<string>();
   const priorMarked = prior ? markedTimeline(prior, slug) : new Set<string>();
+  const superseded = new Set([body, ...(prior ? [prior] : [])].flatMap(b => supersededCitationTimeline(safeBody(b)).map(t => timelineKey(t))));
   const pinned = rows.map(row => {
     const key = timelineKey(row);
     const state: TimelineRowState = exactIncoming.has(exactTimelineKey(row)) ? 'in_body' : timeline.has(key) ? 'drifted'
-      : priorMarked.has(key) ? 'removed_marked' : priorTimeline.has(key) ? 'removed' : 'database_only';
+      : priorMarked.has(key) ? 'removed_marked' : priorTimeline.has(key) ? 'removed'
+      : superseded.has(key) ? (hasExtractorDetail(row) ? 'superseded' : 'superseded_annotated') : 'database_only';
     return { ...row, key, state, action: timelineRowAction(writer, state, policy) };
   });
   return { timeline, exactIncoming, pinned };
@@ -329,6 +339,9 @@ function takeCollision(rows: number[], sections: Map<number, FenceSection>, slug
 export async function prepareCanonicalProjections(engine: BrainEngine, page: ParsedPage, slug: string, sourceId: string,
   prior: PageSnapshot | null, writer: ProjectionWriter, policy?: TimelineWritePolicy): Promise<(tx: BrainEngine, pageId?: number) => Promise<CanonicalProjectionResult>> {
   const { factRows, takes, quoted, sections } = compileCanonicalProjections(page, slug, sourceId);
+  // #6259: a page the content-quality gate hid as junk projects no facts or takes. Rows projected before it
+  // was quarantined are left as they are (hiding them would need a new row state); only new projection stops.
+  const projectFences = !isQuarantined(page.frontmatter);
   const { timeline, exactIncoming, pinned } = classifyTimeline(prior ? await storedTimeline(engine, prior.page.id) : [],
     page, prior?.page ?? null, slug, writer, policy);
   const deletions = JSON.stringify(pinned.filter(row => row.action === 'delete')
@@ -351,7 +364,7 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
     const rows = await collisions(db, pageId);
     if (rows.length) throw takeCollision(rows, sections.takes, slug, sourceId);
   };
-  if (prior) await refuseCollisions(engine, prior.page.id);
+  if (prior && projectFences) await refuseCollisions(engine, prior.page.id);
   // #5984: `pageId` is the caller's own read of the page in this transaction. The
   // statements are issued as pipelines; an engine call that sends more than one
   // statement (insertFacts, addTakesBatch) ends one, so order is kept.
@@ -360,7 +373,7 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
     if (id == null) return { timelineRowsRemoved: null };
     // #5969: only rows this statement actually deleted count; a row changed since preparation is left alone and uncounted.
     const removedDates: string[] = [];
-    if (quoted) await refuseQuotedFenceLoss(tx, id, quoted, takeRowsGone, factRows, slug, sourceId);
+    if (quoted && projectFences) await refuseQuotedFenceLoss(tx, id, quoted, takeRowsGone, factRows, slug, sourceId);
     // Fact IDs in permanent receipts remain meaningful when a canonical row is
     // removed/replaced. Expire and detach its row position instead of deleting it.
     // Conversation-extractor rows share the page coordinate without a fence
@@ -400,15 +413,20 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
       () => tx.executeRaw(`UPDATE timeline_entries t SET detail=r.next FROM jsonb_to_recordset($2::text::jsonb) AS r(id integer,detail text,next text)
         WHERE t.page_id=$1 AND t.event_page_id IS NULL AND t.id=r.id AND t.detail=r.detail`, [id, refreshes]),
     ];
+    if (!projectFences) {
+      await pipelined(tx, timelineRows);
+      return { timelineRowsRemoved: removedSummary(removedDates) };
+    }
+    // The timeline rows are independent of the fact and take rows, so they ride in the first pipeline.
     if (factRows.length) {
-      await pipelined(tx, [expireFacts]);
+      await pipelined(tx, [expireFacts, ...timelineRows]);
       await tx.insertFacts(factRows, { source_id: sourceId }); // gbrain-allow-direct-insert: canonical fence projection shares the journal publication transaction
       await pipelined(tx, [...factFields, checkTakes, dropTakes]);
-    } else await pipelined(tx, [expireFacts, checkTakes, dropTakes]);
+    } else await pipelined(tx, [expireFacts, checkTakes, dropTakes, ...timelineRows]);
     if (takes.length) {
       await tx.addTakesBatch(takes.map(t => takesPreparation.toCanonicalBatchInput(id, t)));
-      await pipelined(tx, [...resolveTakes, ...timelineRows]);
-    } else await pipelined(tx, timelineRows);
+      await pipelined(tx, resolveTakes);
+    }
     return { timelineRowsRemoved: removedSummary(removedDates) };
   };
 }

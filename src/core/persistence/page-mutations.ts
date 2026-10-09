@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { pageQuarantinedNotice } from '../quarantine.ts';
 import { fenceNormalizedNotice, type FencesNormalized } from '../fence-repair/report.ts';
 import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
 import { realpathSync } from 'node:fs';
@@ -7,14 +8,14 @@ import type { OperationContext } from '../ops/contract.ts';
 import { OperationError } from '../ops/contract.ts';
 import { VERSION } from '../../version.ts';
 import { ownerBuildMismatch } from './publication-failure.ts';
-import { enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam, requireWritablePage, validatePageSlug } from '../ops/context.ts';
+import { enforceClientSlugFence, enforceSubagentSlugFence, isLegacyStoredPageSlug, normalizeSlugPrefix, parseSourceIdParam, requireWritablePage, validatePageSlug } from '../ops/context.ts';
 import { suffixedSlugAdmission } from './suffixed-slug.ts';
 import { defaultSlug, detectBinaryNullByte, explicitCaptureType, mergeCaptureFrontmatter, normalizeForHash } from '../capture-content.ts';
 import { computeContentHash } from '../ingestion/types.ts';
 import { resolveSlugForPath } from '../sync.ts';
 import { scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { sha256 } from './digest.ts';
-import { assertPersistenceAccepting, estimatedRetryAfterMs, waitForWrite, writeResponse } from './service.ts';
+import { assertPersistenceAccepting, estimatedRetryAfterMs, waiterOnlyOwner, onPersistenceLane, waitForWrite, writeResponse } from './service.ts';
 import { parseWireWriteWaitMs } from './write-wait.ts';
 import { assertTimelineNotOmitted, isTimelineSection, timelineSectionOf, type TimelineSection } from './timeline-omission.ts';
 import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
@@ -30,6 +31,8 @@ import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-gu
 import { isUnboundSourcePage, readUnboundWritePolicy, unboundSourceError } from './unbound-source.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
 import { publishesDatabaseOnly } from './page-prepare.ts';
+import { cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
+import { pipelined } from '../page-state/transactions.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
 import { isConnectorSourceKind } from './connector-identity.ts';
 
@@ -92,6 +95,18 @@ export async function withBatchAdmission<T>(ctx: OperationContext, run: (own: Op
   return withVerifiedLocalRegistration(ctx.engine, registration, () => run(ctx, shared));
 }
 /** Validate explicit routing before any admission, including dry-run adapters. */
+/**
+ * validatePageSlug, except that delete and restore may name a slug an older
+ * gbrain stored and today's grammar refuses, when an existing row in
+ * `sourceId` holds exactly that slug (#6212). Such a row publishes
+ * database-only (page-prepare.ts prepareFileTarget).
+ */
+export async function validateMutationSlug(ctx: OperationContext, operation: string, slug: string, sourceId: string): Promise<void> {
+  if ((operation === 'delete_page' || operation === 'restore_page') && isLegacyStoredPageSlug(slug)
+    && await ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true })) return;
+  validatePageSlug(slug);
+}
+
 export function pageMutationSource(ctx: OperationContext, params: Record<string, unknown>, operation: string): string {
   const sourceId = parseSourceIdParam(params.source_id, operation) ?? ctx.sourceId ?? 'default';
   if (sourceId === '__all__') {
@@ -138,7 +153,7 @@ async function resolveCaptureFile(ctx: OperationContext, sourceId: string, p: Re
 }
 
 function pendingAwareResponse(ctx: OperationContext, row: WriteRequest): Record<string, unknown> {
-  try { return writeResponse(row, { retryAfterMs: estimatedRetryAfterMs(ctx.engine, 1) }); } catch (error) {
+  try { return writeResponse(row, { retryAfterMs: estimatedRetryAfterMs(ctx.engine, 1), waiterOnlyOwner: waiterOnlyOwner(ctx.engine) }); } catch (error) {
     // #5929: a trusted local caller is told when an owner on another build ran the failed attempt.
     const mismatch = ctx.remote === false ? ownerBuildMismatch(row.error_detail, VERSION) : null;
     if (mismatch && error instanceof OperationError) { error.why = mismatch.why; error.fix = mismatch.fix; }
@@ -150,10 +165,13 @@ function pendingAwareResponse(ctx: OperationContext, row: WriteRequest): Record<
 export function emitFenceNotice(ctx: Pick<OperationContext, 'emitNotice'>, response: Record<string, unknown>, slug?: string): void {
   const report = response.fences_normalized as FencesNormalized | undefined;
   if (report) ctx.emitNotice?.(fenceNormalizedNotice(report, slug));
+  // #6259: a write the content-quality gate quarantined says so (`quarantined` plus one safety notice).
+  const quarantined = response.quarantined as { reason: string; detail: string } | undefined;
+  if (quarantined && slug) ctx.emitNotice?.(pageQuarantinedNotice(slug, quarantined, 'write'));
 }
 
-/** Owner-internal `put_page` kinds the trusted local file writers (import, frontmatter repair) submit; every other caller is refused them. */
-const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 'managed_file_repair']);
+/** Owner-internal `put_page` kinds the trusted local file writers (import, frontmatter repair, quarantine clear) submit; every other caller is refused them. */
+const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 'managed_file_repair', 'managed_quarantine_clear']);
 
 /** #6007: a `put_pages` child: its batch, its position and the batch size are part of its identity. */
 export interface PageBatchMember { id: string; index: number; size: number; requestId: string }
@@ -166,9 +184,24 @@ export async function submitPageMutation(ctx: OperationContext,
   const { wait_ms: wireWait, ...params } = input.params;
   const wireWaitMs = parseWireWriteWaitMs(wireWait);
   const waitMs = () => wireWaitMs !== undefined ? Math.max(0, wireWaitMs - (performance.now() - arrived)) : input.waitMs ?? ctx.writeWaitMs;
-  const prepared = await preparePageAdmission(ctx, { ...input, params });
+  // Phase 4.2: pre-admission reads that admission rechecks come from this process's cache; a refusal the
+  // cache could explain drops it and prepares the write once more, uncached, so it ends as it would without it.
+  const cached = await preadmitReads(ctx.engine);
+  let prepared = await preparePageAdmission(cached ? { ...ctx, engine: cached } : ctx, { ...input, params });
   if (prepared.prior) return pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs()));
-  const row = await admitWrite(ctx.engine, prepared.admission);
+  const brainId = cached ? cachedPreadmitBrain(ctx.engine) : undefined;
+  // Phase 4.4: the admission transaction runs on the warm single-write lane when it is free.
+  const admit = (admission: WriteAdmission) => onPersistenceLane(ctx.engine, transaction => admitWrite(ctx.engine, admission, undefined, transaction),
+    () => admitWrite(ctx.engine, admission));
+  let row: WriteRequest;
+  try { row = await admit(brainId ? { ...prepared.admission, brainId } : prepared.admission); }
+  catch (error) {
+    if (!cached || !preadmitRecheckFailed(error)) throw error;
+    dropPreadmitCache(ctx.engine);
+    prepared = await preparePageAdmission(ctx, { ...input, params: { ...params, request_id: prepared.admission.requestId } });
+    if (prepared.prior) return pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs()));
+    row = await admit(prepared.admission);
+  }
   const response = pendingAwareResponse(ctx, await waitForWrite(ctx.engine, row, ctx.config, waitMs()));
   emitFenceNotice(ctx, response, row.slug);
   return { ...response, ...(prepared.typeWarning ? { type_warning: prepared.typeWarning } : {}), ...(prepared.slugAdvisory ? { slug_advisory: prepared.slugAdvisory } : {}) };
@@ -202,8 +235,11 @@ export async function preparePageAdmission(ctx: OperationContext,
   await initializeLocalPersistence(ctx);
   const captureSlug = input.operation === 'capture' ? await resolveCaptureFile(ctx, sourceId, p) : null;
   const principal = await requestPrincipalForContext(ctx);
-  await assertPageRequestIdentity(ctx.engine, principal, requestId);
-  const prior = await getWriteRequest(ctx.engine, principal, requestId);
+  // Independent reads go out together on Postgres; the first refusal in this order is the one reported.
+  const [, prior] = await pipelined(ctx.engine, [
+    () => assertPageRequestIdentity(ctx.engine, principal, requestId),
+    () => getWriteRequest(ctx.engine, principal, requestId),
+  ]) as [unknown, WriteRequest | null];
   const callerIntent = { ...p };
   delete callerIntent.request_id;
   if (prior) {
@@ -256,7 +292,7 @@ export async function preparePageAdmission(ctx: OperationContext,
     }
     if (typeof intent.capture_path === 'string') intent.capture_file_hash = sha256(p.content);
   }
-  validatePageSlug(slug);
+  await validateMutationSlug(ctx, input.operation, slug, sourceId);
   enforceClientSlugFence(ctx, slug, input.operation);
   enforceSubagentSlugFence(ctx, slug, input.operation);
   // Preserve same-source diagnostics for new timeline writes without making
@@ -264,9 +300,14 @@ export async function preparePageAdmission(ctx: OperationContext,
   if (input.operation === 'add_timeline_entry') await requireWritablePage({ ...ctx, sourceId }, slug, input.operation, 'page');
   intent.slug = slug;
   if (ctx.remote !== false) Object.assign(intent, { source_kind: `mcp:${input.operation}`, source_uri: null, ingested_via: `mcp:${input.operation}` });
-  const authority = await submissionAuthority(ctx, input.operation, sourceId, source.incarnation, slug);
-  await assertKnowledgePublicationAllowed(ctx.engine, { source_id: sourceId, source_incarnation: source.incarnation, slug });
-  const snapshot = await ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true });
+  const [authority, , snapshot, boundAtStart, writeThroughSetting, repoPath] = await pipelined(ctx.engine, [
+    () => submissionAuthority(ctx, input.operation, sourceId, source.incarnation, slug),
+    () => assertKnowledgePublicationAllowed(ctx.engine, { source_id: sourceId, source_incarnation: source.incarnation, slug }),
+    () => ctx.engine.readPageSnapshot(slug, { sourceId, includeDeleted: true }),
+    () => getWorktreeBinding(ctx.engine, sourceId),
+    () => ctx.engine.getConfig('sync.write_through'),
+    async () => !source.local_path && sourceId === 'default' ? ctx.engine.getConfig('sync.repo_path') : null,
+  ]) as [Awaited<ReturnType<typeof submissionAuthority>>, unknown, Awaited<ReturnType<BrainEngine['readPageSnapshot']>>, Awaited<ReturnType<typeof getWorktreeBinding>>, string | null, string | null];
   if (typeof intent.content === 'string' && (typeof p.expected_revision !== 'string' || p.expected_revision === snapshot?.revision)) {
     await assertTimelineNotOmitted(ctx.engine, { intent, remote: ctx.remote !== false, writer: typeof p.expected_revision === 'string' ? 'editing' : 'preserving',
       slug, sourceId, content: intent.content, prior: snapshot });
@@ -280,11 +321,11 @@ export async function preparePageAdmission(ctx: OperationContext,
     assertEditRevision(snapshot.revision, p.expected_revision);
     applyPageEdits(snapshot.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
   }
-  let binding = await getWorktreeBinding(ctx.engine, sourceId);
+  let binding = boundAtStart;
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
-  const configuredWriteThrough = !/^(false|0|off|no)$/i.test(await ctx.engine.getConfig('sync.write_through') ?? 'true');
+  const configuredWriteThrough = !/^(false|0|off|no)$/i.test(writeThroughSetting ?? 'true');
   const writeThrough = configuredWriteThrough && !sandbox;
-  const root = source.local_path || (sourceId === 'default' ? await ctx.engine.getConfig('sync.repo_path') : null);
+  const root = source.local_path || repoPath;
   if (sandbox) authority.databaseOnlyReason = 'subagent_sandbox';
   else if (!configuredWriteThrough) authority.databaseOnlyReason = 'disabled_by_config';
   else if (!root && !binding) authority.databaseOnlyReason = 'no_repo_configured';

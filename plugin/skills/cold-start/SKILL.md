@@ -477,7 +477,12 @@ After completing available phases:
    - Calendar: daily cron
    - Email: periodic sweep (4-8 hours)
    - X: daily ingest
-   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes
+   - Brain repo: `gbrain sync --repo <path>` every 5-30 minutes. A managed brain
+     (`gbrain sources writer status --json` shows `"mode": "managed"`) refuses
+     that line: use the managed recipe in `skills/cron-scheduler/SKILL.md`
+     ("Managed brain") with `--source <id>`, e.g.
+     `gbrain sources refresh <id>; gbrain sync --source <id> --no-pull --hard-deadline 13m`
+     every 15 minutes on the owner host.
 
 4. **Track state:**
    ```json
@@ -564,13 +569,3 @@ Next: Phase N+1 — [description]. Ready to proceed?
 - `add_link` — cross-reference entities
 - `add_timeline_entry` — record events on entity timelines
 - `sync_brain` — sync changes to the index after each phase
-
-## Tools outside your MCP surface
-
-This plugin serves the starter tool surface. When a step above names one of these tools and your tool list
-does not have it, call request_tools {"surface":"full"} to add it to this session, or run its gbrain CLI equivalent:
-
-- `add_link` → `gbrain link`
-- `sync_brain` → `gbrain sync`
-
-To widen every new session, set this machine's plugin surface with GBRAIN_SURFACE=full.
