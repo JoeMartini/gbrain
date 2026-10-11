@@ -10,6 +10,438 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.160.0] - 2026-10-10
+
+**Keyword search finds words glued to Chinese, Japanese or Korean text, and you choose which source a self-registered agent writes to when you approve it.**
+
+A note titled `升级PostgreSQL17` used to be invisible to a keyword search for `PostgreSQL17`, because the index stored the whole glued run as one word. The index now splits wherever CJK text meets Latin letters or digits, and upgrading rebuilds only the pages and chunks that contain such a boundary. When an agent registers itself over OAuth and asks to connect, the approval page now has a "Write source" picker, so you decide which source it reads and writes before it gets a token. On a classic self-hosted Postgres brain, an agent whose page write is refused stops retrying and tells you the real fix: write the file, commit it and run `gbrain sync`. After you upgrade, run `gbrain reindex-search-vector` only if you changed `GBRAIN_FTS_LANGUAGE`; it now rebuilds page vectors too.
+
+### Itemized changes
+
+- **CJK/Latin boundaries in keyword search** (#6370). Every indexing `to_tsvector` and the title query read through a new `gbrain_fts_input()` that inserts a space at each CJK↔ASCII letter or digit boundary; text without CJK is unchanged byte for byte. The upgrade migration rebuilds only rows containing a boundary, in checkpointed batches.
+- **`gbrain reindex-search-vector` rebuilds page vectors** (#6374). Pages now get the same vector the write path builds, so a language change reaches titles and timelines, not only chunks. A page edited during the rebuild is skipped and reindexed by its own save, and facts you withdrew stay out of the index.
+- **Choose a self-registered client's source at first consent** (#6202). Clients that registered themselves through dynamic client registration show a "Write source" picker on their first approval, listing your active sources. Approving with or without a change counts as the client's one first consent; later changes go through the Agents page or `gbrain auth rescope --client`. Clients registered before this release keep read-only consent. A migration adds the `oauth_clients.registered_via` marker.
+- **Classic Postgres write refusals ask instead of retrying** (#6277). `owner_unavailable` with `detail: unbound_source` now renders `retryable: false` and `fix.next: ask_user`, and its guidance says write, commit, `gbrain sync --source <id>`. The guide in [write-refusals](docs/guides/write-refusals.md#unbound-sources-on-postgres) and six skills cover the classic path.
+- **One JSON document on stdout** (#6386): `gbrain sync status --json`, `gbrain sync unblock --json` and `gbrain embed --facts --json` write their JSON to stdout, not stderr.
+- **Bootstrap verify waits like a normal write** (#6356): `gbrain bootstrap verify` uses the CLI write wait instead of a fixed 5 seconds, and a write still pending names its next step.
+- **Local reranker setup** (#6381): the llama-server reranker guide points at the llama.cpp maintainers' model file, the recipe's default names the `qwen3-reranker-0.6b` alias the guide uses, and `gbrain models doctor` reports `config` when the server scores a relevant and an unrelated passage the same.
+- **Codex session hooks** (#6399): a Codex rollout that has only a header ends as `empty_session`, not `parser_drift`.
+- **Link validation** (#6266): the link validator resolves relative links from the page's own directory, the same way link extraction does.
+- **Search latency budget** (#6400): the query-embedding deadline starts at the first embed request, so time spent before it no longer eats the vector search's budget.
+
+### For contributors
+
+- CONTRIBUTING warns before the `git reset --hard` in the line-ending refresh.
+- Every pglite-snapshot cache key in `e2e.yml`, `test.yml` and `stress.yml` also hashes `src/core/audit/redact-connection-info.ts`, which the schema closure now imports.
+
+Contributed by @dovstern, @javieraldape, @daveove, @benswinney and @dhruvatr.
+
+## [0.60.159.0] - 2026-10-10
+
+**Captured memory stops leaking away: failed chats retry until they import, long messages stay whole, sessions file under their own source, and fence writers refuse instead of dropping rows.**
+
+Fix wave 13 PR3 closes 26 reported gaps in capture, the dream cycle, doctor, facts and config. Most of them silently lost or misfiled memory; each now either keeps it or says exactly what is held and how to release it.
+
+### Itemized changes
+
+- Chat connectors keep a conversation that failed until it imports (backoff, up to 10 retries per sync, fair `--limit` split, Claude org routing). The sync reports `partial` with `unresolved`, and doctor warns "archive incomplete". For archives synced before this fix, ask the user, then run `gbrain connectors sync <provider> --full` once.
+- Transcript pages keep every message whole. A message over 4,000 characters continues in the next block under the same speaker instead of being cut.
+- Captured session files record the source their session started under and are filed there. Older unstamped files are held until `gbrain sweep --assign-corpus <source>` (preview, then `--apply`), and a serve refuses to reroute a session to another source.
+- Fence writers no longer drop rows they can't read. A write that would re-render a facts or takes fence with a malformed row refuses with `invalid_fence` / `target_fence_malformed`; `forget` still expires the fact in the database. Facts fences are read by header name, so an unknown, repeated or missing column is held for the fence repair. `attributed_to` is a recognized column.
+- Managed atom extraction retries a failed page up to 3 times, then holds it (doctor `extract_atoms_held_failed` lists it with the paid retry command). `dream --drain` reports a `budget` stop with spend and cap instead of `no_progress`.
+- The dream cycle reads a schema pack set in database config when it gates extract_atoms and synthesize_concepts. A paid phase that only such a pack newly declares waits for `gbrain config set cycle.<phase>.enabled true` (`consent_required`).
+- Synthesis adopts an output that only local maintenance touched after the child committed. Any other later edit is a one-time per-page warning instead of a phase failure every cycle.
+- OpenClaw 2026.9.x compaction banks checkpoint segments again, and doctor warns when a week of compactions banked nothing.
+- Doctor: `--only` for an engine-reading check connects to the brain; `queue_health` and `global_maintenance_timeouts` attribute patterns deaths correctly; `type_proliferation` grades each source against its own pack.
+- Smaller fixes:
+  - claude-cli honors the call's output cap.
+  - Small strict-output calls run with thinking off.
+  - Batch `remember` refuses a non-UUID `request_id`.
+  - An empty repair preview's printed apply succeeds.
+  - Patterns records child timeouts and counts timeline appends.
+  - Relationship-contradiction judge errors back off, then hold (`gbrain edge-proposals retry`).
+  - `propose_takes` skips the dream cycle's own pages.
+  - Database `provider_chat_options` rows apply.
+  - CRAG think escalation stays within the query's sources.
+  - The Anthropic recipe lists `claude-haiku-5-5`.
+
+Contributed by @javieraldape, @mattverlaque, @spiky02plateau, @Masashi-Ono0611, @h6y3 and @andreineacsu.
+
+## [0.60.158.0] - 2026-10-10
+
+**`engine.transaction(fn, { signal })` and `engine.transactionDirect(fn, { signal })`: an `AbortSignal` that cancels a running Postgres transaction. No behavior changes for callers that pass no signal.**
+
+The publication deadline planned in #6288 / #6352 needs to end a specific publish transaction when its ceiling passes, so that its promise rejects and the caller's `finally` releases the request-row lock, page locks, worktree lock and capacity. Until now nothing could cancel one transaction's connection.
+
+### Itemized changes
+
+- **`TransactionOptions.signal`** (`src/core/engine.ts`, `src/core/postgres-engine.ts`, `src/core/postgres-engine/transaction-abort.ts`). On Postgres an abort discards the transaction's connection through the begin handle's `discard()` (the connection-ownership hunk from #5466 / #5560): the socket closes, the server rolls the transaction back on its own whether a statement is in flight or not, directly or through a transaction-mode pooler, and the pool reconnects on its next checkout. The transaction rejects with an `AbortError` whose `message` is the signal's reason and whose `cause` is the driver's `CONNECTION_CLOSED` error; every `finally` on the way out runs and the `tx` gauge is released. An already-aborted signal rejects before `BEGIN` is sent. An abort after `COMMIT` returned changes nothing. A nested transaction shares its parent's connection, so aborting it aborts the parent too.
+- **PGLite** (`src/core/pglite-engine.ts`): one in-process connection cannot interrupt a statement, so only the pre-`BEGIN` check applies; a mid-flight abort is ignored and the transaction commits.
+- Tests: `test/e2e/postgres-transaction-abort-postgres.test.ts` (5 cases: mid-flight abort on `transaction` and `transactionDirect` with `finally`, rollback checked again after the in-flight statement would have finished, pool and gauge freed; pre-aborted signal sends no `BEGIN`; abort after `COMMIT`; no signal), 3 of 5 fail on master (the option is ignored and the transaction commits); `test/transaction-abort.test.ts` (8 cases: the abort-before-and-after-attach paths, error mapping, listener removal, and PGLite's two behaviors).
+
+## [0.60.157.0] - 2026-10-10
+
+**A database-only `validate: false` stamp no longer refuses every write; lost memory writes are counted and replayable.**
+
+The v0.13.1 grandfather stamped `validate: false` into the database. On an unmanaged brain that migration never wrote the file (by design), so once the brain was managed every page with the stamp looked hand-edited and every coordinated write on it, `remember` included, was refused `source_changed` (#6429: 209k of 304k pages on one brain, 68 facts dropped silently). The stamp is now read as what it is, a mechanical database-side annotation, and the next write publishes it to the file. Nothing needs doing after you upgrade; to recover facts that were refused, run `gbrain repair failed-writes --source <id>` on the brain host and apply the set it prints after you agree.
+
+### Itemized changes
+
+- `prepareFileTarget` (`fileMatchesSnapshot`) treats a stored `validate: false` the way #5943 treats a pack-inferred `subtype`: a canonical file without a `validate:` key keeps the stored stamp instead of counting as an uncoordinated local edit. A file that records its own `validate:` decision is still compared as written. `put_page`, `remember`, maintenance pages, lint and `sources reconcile --audit` all route through it.
+- `gbrain repair failed-writes` also lists and replays caller writes (`remember`, `put_page`, `add_timeline_entry`) that ended `conflict` with `source_changed`, with the same dispositions. A replay refused `source_changed` is classified `file_database_drift` only while the file still differs from the database: a reconcile that rewrites only the file makes the write a candidate again (before, only a change to the page row did).
+- Doctor `lost_caller_writes` (ops) counts, per source, the caller writes whose receipt still holds an intent that never landed and names the `repair failed-writes` preview; a write whose replay or retry committed, or whose page was later deleted, is not counted.
+
+### For contributors
+
+- `test/ingestion/put-page-write-through.test.ts` (#6429 case) proves the stamp carry on PGLite (fails before the fix with `source_changed`); `test/repair-failed-writes-conflict-6429.test.ts` covers the conflict replay and the doctor check on PGLite and Postgres; `test/doctor-lost-caller-writes.test.ts` pins the registry wiring. Doctor goldens were regenerated for the new check.
+## [0.60.156.0] - 2026-10-10
+
+**`gbrain setup claude-code` gives Claude Code memory in one command.** It finds or creates your brain, wires the MCP server and the read-context hooks, and checks that they answer. A second run changes nothing, and `--remove` takes out only what setup wrote.
+
+### What you get
+
+- **One command after install.** `bun install -g github:garrytan/gbrain`, then `gbrain setup claude-code`. With no brain configured it creates a keyless local one (`gbrain init --pglite --no-embedding`). It then writes the stdio MCP entry to `~/.claude.json` and the `SessionStart` and `UserPromptSubmit` hooks to `~/.claude/settings.json`, and runs the same stdio smoke as `gbrain doctor --only harness_wiring`.
+- **Target first.** Before any write, setup prints the brain, source, launcher, MCP surface and registration owner it chose. `--dry-run` stops there; `--json` prints one document.
+- **Three separate decisions.** Wiring scope (`--scope user|project`, `--no-hooks`), automatic capture (`--capture` adds the `Stop` and `SessionEnd` hooks) and provider use (`--providers`). Capture and providers are off unless you accept them. An existing `memory.auto_writeback: off` or `GBRAIN_HOOKS=0` wins over a flag.
+- **Owned by hash.** A connection receipt beside `~/.claude.json` records the exact hash of each entry setup wrote. An entry you edited afterwards is kept and reported, never overwritten or removed. An interrupted run resumes without duplicating anything. Two installs on one machine each remove only their own entries.
+- **Refuses instead of guessing.** A hosted brain is never shadowed by a new local one (`setup_hosted_connection`). A live PGLite server, an MCP entry setup did not write, another install's receipt or an existing `bootstrap harness` wiring refuses with `setup_owner_conflict` and the exact next step. `codex`, `openclaw` and `hermes` print their per-harness guide (`setup_harness_unsupported`). `gbrain errors <code>` explains each.
+- **Honest states.** Setup reports `configured`, `connection-verified` and `native-pending` separately; it never claims that memory reaches a fresh session on its own until that is observed.
+
+### For contributors
+
+- `writeClaudeHooksAt` and `removeClaudeHooksAt` accept an opt-in `ownedEntryHashes` set (`hookEntryHash`: sha256 over type, command and timeout). With it, a marker match alone never replaces or removes an entry, and edited entries come back in `preserved`. Existing callers are unchanged.
+- `src/core/setup/capabilities.ts` is the versioned harness × transport capability table that setup reads.
+- Guide: `docs/guides/setup.md`. Refusals: `docs/guides/repair.md#setup-refusals`.
+
+## [0.60.155.0] - 2026-10-10
+
+**The Postgres E2E test for filtered HNSW recall under iterative scan no longer fails at random. It averages four index builds instead of trusting one.** Product code is unchanged.
+
+`test/e2e/hnsw-iterative-scan-recall-postgres.test.ts` builds a deliberately sparse HNSW index (m 4, ef_construction 8, 20k vectors) and asserts that default recall stays at or above 0.6. pgvector draws each element's graph level from the server's own unseeded random generator, so every build is a different graph. One build failed on CI with 0.5825.
+
+| measure (local pg16, pgvector 0.8.7) | one build | mean of four builds |
+|---|---|---|
+| default recall: mean / sd / min (200 builds) | 0.714 / 0.037 / 0.629 | 0.714 / 0.018 / 0.674 (50 groups) |
+| forced probe: runs failing at a 0.67 bar, 30 fresh runs each | 3 / 30 | 0 / 30 |
+
+Both bounds are unchanged (default ≥ 0.6, default − strict ≥ 0.1). The test takes about 5 s instead of 3 s.
+
+## [0.60.154.0] - 2026-10-10
+
+**`gbrain serve` answers while a large effects backlog drains.** A big import followed by `gbrain embed --stale` left tens of thousands of queued page embedding effects whose chunks already had current vectors. The serve consumer ran each one through a claim, a guard, a projection read and a completion, and PGLite resolves its queries as one microtask chain, so stdin waited for the whole drain: on a 47k-page brain the first tool call took 432 to 489 s. It now answers in about 2 s, and the same backlog settles in about 18 s.
+
+Nothing needs doing after you upgrade. A drain longer than 5 s prints one progress line on serve's stderr.
+
+### Itemized changes
+
+- **No-op embedding effects settle in bulk** (`src/core/persistence/embedding-noop-settle.ts`). The serve drain first settles queued page embedding effects that have nothing left to embed, one statement per window of 200. An effect settles there only if the effect runner would find nothing to embed: never attempted, claimable by this host, its source unchanged, its page live and sealed at the effect's revision, and every chunk carrying a vector for the current signature, write column and model. The row ends exactly as the runner's own completion leaves it. Everything else, including any effect the settle passes over, still runs through the runner.
+- **A per-process cursor** keeps a backlog that cannot settle (stale vectors, an unconfigured provider) from being rescanned on every drain: on a 40k stale backlog the first sweep takes about 2 s and every later drain costs one indexed read.
+- **The drain yields to the event loop** between settle windows and between effect batches, never inside a Git group or while a worktree lock is held.
+- **The PGLite checkpoint guard reuses a WAL probe for up to 50 ms** while the reading leaves a full window of headroom at a bound well above the measured peak WAL rate, so a run of small writes no longer probes once per statement.
+- **Progress line.** `[persistence] phase=effects_drain state=running|done settled_noop_embeddings=… ran=… elapsed_s=…` on serve's stderr (never on CLI output), and `status()` reports the drain in progress.
+
+### For contributors
+
+- `test/persistence-drain-latency.serial.test.ts` is the forced probe: a tool call every 50 ms while 8,000 no-op effects drain must answer, and the event loop must not stall, within 2,000 ms (master: no call answers during the drain, worst gap 30.9 s).
+- `test/persistence-embedding-noop-settle.test.ts` (PGLite and Postgres) covers a mixed queue, Git rows untouched, row and request parity with the runner, a crash inside the settle (fault point `effect:embedding:settle`), guard refusals, the cursor, numeric id order and the runner fallback for passed effects.
+- `test/pglite-checkpoint-guard.test.ts` covers the probe reuse window, including WAL crossing the threshold inside it; `test/persistence-git-coalescing-5530.slow.test.ts` adds a write behind a Git backlog and a no-op embedding backlog.
+
+## [0.60.153.0] - 2026-10-10
+
+**A repeated query in a long-running `gbrain serve` no longer waits on the embedding provider: about 110–150 ms faster per repeat, and 75 of 100 provider embed calls avoided on a realistic mix. Cold `search`, `query` and `stats` start 100–175 ms faster on both engines. Doctor's `eval_drift` stops paying 0.2–0.4 s per run on a freshly cloned or just-pulled source checkout. Rankings and output are unchanged.**
+
+Efficiency wave 11 (GBRA-75). Base is master at wave 10 (c8d513eeb). Measured on 4-vCPU / 16 GiB cloud machines with synthetic brains, base and branch interleaved in one session, p50 / p95.
+
+| Path | Engine, brain, N | Before | After |
+|---|---|---|---|
+| MCP `query`, repeat of an earlier query (live Voyage embed + rerank) | Postgres 5k, N=25 | 483 / 530 ms | 370 / 427 ms |
+| same | Postgres 50k, N=25 | 504 / 557 ms | 359 / 441 ms |
+| same | PGLite 5k, N=25 | 462 / 531 ms | 312 / 399 ms |
+| provider embed calls, 100-query Zipf mix of 40 queries | all three brains | 100 | 25 |
+| cold `gbrain search` | PGLite 5k / 50k, N=20 | 704 / 754, 739 / 769 ms | 604 / 642, 622 / 655 ms |
+| same | Postgres 5k / 50k, N=20 | 477 / 550, 515 / 579 ms | 355 / 429, 392 / 442 ms |
+| cold `gbrain stats` | PGLite 50k / Postgres 50k, N=20 | 987 / 1061, 584 / 633 ms | 855 / 902, 437 / 499 ms |
+| modules loaded before connect, `search` | PGLite 5k | 1021 | 667 |
+| `eval_drift` probe, racy index (fresh 10.5k-file clone) | 3 clones × 6 runs | 224–457 ms every run | one 400–1045 ms run, then 18–35 ms |
+| same, settled index | 6 runs | 22–32 ms | 17–28 ms |
+
+PGLite cold start stays about 170–200 ms above Postgres: `PGlite.create` boots the WASM backend and its vector and pg_trgm extensions on the main thread, and the catalog needs those extensions at boot.
+
+### Itemized changes
+
+- **Query-embedding cache** (`ai/query-embed-cache.ts`, `gateway.ts` `embedQuery`). Identical query embeds within one process reuse the vector: a 512-entry LRU with a 10-minute TTL, keyed by recipe, resolved model id, `base_urls` override, effective dimensions and the exact string sent (query prefix + text). Only resolved vectors are stored, as copies; aborts and failures are never cached. Every gateway reconfigure clears it, and a caller under an AI invocation guard (minion spend authorization, delegated spend) always goes through its guard. Document-side embeds are uncached. A deterministic-provider fixture shows byte-identical ranked lists with and without the cache on both engines. Expansion variants never repeat within one call (deduped already); across calls the expansion LLM output is not cached, so a variant embed is reused only when the LLM returns the same string.
+- **Cold start** (`operation-load.ts`, `operation-loaders.generated.ts`, `remote-mcp-error.ts`, `embedding-disabled.ts`, `ai/gateway.ts`, `ops/admin.ts`). The CLI loads only the module that defines the op it runs, finalized by the same area-and-redaction step the registry uses; the MCP client, evidence delivery, the `ai` SDK and `page-mutations` load on first use. Trust proposal decisions load their handlers at the reader, and a test classifies every load-time registry and diffs it per op against the full registry.
+- **`eval_drift`** (`eval/drift-watch.ts`). A working-tree diff that takes 75 ms or more means racily-clean index entries, which git re-hashes on every diff until the index is rewritten; the probe then runs `git update-index -q --refresh` once. A settled checkout skips it. The answer is unchanged, and a held `index.lock` is ignored.
+
+## [0.60.152.0] - 2026-10-10
+
+**Remote fact writes apply the same visibility filter as reads.**
+
+`forget` and `remember` called by a remote agent now apply the same visibility filter as remote fact reads. The trusted local CLI is unchanged, and nothing needs doing after you upgrade.
+
+### Itemized changes
+
+- Remote `forget` applies the same visibility filter as reads, through its trust guard, the withdrawal it records and the similar facts it lists.
+- Remote `remember` applies the same visibility filter in its duplicate checks and in `replaces`.
+
+### For contributors
+
+- `test/remote-fact-write-private-provenance.test.ts` covers the fix on PGLite, and on Postgres through `test/e2e/remote-fact-write-private-provenance-postgres.test.ts`.
+
+## [0.60.151.0] - 2026-10-10
+
+**A visibility filter fix for remote fact reads.**
+
+This release ships a visibility filter fix for remote fact reads. Reads from the trusted local CLI are unchanged, and nothing needs doing after you upgrade.
+
+### Itemized changes
+
+- A visibility filter fix for remote fact reads (`FactListOpts.excludePrivate`, `TrajectoryOpts.excludePrivate`).
+
+### For contributors
+
+- `test/remote-fact-list-private-provenance.test.ts` covers the fix on PGLite, and on Postgres through `test/e2e/remote-fact-list-private-provenance-postgres.test.ts`.
+## [0.60.150.0] - 2026-10-10
+
+**On Postgres, one statement with an `undefined` parameter could wedge a pooled connection for good: the statement in flight ahead of it got its error, it stayed queued with nothing on the wire, every later reply arrived one statement late, and the backend sat `active / ClientRead` while `/health` answered 200 (#6383, the driver desync behind #6352). The vendored driver now answers a statement that fails to build in its place in the pipeline (the approach of porsager/postgres#1236), so only the culprit fails and a transaction it was part of is aborted rather than committed without it; a connection whose statement waits past `statement_timeout` plus 30 s with nothing coming back is retired and replaced; the pool numbers are live; and `/health?deep=1` probes through the same pool the handlers use.**
+
+GBRA-76. Reproduced on master against Postgres 16 with `max: 1, prepare: false, shared_types: true`: a head statement, a statement binding `undefined`, and a describe-first follower issued together. Head rejects with `UNDEFINED_VALUE`, the culprit with `null is not an object (evaluating 'query.statement.types')`, the follower and everything after it never settle, and `pg_stat_activity` shows the backend `active / Client:ClientRead` on the follower. With the fix the head and the follower resolve with their own rows, only the culprit rejects, and the backend is idle.
+
+### Itemized changes
+
+- **A statement that fails to build is answered in its place** (`vendor/postgres/src/connection.js`, the `cjs` and `cf` copies, `patches/postgres@3.4.9.patch`; the approach of upstream PR porsager/postgres#1236, which fixes the same desync as porsager/postgres#1082). A statement joins the connection's queue before it is built, so when `build` throws (`UNDEFINED_VALUE`, `MAX_PARAMETERS_EXCEEDED`) it already holds a place in the pipeline with nothing on the wire. The driver now sends a query the server is certain to refuse in that place: the culprit gets an answer of its own and rejects with its own error, every later reply stays with its statement, and a transaction the culprit was part of is aborted by the server (the member behind it is refused with `25P02`, a pipelined `commit` lands as `ROLLBACK`) instead of committing without it. The reservation and transaction state machines are unchanged. The pool reports each failure through `onbuilderror(code, statement)` with the statement's text and `$n` placeholders, never values; the engine logs it as `[gbrain] warn code=pg_statement_build_failed error=UNDEFINED_VALUE pool=read sql=INSERT_mcp_request_log` (first keyword and table), so the call site that binds `undefined`, which nobody has found yet, names itself the first time it happens.
+- **A connection whose statement never answers is retired, not kept** (`connection.js`, `index.js`, `src/core/db.ts`, `connection-manager.ts`, `postgres-engine.ts`, `pool-gauge.ts`). New pool option `inflight_timeout`: a clock on the head statement that starts when it becomes the head, restarts on every byte the server sends and stops at `ReadyForQuery`. Past it the statement and everything queued behind it reject with `CONNECTION_STUCK`, the pool parks the connection out of rotation before its socket closes, `onstuck({ age_ms, queued, statement })` fires once, the socket is ended and destroyed, and the pool reconnects. gbrain sets it to each pool's own `statement_timeout` plus `GBRAIN_PG_STUCK_GRACE_MS` (default 30 000 ms; `0`/`off` disables it; a pool without a statement timeout has no watchdog), so a legitimate statement, which the server ends first, is never retired, while a desynced pipeline, a transaction-mode pooler that swallowed a `CancelRequest`, or a dead peer costs one budget instead of a restart. Each retirement logs `pg_connection_stuck` with the pool, age, queue depth and the statement's keyword and table, and counts in `getPoolDiagnostics().stuckDiscards`.
+- **The pool numbers are live** (`index.js`, `postgres-engine/pool-stats.ts`, `persistence/consumer-heartbeat.ts`). `sql.pool` (#6317) was defined inside `Object.assign`, which reads a getter once and copies the value, so every reader saw the construction-time snapshot (`checked_out: 0`, `waiters: 0`) for the life of the pool. It is a property getter now and adds `inflight_oldest_ms` (the oldest head statement's age) and `completed` (statements settled). The persistence heartbeat row carries both, so `gbrain sources writer status --json` shows them for the owner process.
+- **`/health?deep=1`** (`serve-http-metrics.ts`). Plain `/health` is unchanged and still fast. It answered 200 through the whole incident because its `SELECT 1` runs on a reserved connection, and `reserve()` only ever claims an idle one; the wedged connections sat in the busy queue where handler statements are routed. `/health?deep=1` runs `SELECT 1` through that ordinary pooled dispatch with the 3 s budget, returns the pool block (`checked_out`, `max`, `waiters`, `inflight_oldest_ms`, `completed`, `poisoned_discards`, `stuck_discards`, `build_failures`) and answers 503 when the probe times out, when a statement is past the read pool's in-flight budget, or while an earlier deep probe is still pending (one at a time per engine).
+- **The pool stall line** (`postgres-engine/pool-stall-watch.ts`, `commands/serve.ts`). `gbrain serve` reads its pool every 30 s. Connections checked out or statements waiting across two ticks with nothing completed in between logs `[gbrain] warn code=pg_pool_stalled checked_out=… waiters=… inflight_oldest_ms=… stalled_ms=…` once per tick and `info code=pg_pool_recovered` when statements complete again. One slow statement is one quiet tick and is not reported. The incident's fifty silent minutes become a line a minute in.
+- `gbrain errors pg_connection_stuck | pg_statement_build_failed | pg_pool_stalled` resolve offline; [docs/ENGINES.md](docs/ENGINES.md#pg-connection-stuck) has the entries and the `/health?deep=1` contract; `docs/mcp/DEPLOY.md` names the deep probe for supervisors.
+- Not in this release: forwarding an HTTP client's abort into the MCP handler (serve never did; the cancel in the #6383 timeline was coincidental, the retries fed the wedged connection) and a deadline on publication transactions (#6352's second ask).
+- Tests:
+  - `test/e2e/postgres-pipelined-build-failure-postgres.test.ts` (6 cases: the pipelined culprit, a culprit as head on an idle and on a reserved connection, a `sql.begin` with a bad member, a pipelined `begin … commit` on a reserved connection with a bad member, `MAX_PARAMETERS_EXCEEDED`, the CommonJS build). On master 6 of 6 fail: the follower and later statements hang and the backend stays `active`. A fix that only drops the culprit from the pipeline fails the two transaction cases: both inserts commit.
+  - `test/e2e/postgres-stuck-connection-postgres.test.ts` (5 cases: live pool numbers, a stuck head and its queued follower, a stuck reserved connection, no false positive within budget and with the watchdog off, the engine's counter and warn line). On master 4 of 5 fail: `busy` reads 0 during `pg_sleep` and the stuck statements hang.
+  - `test/pool-health-6383.test.ts` (18 cases, no database): the budget derivation and its `0`/`off` switch, the three warn lines, the stall watch's two-tick rule and single recovery line, and `/health?deep=1`'s 200, budget-exceeded 503, timeout 503, pending 503 and PGLite paths.
+
+## [0.60.149.0] - 2026-10-10
+
+**A keyword search from an MCP or other remote caller that hits a common term now takes about 0.2 s of database time on a 50k-page Postgres brain instead of about 1 s. Full `gbrain doctor` is 1.4–1.6 s faster at 50k on both engines. Import issues about 6% fewer statements per page. Results, doctor output and imported content are unchanged.**
+
+Efficiency wave 10 (GBRA-75). Base is master at wave 9 (3f960312a). Measured on 4-vCPU AMD EPYC / 16 GiB machines with Bun 1.4.2 and synthetic brains, base and branch interleaved in one session, p50 / p95.
+
+| Path | Engine, brain, N | Before | After |
+|---|---|---|---|
+| keyword arm, common single term (~10% of chunks), remote caller | Postgres 50k, N=10 per query | 127 / 973 ms (that query: 954 ms) | 127 / 204 ms (192 ms) |
+| same | Postgres 5k | 33 / 126 ms | 27 / 50 ms |
+| phrase, natural-language, rare-term and local keyword queries (guards) | Postgres 5k and 50k | | unchanged within noise, same plans |
+| `gbrain doctor --json`, cold | Postgres 50k, N=5 | 13,683 / 14,035 ms | 12,324 / 12,809 ms |
+| same | PGLite 50k, N=5 | 15,622 / 15,802 ms | 14,017 / 14,148 ms |
+| same | PGLite 5k, N=5 | 5,662 / 8,060 ms | 4,551 / 4,655 ms |
+| fence census pass on a 37k-page source | PGLite / Postgres 50k | 2,903 / 1,970 ms | 80 / 66 ms |
+| import of every source, statements per page, `--no-embed` | Postgres 5k, N=2 | 54.3 | 50.9 |
+| same | PGLite 5k, N=2 | 60.7 | 57.3 |
+
+Import wall time is flat (Postgres 180.5 → 177.0 s, PGLite 149.1 → 148.8 s); publication transactions dominate it, not the reads this wave batched. Fewer statements matter most on a networked database, where each one costs a round trip.
+
+### Itemized changes
+
+- **Keyword search for remote callers plans its match on its own** (`search/keyword-chunk-match.ts`, `PostgresEngine.searchKeyword`). For remote callers, the private-page filters add correlated subplans that inflate every join plan's cost. That put the cheap bitmap scan within the planner's 1% fuzz of a serial seq scan, and the seq scan won on startup cost. It then read every chunk's out-of-line `search_vector` (1.19M buffers, about 1.1 s for a common term at 250k chunks). For callers that set `excludePrivate`, the full-text match now runs in an `OFFSET 0` subquery. Local callers keep the unfenced join and its parallel plans. Rows, order and scores are identical, and ranking is untouched.
+  - **Why keyword queries can run twice:** both the keyword and the title arms run a strict AND query first. Only hybrid's recall arm, and only when the strict query returns nothing, re-runs with `term OR term`. The two runs have different parameters, so there is nothing to cache. The empty strict pass costs 2–3 ms at 50k.
+- **Doctor hot checks** (`brain-writer.ts`, `repair/timeline.ts`, `fence-repair/census.ts`, `git-visible-files.ts`, `sync-git.ts`):
+  - **frontmatter_integrity:** validates only the frontmatter head of a plainly shaped file, behind a scan option that only doctor passes. Any other shape gets the full parse. Write and import paths are unchanged.
+  - **timeline_history:** reads stored timeline rows once per 200-page batch instead of once per page.
+  - **Git verdict memo:** inside one `withGitListingCache` scope, the "not a git repository" verdict is remembered per directory. Any repository-changing `sync-git` command, or `invalidateGitListingCache()`, drops the scope's memo.
+- **Fix: the doctor fence census no longer skips pages across a DST fallback** (`fence-repair/census.ts`). Its incremental pass ordered by the text form of `updated_at`. In a non-UTC session that order could skip stored pages updated in the repeated hour, and it forced a full sort of the source's pages on every batch. The pass now orders by the timestamp, which also lets it use `idx_pages_updated_at_desc`.
+- **Import reads per group** (`persistence/import-reads.ts`, `persistence/group-publish.ts`, `persistence/import-mutations.ts`, `page-snapshot-batch.ts`, `engine-sql/pages.ts`). Design agreed with GBRA-58.
+  - **Duplicate checks:** an import group's duplicate checks run as one `findDuplicatePages` statement, with the same predicate and ranking as the single-page query.
+  - **Snapshot reads:** each member's first deleted-inclusive snapshot read, and the admission screen's snapshot reads for two or more new members, come from one batch. A lone member keeps its single read.
+  - **Config:** preparation config comes from one `getAllConfig` per group.
+  - **Path screen:** a group's preparation runs inside one path-screening scope. Validation, the apply-time read and the checks under the publication lock stay per page and are not memoized.
+  - **Fallback:** if a batch read fails, every member falls back to its own single read.
+- Tests:
+  - **Keyword ranking:** `search/keyword-arm-ranking.test.ts` and its Postgres twin pin ranked lists (slug, chunk_id, exact score, text hash) for 24 queries. They cover raw keyword search (local and remote), hybrid search, query and recall, against one golden recorded from base code. A ×1.0000001 score change or an order change fails it. The twin also pins the statement shape.
+  - **Doctor golden:** `doctor-hot-checks-golden.test.ts` and its Postgres twin pin the full `doctor --json` output. The fixture covers every frontmatter validation code, held and unsynced files, every fence tier, database-only timeline rows, a non-Git source and a second run after edits. The golden passes on base and branch.
+  - **Frontmatter head scan:** `brain-writer-frontmatter-scan-head.test.ts` checks it against the full parse over 48 hand cases and 10,000 generated documents.
+  - **Git memo:** `git-listing-memo.serial.test.ts` fails with invalidation disabled.
+  - **DST census:** the new case in `fence-census.test.ts` fails on base.
+  - **Import reads:** `import-reads.test.ts` and its Postgres arm check batch-versus-single parity, including soft-deleted pages, withdrawals, global purges and quoted ids. Normalized table hashes of a 5k import match base on both engines, with and without tombstones.
+  - **Crash robot:** 600 s on each engine, with PgBouncer and `pooler_disconnect` on Postgres.
+
+## [0.60.148.0] - 2026-10-10
+
+**The nightly E2E and Heavy Tests runs are green again.**
+
+Both failures came from this week's migrations meeting older tests, and gbrain itself behaves the same.
+
+- **E2E:** v225 drops `idx_chunks_embedding_null`, a duplicate of `content_chunks_stale_idx`. The invalid-index recovery test replays v66, which re-creates that index on a brain already at the latest version, and left it behind. The nightly shard runs files one after another on one database without replaying migrations, so `embed-stale-pagination`, several files later, found the duplicate. The recovery test now runs v225 again when it finishes, putting the schema back where the latest version leaves it.
+- **Heavy:** the Postgres upgrade test builds a pre-v0.18 brain by dropping `pages.source_id` from a current one. v230's trust-generation triggers depend on that column, so the drop failed. The fixture now drops those triggers first; the walk forward re-creates them when v230 runs again (checked: every trigger is back at the latest version).
+
+## To take advantage of v0.60.148.0
+
+`gbrain upgrade` installs the binary. There are no schema migrations.
+
+## [0.60.147.0] - 2026-10-10
+
+**A write that arrives while a brain folder with the Git durability hook is committing a backlog of Git effects now publishes after the group in flight, inside its 5 s wait. Before, it waited out the whole backlog and came back pending. On Postgres, a first sync of an already-imported source now issues 40 statements per unchanged file instead of 82.**
+
+Efficiency wave 9 (GBRA-75). Base is master at wave 8 (310371559). Measured on 4-vCPU AMD EPYC / 16 GiB machines with Bun 1.4.2 and synthetic brains, base and branch interleaved, p50 / p95.
+
+| Path | Engine, brain, N | Before | After |
+|---|---|---|---|
+| write submitted while 6 full Git groups (600 effects, 1 s per commit) are committing in a hooked folder | PGLite, N=6 | 6 of 6 still pending at the 5 s wait | 6 of 6 published (about 1.8 s) |
+| same | Postgres, N=1 | pending | published |
+| first sync of an already-imported 3,700-file source | Postgres 5k, N=3 | 22,859 / 23,139 ms | 21,227 / 21,989 ms |
+| statements per unchanged file in that sync | Postgres 5k | 82.2 | 40.3 |
+| `SET LOCAL statement_timeout` statements per sync | Postgres 5k | 51.8k | about 80 |
+| 1-page sync / no-change sync (guards) | Postgres 5k, N=10 | 1,426 / 737 ms | 1,450 / 751 ms |
+
+### Itemized changes
+
+- **Full Git groups yield to a queued write** (`persistence/effects.ts`). A Git group in a folder with the durability hook already stood aside, for at most 20 claims, when a publication was queued or running on its worktree. Groups of 100 never did, though, so under a backlog every group was full. A write's publication found the worktree lock held, was released as `writer_busy`, and missed every gap until the backlog ended. Every group now yields, in a single update with `publication_pending` (250 ms). The attempt cap still bounds the delay under a steady stream of writes. Effects stay in claim order per worktree, and no group spans a publication of its own worktree.
+- **A released claim no longer looks like a stalled preparation** (`persistence/journal.ts`). An uncharged release (`writer_busy`, `owner_unavailable`, `recovery_required`, capacity) now clears the claim phase. A row that waits on the worktree lock used to keep reading `preparing` / `waiting_on=unknown`. A charged `preparation_deadline` release keeps its phase, which kill accounting reads.
+- **One bounded-read session per waiver run** (`persistence/bounded-reads.ts` `withBoundedReadSession`, `sync-run.ts`, `sync-waivers.ts`, `postgres-engine.ts`). On Postgres, a waiver run's screens now share one reserved connection and one transaction. `SET LOCAL statement_timeout` is set again before any read whose bound differs by more than 25 ms, so every read keeps its server-side budget. Before, each bounded read had its own `BEGIN; SET LOCAL; read; COMMIT`. A failed read rolls back the transaction, and reads it aborted run again in a new transaction. A lost connection, a pool with no long-hold capacity, or PGLite all fall back to the per-read path. Session reads are prepared statements unless the pool is a transaction pooler.
+- Tests:
+  - `persistence-git-coalescing-5530.slow.test.ts` and its Postgres twin add two cases. A write behind six full groups, sent while one is committing, must publish within the wait with at most the in-flight group ahead of it; this fails on base on both engines. A write that finds the worktree locked is requeued as `writer_busy` with no claim phase.
+  - `persistence-bounded-read-session.test.ts` has 7 cases: sequencing, bound refresh, rollback and retry, joining a run's session, prepared reads, the PGLite and no-permit paths, a real lock wait that ends at its bound with nothing left running, and a re-sync. On the re-sync, base runs 101 bounded transactions for 8 files and the branch runs 16.
+  - `managed-sync-foreground-priority.test.ts` (Postgres arm) flake fixed. "a stream of writes from another process" now boots and connects its writer process before the drain starts. Before, the drain's lead depended on how fast a cold process started, so a slow runner could commit most groups before the first write. Forcing a 600 ms boot fails the old test 4 of 4 times and passes the new one 4 of 4.
+  - Crash robot: 600 s on each engine, every seam, with PgBouncer and `pooler_disconnect` on Postgres.
+
+## [0.60.146.0] - 2026-10-10
+
+**On PGLite at 50,000 pages, the vector index now builds (11 minutes, where it used to run out of memory) and vector search drops from 1.7 s to 27 ms. A 50,000-page import no longer leaves about 30,000 Git effects queued, so `gbrain serve`'s first call is 189 ms instead of 640 ms and the first write after it 266 ms instead of 758 ms. The first sync of an already-imported 3,700-file source takes 22 s instead of 96 s on Postgres and 28 s instead of 60 s on PGLite.**
+
+Efficiency wave 8 (GBRA-75). Base is master at wave 7 (97497f68e); the import, serve and first-write rows compare against master 1a3adfe99 with one fresh import per side and restored copies. Synthetic brains on 4-vCPU AMD EPYC / 16 GiB machines with Bun 1.4.2: 5k = 5,001 pages, 50k = 50,010 pages / 248,802 vector(1024) chunks. Base and branch were interleaved on the same machine and are shown as p50 / p95.
+
+| Path | Engine, brain, N | Before | After |
+|---|---|---|---|
+| first sync of an already-imported 3,700-file source | Postgres 5k, N=2 | 96,210 / 96,313 ms | 22,092 / 22,539 ms |
+| same | PGLite 5k, N=2 | 60,191 / 62,327 ms | 27,995 / 30,109 ms |
+| statements per skipped file in that sync | Postgres 5k | 172 | 82 |
+| 1-page sync / no-change sync (guards) | Postgres 5k, N=10 | 1,334 / 733 ms | 1,421 / 687 ms |
+| Git effects still open after `gbrain import` of every source | PGLite 50k, N=1 | 30,070 | 2 |
+| `gbrain import` of every source, wall | PGLite 50k, N=1 | 1,377 s | 1,380 s |
+| `gbrain serve` first call on a copy of the fresh import, cold | PGLite 50k, N=3 | 640 / 642 ms | 189 / 201 ms |
+| `gbrain serve` start to first answer, same runs | PGLite 50k, N=3 | 1,324 / 1,609 ms | 976 / 985 ms |
+| first fact write (`writeSingleFact`) on a copy of the fresh import, then 200 timed | PGLite 50k, N=3 | 758 / 782 ms, then 71 / 98 ms | 266 / 282 ms, then 53 / 75 ms |
+| Git effects finished in 60 s of `gbrain serve` on a backlogged brain | PGLite 50k, N=2 | 37,832 and 41,760 of 50,010 | 50,010 and 50,010 |
+| HNSW build of every vector index (`gbrain reindex --vectors`) | PGLite 50k | out of memory at 1 GB `maintenance_work_mem`; wedged after the index write at 1.5 GB | 663 s, chunk index 1.9 GB |
+| warm `searchVector`, limit 10 / limit 50 | PGLite 50k, N=20 ×2 | 1,716 / 1,768 and 1,713 / 1,761 ms (exact scan) | 27.5 / 32.4 and 52.0 / 58.0 ms |
+
+No first write threw `write_pending` on either side on this machine. On a Postgres 5k import, neither side leaves a backlog: 145/146 s on base, 160/149 s on the branch (N=2), with all 5,001 Git effects committed.
+
+### Itemized changes
+
+- **Batched sync waivers now cover imports** (`persistence/sync-prepare.ts`, `sync-waivers.ts`). A first sync already batched runs of unchanged entries, up to 64 per waiver transaction with one cursor write. In practice only deletes ever used it: each unchanged import's screen refused because the cursor did not yet name it, so every file fell back to its own pending save, second preparation and transaction. A waiver screen (`prepareManagedSyncMutation(..., { unsaved: true })`) now also accepts the run's own cursor with nothing pending. Every real publication still requires the cursor to name its request. Inside its lock, the waiver transaction re-reads the owner epoch (a change sends the run back to the per-entry path) and re-hashes each file (an edited file ends the waived prefix before it). The cursor and waived counts advance in the transaction that validates the prefix, so a crash resumes from the same cursor. Cursor checkpoint writes drop from 7.4k to 59.
+- **Git effects without the durability hook finish as a group** (`persistence/effects.ts`). In a folder without the hook, a single-file Git effect runs no git command and only records `durability_not_enabled`, but each one still took its own worktree lock, guard transaction and update. A coalesced group of up to 100 now takes each root's lock once, guards each source incarnation once, validates every path as before (escape, replaced file, db_only, read-only mirror) and records the plain outcomes in one update bound to each effect's claim token. A failed guard or path fails only the effects it covers.
+- **PGLite vector index builds fit** (`pglite-embedded-assets.ts`, `vector-index.ts` `withHnswBuildMemory`, `embedding-ann-build.ts`, `commands/reindex-vectors.ts`). pglite.wasm caps its heap at 2 GiB. PGLite runs no workers, but its default `max_parallel_maintenance_workers=2` still made pgvector reserve all of `maintenance_work_mem` up front. The build also WAL-logs the whole index (1.9 GB) in one statement, past the automatic checkpoint trigger (539 MB), and that checkpoint wedged inside the statement. PGLite now starts with `max_parallel_maintenance_workers=0` and `max_wal_size=8GB`; the between-statement guard still checkpoints at 256 MB. The deferred ANN build and `reindex --vectors` size `maintenance_work_mem` to the graph (rows × (vector + 640 B) × 1.1, floor 64 MB). Above a 1.5 GiB graph (about 308k 1024-dim chunks), they refuse before building with `pglite_vector_index_too_large`, a read-only `gbrain migrate --to postgres --plan --json` fix and a doctor verify. Postgres is unchanged.
+- Tests: `sync-waiver-run-imports.test.ts` covers twelve unchanged files waived in under 8 transactions (28 on base), an edit during the run, an owner change during the screens, and a crash with resume, on both engines. Two new cases in `persistence-git-coalescing-5530.slow.test.ts` and its Postgres twin: a 33-effect group writes one outcome update and at most 6 transactions (33 and 37 on base), and a mixed group (unsafe path, hand-edited file, replaced source incarnation) keeps every effect's own outcome, identical to base. `pglite-hnsw-build.test.ts` covers the start settings (2 and 1024 on base), the graph estimate, a real sized build that restores the setting, the refusal envelope with no build, and Postgres pass-through. The crash robot ran 600 s on each engine with every seam, PgBouncer and `pooler_disconnect` on Postgres, with 0 violations.
+
+## [0.60.145.0] - 2026-10-10
+
+**Bulk DB extraction no longer sees purged facts. `gbrain extract --source db` and the batched derived-link write read snapshots with `readPageSnapshotsBatch`, which never read `fact_purges`. A fence row purged for the page, or purged source-wide with a `'*'` tombstone, stayed in the batched body that links and timeline were extracted from, although `get_page` and every per-page read hid it. The batch now applies the same purges and `'*'` purge marker as `readPageSnapshot`, and under `GBRAIN_RLS_SCOPE_BINDING=1` it runs scoped to the batch's sources.**
+
+Efficiency follow-up (GBRA-67, from GBRA-69's report). Measured on the same 4-vCPU AMD EPYC / 16 GiB machine, Postgres 16 + pgvector 0.8.7, synthetic brains (5k = 5,001 pages, 50k = 50,010 pages), warm, 3 rounds x N=40 (get_page) or 2 rounds x N=25 (batches).
+
+| Path | Engine, brain | Before | After |
+|---|---|---|---|
+| get_page snapshot statement, mean | Postgres 5k | 0.52-0.67 ms (unguarded fingerprints) | 0.19-0.30 ms |
+| get_page snapshot statement, mean | Postgres 50k | 0.62-0.69 ms (unguarded fingerprints) | 0.15-0.20 ms |
+| get_page MCP call, p50 | Postgres 5k / 50k | 8.7-11.8 / 7.9-9.0 ms | 10.0-17.4 / 7.1-8.7 ms (within run-to-run noise) |
+| `readPageSnapshotsBatch`, 100 refs, p50 | Postgres 5k / 50k | 7.9-8.3 / 8.7 ms | 9.3-9.4 / 9.5-9.6 ms |
+
+The get_page rows measure the fingerprint guard that shipped in v0.60.141.0 (GBRA-75 wave 7), against master with only that guard reverted; this release does not change `snapshot.ts`. The statement saves 0.4-0.5 ms per read, which is smaller than the MCP call's run-to-run noise on synthetic bodies. The batch costs about 1 ms more per 100 pages for the two purge lookups it was missing.
+
+### Itemized changes
+
+- **Purge-correct batched snapshots** (`src/core/page-snapshot-batch.ts`). The batch statement now reads page-subject `fact_purges` rows and the source's `'*'` purge marker, resolves `'*'` tombstones per overlaid fence through `resolveGlobalPurges`, and computes line fingerprints under the same guard as `snapshot.ts`. `test/page-snapshot-batch.test.ts` and its Postgres arm pin batch == per-page read with both purge kinds; on master the batch returned the purged rows and no purge withdrawals.
+- **RLS-scoped batch read** (`engine.readPageSnapshotsBatch`). The batched read is now an engine member. Postgres runs it through `withScopedReadTransaction` with the refs' sources, so `replaceDerivedLinksBatch`, `extract --source db` and the timeline DB walk bind `app.scopes` under `GBRAIN_RLS_SCOPE_BINDING=1`. With the flag off it stays on the caller's lane (no new pool hold). The RLS inventory golden records `replaceDerivedLinksBatch` as scoped and 24 scoped call sites.
+
+## [0.60.144.0] - 2026-10-10
+
+**A managed import writes about 12% less WAL on Postgres (200 → 176 KB per page at 50,000 pages) and spends 3-13% less time executing SQL, with the same rows: each imported, synced or put page is sealed by one closing write instead of two, the import's crash checkpoint no longer stores the page text, and the write claim looks up its root's earlier rows by index.**
+
+Efficiency wave (GBRA-69). Base is master at wave 7 (f3155533e), measured on the same 4-vCPU AMD EPYC / 16 GiB machine, Bun 1.4.2, synthetic brains (5k = 5,003 pages, 50k = 50,030 pages / 265,861 chunks), cold `gbrain import` of every source with `--no-embed`, N=1.
+
+| Path | Engine, brain | Before | After |
+|---|---|---|---|
+| `gbrain import`, wall | Postgres 50k | 1,458 s (29.1 ms/page) | 1,427 s (28.5 ms/page) |
+| SQL execution time | Postgres 50k | 657 s | 635 s |
+| WAL written | Postgres 50k | 9.99 GB | 8.81 GB |
+| `gbrain import`, wall | Postgres 5k | 142.9 s | 133.5 s |
+| SQL execution time | Postgres 5k | 64.2 s | 55.6 s |
+| `gbrain import`, wall | PGLite 5k | 151.9 s | 141.9 s |
+
+### Itemized changes
+
+- **One closing page write** (`import-file.ts`, `page-state/projections.ts` `sealImportedPage`, `persistence/import-prepare.ts`, `sync-prepare.ts`, `page-prepare.ts`, `engine-sql/chunks.ts`). A coordinated import (managed import, managed sync and the lean `put_page` path) no longer stamps `chunker_version` with its chunk insert; its apply reports `chunkerSeal` and the caller stamps it in the same UPDATE as the text seal, after its one read-back. The chunker version is stamped whatever the page's revision, the text seal only at the revision read back, and the page id is checked against the page the transaction wrote, as before. Uncoordinated imports are unchanged.
+- **Content-free import checkpoints** (`persistence/import-mutations.ts`). The managed-import `op_checkpoints` row keeps the admission's request id and expectations but not the page content: its key binds the input hash, so a retry restores the content from the bytes it just read and refuses a checkpoint whose stored input hash or slug does not match. Checkpoints written by older binaries, which carry the content, still resume and clear. (Design agreed with GBRA-64.)
+- **Indexed claim root probe** (`persistence/journal.ts` `claimableWriteSql`). The "unfinished row ahead on the same root" anti-join matches a worktree root by `worktree_id` and a database-only root by `source_incarnation`, both covered by the pending indexes, instead of a COALESCE text key that walked every pending row once per candidate: 6.1 → 1.4 ms per claim with eight worktrees of queued rows; unchanged for a single source. The claimable rows and their order are identical. (Design agreed with GBRA-64.)
+- Tests: `claim-earlier-equivalence.test.ts` + its Postgres e2e (120 randomized request tables of worktree and database-only roots, every state, passable sync rows and lane groups claim exactly the former predicate's rows in the same order; a forced break of either probe fails it; the Postgres arm checks the index range scan), a checkpoint-resume case in `persistence-file-import.test.ts` (content-free checkpoint, legacy checkpoint with content), and `e2e/managed-import-crash.test.ts` (an import SIGKILLed after admission or at the closing write is published from the stored request on retry, same request id, page sealed, both engines).
+
+## [0.60.143.0] - 2026-10-10
+
+**The crash robot drops each run's database as soon as the run passes, so a transaction-mode pooler no longer holds every run's server connections until the budget ends. Harness only; no product behavior changes.**
+
+Master `f250a517c` failed the `Crash robot / postgres / Bun 1.4.0` cell with `FATAL: sorry, too many clients already` 25 runs into its 600 s budget. The robot gives every run its own database and, until now, kept all of them until the phase ended. Through the CI PgBouncer (wildcard `[databases]`, transaction mode) each run's database gets its own server pool, and PgBouncer keeps those connections for `server_idle_timeout` (600 s by default, the length of a full robot budget), so the server held about four idle backends per finished run: 111 server connections across 26 fixture databases in the failing cell against `max_connections=100`. The previous green masters ran the same cases with the same per-run counts and passed only because their slower early runs reached 22 cases before the budget closed; in the passing Bun 1.4.2 sibling, started at the same moment, PgBouncer's first `server idle timeout` closes came at 06:22:23, 46 s after the Bun 1.4.0 cell's first refusal at 06:21:37. Nothing in `#6412` (v0.60.142.0) changed how many connections a run opens.
+
+### Itemized changes
+
+- `scripts/persistence/robot-driver.ts`: a run that passes has its database dropped (`WITH (FORCE)`) before the next run starts, which ends the pooler's server connections to it. A failing run keeps its database for the retained-fixture metadata as before.
+- `scripts/persistence/validate.ts`, `scripts/persistence/failure-diagnostics.ts`: a failed Postgres gate records `connection_diagnostic` in the manifest: `max_connections`, the backend total and counts per database class (this harness's fixtures or other), state and wait class. No database name, query text or client address is included.
+- `test/e2e/persistence-robot-fixture-release.test.ts`: one replayed run through the pooler when `GBRAIN_PGBOUNCER_URL` names one (direct otherwise); the passed run's database must be gone with no backend attached (four idle pooler backends remained before the fix), and the connection diagnostic's shape is pinned.
+
+## [0.60.142.0] - 2026-10-10
+
+**A file write's publication takes its request-row lock and its `publication_started` stamp in one statement instead of two. No behavior changes; one UPDATE fewer per published file.**
+
+GBRA-69's import profile (50k pages, Postgres 16) counted about six UPDATEs of each `persistence_requests` row per write. One of them was the `publication_started=true` stamp the publication transaction issued right after a bare `SELECT … FOR UPDATE` of the same row. The stamp now rides on the row lock: a file publication locks its request with `UPDATE … SET publication_started=true … RETURNING *`, which takes the same lock, in the same transaction, with the same visibility (the stamp still lives and dies with that transaction, as `control.ts` relies on), and the claim-token and state checks run on the returned row exactly as before. Database-only writes keep the bare `FOR UPDATE`; they never stamped.
+
+### Itemized changes
+
+- `src/core/persistence/coordinator.ts` (`publishMutation`): the request-row lock of a file publication is the stamping UPDATE; the separate stamp statement before `before_publication` is gone.
+- `scripts/persistence/lock-order.ts`: the crash robot's lock-order tracer recognises the stamping UPDATE as the publication's exclusive request-row lock (it previously keyed publications on the bare `FOR UPDATE`), and reports `publication_row_lock_statements_max`.
+- Tests: `test/persistence-crash-robot.test.ts` asserts one request-row lock statement per publication (two on the previous code). Statement budget (`test/e2e/persistence-statement-budget.test.ts`) measures publication at 42 statements on Postgres, under its 50 budget.
+
+## [0.60.141.0] - 2026-10-10
+
+**Re-importing and syncing unchanged files is 2.4x faster, `gbrain extract` finishes on a 50,000-page PGLite brain (114 s instead of hanging), a PGLite `serve` with a git backlog answers its first tool call in 0.6 s instead of 4.3 s, and a Postgres brain that lost its planner statistics gets them back instead of taking a minute per search.**
+
+Efficiency wave 7. Every number below is interleaved base vs this branch on the same 4-vCPU AMD EPYC / 16 GiB machine, Bun 1.4.2, synthetic brains (5k = 5,001 pages / 25,331 chunks, 50k = 50,010 / 248,802), cold processes, p50 / p95.
+
+| Path | Engine, brain | Before | After | N |
+|---|---|---|---|---|
+| unchanged re-import, 3,700 files | Postgres 5k | 35,310 / 36,281 ms | 14,268 / 15,552 ms | 3 |
+| unchanged re-import, 3,700 files | PGLite 5k | 19,278 / 20,138 ms | 8,111 / 8,254 ms | 3 |
+| first sync of an already-imported 3,700-file source | Postgres 5k | 119,230 / 137,457 ms | 87,227 / 88,866 ms | 2 |
+| first sync of an already-imported 3,700-file source | PGLite 5k | 84,242 / 91,485 ms | 63,996 / 65,691 ms | 2 |
+| `extract links --source db` from empty links | PGLite 50k | 1,485 s (3.5 → 59.9 ms/page) | 103 s in `extract all` (1.2-1.8 ms/page, flat) | 1 |
+| `extract all` watermark stamp | PGLite 50k | wedges at ~528 MB WAL | completes | 1 |
+| `serve` first tool call after a 50k import (29.8k queued git effects) | PGLite 50k | 4,340 / 4,596 ms | 630 / 726 ms | 10 |
+| git effects drained in 60 s of `serve` | PGLite 50k | 12.7k-14.0k | 20.0k-21.8k | 2 |
+| warm search with planner statistics deleted | Postgres 5k | 55,975 / 61,535 ms | 582 / 1,768 ms (564 after the first call) | 6 / 21 |
+
+### Itemized changes
+
+- **Skipped files cost less** (`persistence/import-mutations.ts`, `import-prepare.ts`, `noop-kernel.ts`, `sync-run.ts`, `sync-waivers.ts`, new `screening-paths.ts`, `shared-skills/knowledge-guard.ts`, `page-state/snapshot.ts`, `persistence/identity.ts`). A file the hash screen proves unchanged takes one page-snapshot read and no admission: the screen hands its snapshot to the preparer, which drops the duplicate path check and re-read, and the no-op kernel reports `revision_moved` when the page moved since. Other sources' realpath roots, the skillpack roots and the source Git scope are resolved once per screening batch (never across batches, never a thrown result), cutting openat/access/readlink syscalls 1.58M → 466k per re-import. `readPageSnapshot` computes its withdrawal fingerprints only when the page has withdrawals or `*` purges. `localHostId()` caches the validated `host.json` keyed by path, dev, inode, mtime, ctime and size (a file modified in the last 2 s is read, not cached), so a replaced or edited identity and a changed home still read fresh.
+- **PGLite extract at scale** (`pglite-engine.ts`, `pglite-engine/checkpoint-guard.ts`, `commands/extract.ts`). Autocommit writes through the engine's SQL helpers (`markPagesExtractedBatch` and the rest of `engineSql`) pass the same WAL checkpoint guard as `executeRaw`; before, the stamp loop reached PGLite's automatic checkpoint inside a write and spun forever. The `extract --source db` links walk refreshes planner statistics through `plannerStatsForLinkDrain` at each snapshot batch, so `links` is analyzed while it grows instead of planning every page against zero rows. The same 147,969 links come out (identical md5 of the ordered link set); Postgres is unchanged within noise (91.6 vs 92.8 s).
+- **Git effect claims** (`persistence/effect-journal.ts`, `worktree-refresh-schema.ts`). `claimCoalescedGitEffects` checks the worktree-wide conditions (owner, refresh fence, effect and request recovery blocks) once as an InitPlan and walks `persistence_effects_pending` in order to its limit: 351 → 25 ms per claim with 22k ready effects. PGLite runs each claim synchronously on the main thread, so the old claim also starved the serve boot behind it.
+- **Missing planner statistics on Postgres** (`search/projection-statistics.ts`, `postgres-engine.ts`, doctor `planner_stats_stale`, repair `planner-stats`). `missingSearchStatistics` is the one test for absent search statistics (the six `pages` and three `content_chunks` columns plus the projection statistics); the wave-6 write-pass skip, a once-per-process background guard on the first search outside a transaction (never awaited by the search), doctor and repair all use it. The flip comes from the `pages` statistics: without them the adjacency count runs pages × pages.
+- The write gate no longer flags an assistant's ordinary replies in saved chat transcripts ("As an AI language model, I don't…, but I can…") as instructions to an agent; planted instructions are still caught. (GBRA-58)
+- Importing or saving a page no longer slows down on a brain with many purged facts; gbrain looks up only the purges that match the page's own fact rows (12k tombstones: PGLite import 159 → 57 ms, Postgres 161 → 50 ms). Migration v231 adds two `fact_purges` indexes. (GBRA-58)
+- `test/e2e/persistence-idle-pool.test.ts` awaits the drain, dumps `pg_stat_activity` on failure and holds past one probe cycle. (GBRA-64)
+- Tests: `persistence-skip-cost.test.ts`, `persistence-host-identity-cache.test.ts`, `pglite-checkpoint-guard.test.ts` (with a WAL worker fixture), `extract-links-db-planner-stats.test.ts`, `search-statistics-guard.test.ts` + its Postgres e2e, `purge-global-marker.test.ts`, and a reference-predicate equivalence case in `persistence-git-coalescing-5530.slow.test.ts` (every fence, recovery, mirror, owner and readiness state claims exactly the old predicate's rows, both engines).
+
+## [0.60.140.0] - 2026-10-10
+
+**CI only: unit shard 7 no longer loses its tail to a Bun runtime defect, and a red shard that does names the defect instead of blaming the tests. Nothing in gbrain itself changes.**
+
+Three runs out of three of the `Test` workflow's shard 7 at the current file composition (d4dc2d4d8 twice, c12e14adf once) went bad about ten minutes in, inside `test/persistence-git-publication.test.ts`: a `git` run through `Bun.spawnSync` spun until the test deadline printed `killed 1 dangling process`, and from then on every synchronous child spawn in the process (`spawnSync`, `execSync`, `execFileSync`) in unrelated files timed out with empty output while asynchronous spawns and in-process tests kept passing. That is oven-sh/bun#34069 in Bun 1.4.0 and 1.4.2: a GC finalizer that runs while `Bun.spawnSync` waits leaves the runtime's private spawnSync loop with a drifted poll count for the life of the process. Bun fixed it upstream on 2026-10-05 (oven-sh/bun#44581, commit 13a98b0); no release carries it yet. The release gate refused v0.60.139.0 on it.
+
+### Itemized changes
+
+- `test/helpers/git-publication.ts`: `gitAsync` and `gitFixtureAsync` run git through `Bun.spawn` on the main loop; `test/persistence-git-publication.test.ts` uses them for every call, so the shard's densest run of `spawnSync` windows is gone. The synchronous `git` stays for callers that cannot await, and both now throw on any exit that is not 0: a null exit code (signal, or a `spawnSync` that returned without a status) used to pass as success and return `''`, which turned the poisoned run into a bogus fixture and a `durability_not_enabled` assertion two lines later. Both spawns pass the live `process.env`, so a test's `PATH` or `GIT_*` override reaches the child.
+- `scripts/capture-test-log.ts`: a red shard whose log shows `killed N dangling process` followed by nothing but timeouts, at least three of them in at least two files, is named `bun_spawnsync_poisoned` in the job's step summary and on stderr, with the Bun version, the upstream issue and fix, and "rerun the job". A signal only; nothing is resumed or retried. One hung test with a dangling child, timeouts with no killed child, timeouts confined to one file, or any non-timeout failure after the kill are left for their own diagnosis.
+- `TODOS.md`: bump Bun when a release carries 13a98b0; check the compare, not the version number.
+- Tests: `test/git-publication-helper.test.ts` (a git that ends by signal throws from both helpers with the command and the status; a non-zero exit carries git's stderr; the signal case returned `''` on the previous helper), `test/scripts/capture-test-log.test.ts` (the signature is named; the four look-alike shapes are not). The detector names both real shard-7 logs and not the same shard's unrelated recall-budget failure.
+
 ## [0.60.139.0] - 2026-10-09
 
 **Your agent can now tell your own notes from something a web page told it. Everything it reads back from memory says where it came from, text that reads like instructions to an agent is flagged when it is saved, and you can remove a fact you saved by mistake with a receipt that says exactly what was removed and what was out of reach.**

@@ -51,7 +51,7 @@ import { collectWantedLinks, isWantedPagesEnabled } from '../core/wanted-links.t
 import { readLineGrammarSettings, statedRelationTypes } from '../core/line-grammar.ts';
 import { effectiveLinkExtractorWatermark, linkExtractorWatermarkFor } from '../core/link-extraction-watermark.ts';
 import { replaceDerivedLinksBatchOrReplay, replaceDerivedLinksUnlessSettingsChanged, settingsChangedSkipLine, type DerivedLinkBatchItem } from '../core/derived-links.ts';
-import { pageSnapshotKey, readPageSnapshotsBatch } from '../core/page-snapshot-batch.ts';
+import { pageSnapshotKey } from '../core/page-snapshot-batch.ts';
 import type { PageSnapshot } from '../core/page-state/types.ts';
 export { reconcileSourceLinks, type SourceLinkReconciliationResult } from '../core/link-reconciliation.ts';
 export { extractMarkdownLinks } from '../core/link-extraction.ts';
@@ -1889,6 +1889,7 @@ async function extractLinksFromDB(
   const grammar = await readLineGrammarSettings(engine), lineGrammar = { enabled: grammar.enabled, allowUndeclaredTypes: grammar.allowUndeclaredTypes };
   let skippedSettingsChanged = 0;
   progress.start('extract.links_db', walkRefs.length);
+  const plannerTick = dryRun ? async () => {} : await plannerStatsForLinkDrain(engine, async () => walkRefs.length);
 
   // Dedup in dry-run only — DB enforces uniqueness via ON CONFLICT in batch writes.
   const dryRunSeen = dryRun ? new Set<string>() : null;
@@ -1914,7 +1915,8 @@ async function extractLinksFromDB(
   for (const [index, { slug, source_id }] of walkRefs.entries()) {
     if (index >= snapshotBatch.start + snapshotBatch.covered) {
       await flushLinkWrites();
-      snapshotBatch = { start: index, ...await readPageSnapshotsBatch(engine, walkRefs.slice(index, index + BATCH_SIZE)
+      await plannerTick(index);
+      snapshotBatch = { start: index, ...await engine.readPageSnapshotsBatch(walkRefs.slice(index, index + BATCH_SIZE)
         .map(ref => ({ slug: ref.slug, sourceId: ref.source_id }))) };
       wantedPages = !dryRun && await isWantedPagesEnabled(engine);
     }

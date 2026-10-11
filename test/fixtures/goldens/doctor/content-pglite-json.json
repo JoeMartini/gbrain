@@ -192,6 +192,11 @@
               "session_end": "extract",
               "writeback": "retire"
             },
+            "corpus_source_holds": {
+              "legacy_unstamped": 0,
+              "sessions": 0,
+              "unresolved": 0
+            },
             "counters_note": "local, append-only, loss-tolerant observability over the last 7d — never a source of truth",
             "cross_lane_duplicates_7d": 0,
             "instruction_visibility": "world",
@@ -882,6 +887,19 @@
           },
           "message": "No write request has held its claim longer than persistence.max_claim_ms (600000 ms).",
           "name": "persistence_write_stall",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "compacted_unreplayable": 0,
+            "count": 0,
+            "docs": "docs/guides/repair.md#failed-writes",
+            "repair": "failed-writes",
+            "writes": []
+          },
+          "message": "Every caller write with a retained receipt committed or was superseded.",
+          "name": "lost_caller_writes",
           "status": "ok"
         },
         {
@@ -1868,6 +1886,7 @@
             ],
             "engine": "pglite",
             "fix": "gbrain repair planner-stats --apply",
+            "missing_search_statistics": [],
             "stale": []
           },
           "message": "Planner statistics are fresh on 6 hot tables.",
@@ -2070,6 +2089,17 @@
           },
           "message": "This process's host identity (<home>/.gbrain/persistence/host.json) owns every binding this filesystem holds.",
           "name": "host_identity_mismatch",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
+            "code": "held_failed",
+            "held": 0,
+            "items": []
+          },
+          "message": "No managed atom page or transcript is held after repeated extraction failures.",
+          "name": "extract_atoms_held_failed",
           "status": "ok"
         },
         {
@@ -2476,7 +2506,7 @@
         },
         {
           "category": "meta",
-          "message": "3 distinct typed values (pack declares 20)",
+          "message": "3 distinct typed values (pack gbrain-base-v2 declares 20)",
           "name": "type_proliferation",
           "status": "ok"
         },

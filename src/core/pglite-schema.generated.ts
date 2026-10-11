@@ -186,6 +186,15 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
 CREATE INDEX IF NOT EXISTS content_chunks_stale_idx
   ON content_chunks(page_id, chunk_index) WHERE embedding IS NULL;
 
+-- #6370: indexing and the title query read text through gbrain_fts_input(),
+-- which splits CJK/ASCII-alnum boundaries (a no-op on text without CJK).
+CREATE OR REPLACE FUNCTION gbrain_fts_input(t text) RETURNS text
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE SET search_path = pg_catalog
+AS \$fn\$
+  SELECT regexp_replace(regexp_replace(t, '([一-鿿぀-ゟ゠-ヿ가-힯])([A-Za-z0-9])', '\\1 \\2', 'g'), '([A-Za-z0-9])([一-鿿぀-ゟ゠-ヿ가-힯])', '\\1 \\2', 'g')
+\$fn\$;
+
+
 CREATE TABLE IF NOT EXISTS links (
   id             SERIAL PRIMARY KEY,
   from_page_id   INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
@@ -631,9 +640,9 @@ BEGIN
   WHERE page_id = NEW.id;
 
   NEW.search_vector :=
-    setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
-    setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
-    setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.title, ''))), 'A') ||
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(NEW.timeline, ''))), 'C') ||
+    setweight(to_tsvector('english', gbrain_fts_input(coalesce(timeline_text, ''))), 'C');
 
   RETURN NEW;
 END;
@@ -2162,6 +2171,9 @@ DO \$rls\$ BEGIN
     ALTER TABLE needs_rederive ENABLE ROW LEVEL SECURITY;
   END IF;
 END \$rls\$;
+
+CREATE INDEX IF NOT EXISTS fact_purges_subject_idx ON fact_purges (source_id, subject, fact_hash) INCLUDE (visibility, purged_at);
+CREATE INDEX IF NOT EXISTS fact_purges_all_subjects_idx ON fact_purges (source_id, purged_at) WHERE subject = '*';
 
 -- #5575 blocking write gate: verdict receipts and held facts/takes.
 CREATE TABLE IF NOT EXISTS write_gate_receipts (
