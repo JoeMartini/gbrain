@@ -18,6 +18,7 @@ import { reservedTransactions, type ReservedTransactions } from './postgres-engi
 import { traceSqlOptions } from './sql-trace.ts';
 import { hasPostgresCancellationCapability, postgresCancellationUnavailable, reserveWithCancellation } from './postgres-engine/cancellation.ts';
 import { runBoundedStatement } from './postgres-engine/bounded-statement.ts';
+import { schemaDiagnosticConnection, withSchemaLockTimeout } from './postgres-engine/schema-lock-timeout.ts';
 export { hasPostgresCancellationCapability } from './postgres-engine/cancellation.ts';
 import type {
   BrainEngine,
@@ -125,6 +126,7 @@ import * as takesImpl from './engine-sql/takes.ts';
 import * as codeEdgesImpl from './engine-sql/code-edges.ts';
 import * as salienceImpl from './engine-sql/salience.ts';
 import * as healthImpl from './engine-sql/health.ts';
+import { resolveEntityTypes } from './schema-pack/entity-types.ts';
 import * as pagesImpl from './engine-sql/pages.ts';
 import * as tagsImpl from './engine-sql/tags.ts';
 import * as linksImpl from './engine-sql/links.ts';
@@ -132,10 +134,12 @@ import * as timelineImpl from './engine-sql/timeline.ts';
 import * as sourcesImpl from './engine-sql/sources.ts';
 import * as filesImpl from './engine-sql/files.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
+import type { KeywordPageWindow } from './search/keyword-statement.ts';
 import * as chunksImpl from './engine-sql/chunks.ts';
 import { hasCJK } from './cjk.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './engine-sql/cjk-search.ts';
 import * as titlesImpl from './engine-sql/titles.ts';
+import * as keywordPagesImpl from './engine-sql/keyword-pages.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
 import { postgresExecutor, type RunUnsafeOpts } from './engine-sql/dialect-postgres.ts';
 
@@ -570,7 +574,7 @@ export class PostgresEngine implements BrainEngine {
         // transaction pooler. Codex P1 finding from v0.36 dreamy-thompson wave.
         await this.applyForwardReferenceBootstrap(conn);
 
-        await conn.unsafe(sqlText);
+        await withSchemaLockTimeout(conn, () => conn.unsafe(sqlText), { step: 'replay', diagnostic: schemaDiagnosticConnection(this._savedConfig?.database_url) }); // #5227: bounded wait, typed schema_lock_blocked
 
         // Run any pending migrations automatically
         const { applied } = await (await import('./migrate.ts')).runMigrations(this); // engine-dynamic-import-ok: initSchema only, keeps the ~220 migration modules off every connect
@@ -728,7 +732,7 @@ export class PostgresEngine implements BrainEngine {
   /** #5801: observe connection acquisition (see CheckoutGauge.onCheckout). Duck-typed like getPoolDiagnostics. */
   onCheckout(listener: () => void): () => void { return this.checkoutGauge.onCheckout(listener); }
 
-  getPoolDiagnostics(): { tracked: PoolGaugeSnapshot; poolMax: number | null; poisonedDiscards: number; stuckDiscards: number; buildFailures: number; pool: DriverPoolStats | null; prepare: boolean | null } | null {
+  getPoolDiagnostics(): { tracked: PoolGaugeSnapshot; poolMax: number | null; poisonedDiscards: number; stuckDiscards: number; buildFailures: number; desyncDiscards: number; pool: DriverPoolStats | null; prepare: boolean | null } | null {
     try {
       const max = (this.sql as unknown as { options?: { max?: number } }).options?.max;
       return {
@@ -737,6 +741,7 @@ export class PostgresEngine implements BrainEngine {
         poisonedDiscards: this.poisonedDiscards?.count ?? 0,
         stuckDiscards: this.poolIncidents?.stuckCount ?? 0,
         buildFailures: this.poolIncidents?.buildFailureCount ?? 0,
+        desyncDiscards: this.poolIncidents?.desyncCount ?? 0,
         pool: driverPoolStats(this.sql),
         prepare: (this.sql as unknown as { options?: { prepare?: boolean } }).options?.prepare ?? null,
       };
@@ -1071,6 +1076,7 @@ export class PostgresEngine implements BrainEngine {
     // FTS config name (e.g. 'english', 'pt_br'). Validated by getFtsLanguage()
     // — safe to interpolate into raw SQL.
     const ftsLang = getFtsLanguage();
+    const rankParam = opts?.rankQuery ? `$${params.push(opts.rankQuery)}` : '$1';
 
     const chunk = buildKeywordChunkMatch(ftsLang, opts?.excludePrivate);
     const rawQuery = `
@@ -1083,7 +1089,7 @@ export class PostgresEngine implements BrainEngine {
           CASE WHEN NULLIF(regexp_replace(p.frontmatter->>'message_id', '^[[:space:]]+|[[:space:]]+$', '', 'g'), '') IS NOT NULL
             THEN NULLIF(p.frontmatter->>'subject', '') END AS source_subject,
           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-          ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score
+          ts_rank(cc.search_vector, websearch_to_tsquery('${ftsLang}', ${rankParam})) * ${sourceFactorCase} AS score
         FROM ${chunk.from}
         JOIN pages p ON p.id = cc.page_id
         JOIN sources s ON s.id = p.source_id
@@ -1161,6 +1167,14 @@ export class PostgresEngine implements BrainEngine {
    * predicate). Each attempt (strict, then OR fallback) runs in its own
    * scoped read transaction with an 8s statement timeout.
    */
+  /** Cat 40 Hard F2 strict keyword count and keyword-mode pages; SQL in engine-sql/keyword-pages.ts. */
+  async countKeywordPages(query: string, opts?: SearchOpts & { timeoutMs?: number }): Promise<number> {
+    return keywordPagesImpl.countKeywordPages((read) => this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx => read(scopedRead(this.engineSqlOn(tx))), { alwaysTransaction: true, jitOff: true }), query, opts, { statementTimeout: '8s', timeoutMs: opts?.timeoutMs });
+  }
+  async searchKeywordPages(query: string, opts: SearchOpts | undefined, page: KeywordPageWindow): Promise<SearchResult[]> {
+    return keywordPagesImpl.searchKeywordPages((read) => this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx => read(scopedRead(this.engineSqlOn(tx))), { alwaysTransaction: true, jitOff: true }), query, opts, page, { statementTimeout: '8s' });
+  }
+
   async searchTitles(query: string, opts?: SearchOpts): Promise<SearchResult[]> {
     return titlesImpl.searchTitles(
       (read) => this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx => read(scopedRead(this.engineSqlOn(tx))), { alwaysTransaction: true, jitOff: true }),
@@ -2232,7 +2246,7 @@ export class PostgresEngine implements BrainEngine {
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: import('./engine.ts').FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: import('./engine.ts').FactAttribution | null },
   ): Promise<FactRow[]> {
     return factsImpl.findCandidateDuplicates(unscopedExecutor(this.engineSql, 'facts: unscoped on master (EO4 inventory)'), source_id, entitySlug, factText, opts);
   }
@@ -2476,6 +2490,7 @@ export class PostgresEngine implements BrainEngine {
       embeddingColumn: async () => (await resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })).name,
       countStalePagesForExtraction: (o) => this.countStalePagesForExtraction(o),
       getConfig: (key) => this.getConfig(key),
+      entityTypes: (scope) => resolveEntityTypes(this, scope),
     });
   }
 

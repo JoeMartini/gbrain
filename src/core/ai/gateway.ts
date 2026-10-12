@@ -62,7 +62,7 @@ import type { BrainEngine } from '../engine.ts';
 import { dimsProviderOptions } from './dims.ts';
 import { hasAnthropicKey, stashGatewayAnthropicKeyFromEnv } from './anthropic-key.ts';
 import { AIConfigError, AITransientError, isStructuredOutputRejection, isUnbilledEmbeddingRejection, normalizeAIError } from './errors.ts';
-import { isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
+import { fitMatryoshkaPrefix, isEmbeddingZeroNormError, screenAlignedEmbeddings, screenEmbeddings, sendableEmbeddingInputs } from './embedding-guard.ts';
 import { getProviderCapabilities } from './capabilities.ts';
 import { runGuardrails, hasGuardrails, type GuardrailHook } from '../guardrails.ts';
 import { loadConfig } from '../config.ts';
@@ -413,20 +413,26 @@ export function applyOpenAICompatConfig(
  *
  * Returns undefined when the env provides no base URL, so the SDK's own default
  * (which already includes `/v1`) is preserved untouched — the happy path is not
- * altered. Google is intentionally NOT handled here: its native suffix is
- * unproven (Gemini's OpenAI-compat route is `/v1beta/openai`), so it's deferred
- * to a follow-up rather than risk a regression on a wrong assumption.
+ * altered.
+ *
+ * Google (`GOOGLE_GENERATIVE_AI_BASE_URL`, used by native-google chat,
+ * expansion and embedding): the SDK's default root is
+ * `https://generativelanguage.googleapis.com/v1beta` and it appends
+ * `/models/<id>:<method>`, so a URL with no version segment gets `/v1beta`
+ * (a pass-through proxy then forwards the real path); a URL that already
+ * names a version (`/v1`, `/v1beta`, `/v1alpha`) is kept as written.
  *
  * @internal exported for tests.
  */
 export function resolveNativeBaseUrl(
-  provider: 'anthropic' | 'openai',
+  provider: 'anthropic' | 'openai' | 'google',
   cfg: AIGatewayConfig,
 ): string | undefined {
-  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : 'OPENAI_BASE_URL';
+  const envKey = provider === 'anthropic' ? 'ANTHROPIC_BASE_URL' : provider === 'openai' ? 'OPENAI_BASE_URL' : 'GOOGLE_GENERATIVE_AI_BASE_URL';
   const raw = cfg.env[envKey];
   if (!raw || !raw.trim()) return undefined;
   const trimmed = raw.trim().replace(/\/+$/, '');
+  if (provider === 'google') return /\/v\d+[a-z]*$/i.test(trimmed) ? trimmed : `${trimmed}/v1beta`;
   return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
@@ -1435,7 +1441,8 @@ function instantiateEmbedding(recipe: Recipe, modelId: string, cfg: AIGatewayCon
         `Google embedding requires GOOGLE_GENERATIVE_AI_API_KEY.`,
         recipe.setup_hint,
       );
-      const client = createGoogleGenerativeAI({ apiKey });
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      const client = createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
       return (client as any).textEmbeddingModel
         ? (client as any).textEmbeddingModel(modelId)
         : (client as any).embedding(modelId);
@@ -1765,17 +1772,17 @@ async function embedSubBatch(
       );
     }
 
-    for (const embedding of result.embeddings) {
+    const embeddings: number[][] = result.embeddings.map((e: number[]) => fitMatryoshkaPrefix(recipe, modelId, e, expectedDims)); // PR #5921
+    for (const embedding of embeddings) {
       if (Array.isArray(embedding) && embedding.length !== expectedDims) {
-        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`,
-          { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
+        throw embeddingDimMismatchError(modelId, embedding.length, expectedDims, `gbrain migrate --embedding-model ${getEmbeddingModel()} --embedding-dimensions ${embedding.length}`, { provider: recipe.id, baseUrl: _config?.base_urls?.[recipe.id], defaultBaseUrl: recipe.base_url_default });
       }
     }
 
     recordSubBatchSuccess(recipe);
     const usageTokens = (result as { usage?: { tokens?: unknown } }).usage?.tokens;
     return {
-      embeddings: result.embeddings.map((e: number[]) => new Float32Array(e)),
+      embeddings: embeddings.map((e: number[]) => new Float32Array(e)),
       reportedTokens: typeof usageTokens === 'number' && Number.isFinite(usageTokens) && usageTokens > 0
         ? usageTokens
         : null,
@@ -1862,6 +1869,37 @@ export async function embedMultimodal(
   opts: EmbedMultimodalOpts = {},
 ): Promise<Float32Array[]> {
   if (!inputs || inputs.length === 0) return [];
+  // Fix wave 13 P1.18: reserve on the ambient tracker before any provider call,
+  // as embed() does. An image is reserved at the provider's per-input maximum
+  // (MULTIMODAL_IMAGE_TOKEN_CEILING) and settled at the provider's reported
+  // tokens when it reports them, so a cap is never crossed by an estimate.
+  const tracker = __budgetStore.getStore() ?? null;
+  if (!tracker) return embedMultimodalUnmetered(inputs, opts);
+  const modelStr = requireConfig().embedding_multimodal_model ?? getEmbeddingModel();
+  const { parsed, recipe } = resolveRecipe(modelStr);
+  const mmModelId = `${recipe.id}:${parsed.modelId}`;
+  const charsPerToken = Math.max(recipe.touchpoints.embedding?.chars_per_token ?? DEFAULT_CHARS_PER_TOKEN, 1);
+  const estimatedInputTokens = inputs.reduce((n, input) => n + (input.kind === 'text' ? Math.ceil(input.text.length / charsPerToken) : MULTIMODAL_IMAGE_TOKEN_CEILING), 0);
+  const reservation = tracker.reserve({ modelId: mmModelId, estimatedInputTokens, maxOutputTokens: 0, kind: 'embed', label: 'gateway.multimodal' });
+  const usage: { tokens: number | null } = { tokens: 0 };
+  try {
+    const out = await embedMultimodalUnmetered(inputs, opts, usage);
+    recordOnTracker(tracker, { modelId: mmModelId, reservation, requestedModelId: modelStr, kind: 'embed', label: 'gateway.multimodal',
+      inputTokens: usage.tokens || estimatedInputTokens, outputTokens: 0, estimated: !usage.tokens });
+    return out;
+  } catch (err) {
+    if (err instanceof AIConfigError) tracker.release(reservation);
+    else recordOnTracker(tracker, { modelId: mmModelId, reservation, requestedModelId: modelStr, kind: 'embed', label: 'gateway.multimodal.failed',
+      inputTokens: estimatedInputTokens, outputTokens: 0, failed: true, estimated: true });
+    throw err;
+  }
+}
+
+async function embedMultimodalUnmetered(
+  inputs: MultimodalInput[],
+  opts: EmbedMultimodalOpts,
+  usage: { tokens: number | null } = { tokens: null },
+): Promise<Float32Array[]> {
 
   const cfg = requireConfig();
   // Prefer embedding_multimodal_model when set, so brains using OpenAI for
@@ -1898,6 +1936,7 @@ export async function embedMultimodal(
     return embedMultimodalSiliconflow(inputs, recipe, parsed.modelId, cfg, opts);
   }
   if (recipe.id !== 'voyage' && recipe.implementation === 'openai-compatible') {
+    usage.tokens = null;
     return embedMultimodalOpenAICompat(inputs, recipe, parsed.modelId, cfg, opts);
   }
   if (recipe.id !== 'voyage') {
@@ -1990,9 +2029,9 @@ export async function embedMultimodal(
       );
     }
 
-    let parsedBody: { data?: Array<{ embedding: number[] }> };
+    let parsedBody: { data?: Array<{ embedding: number[] }>; usage?: { total_tokens?: unknown } };
     try {
-      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }> };
+      parsedBody = (await res.json()) as { data?: Array<{ embedding: number[] }>; usage?: { total_tokens?: unknown } };
     } catch (err) {
       throw new AITransientError(
         `Voyage multimodal returned malformed JSON: ${err instanceof Error ? err.message : String(err)}.`,
@@ -2014,6 +2053,8 @@ export async function embedMultimodal(
       }
       allEmbeddings.push(new Float32Array(row.embedding));
     }
+    const reported = parsedBody.usage?.total_tokens;
+    usage.tokens = usage.tokens !== null && typeof reported === 'number' && reported > 0 ? usage.tokens + reported : null;
   }
 
   return screenAlignedEmbeddings(allEmbeddings, `${recipe.id}:${parsed.modelId}`);
@@ -2430,7 +2471,8 @@ function instantiateExpansion(recipe: Recipe, modelId: string, cfg: AIGatewayCon
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google expansion requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -2486,6 +2528,14 @@ export function parseExpansionResponse(text: string): string[] | null {
 // by the image token cost, NOT its base64 length (bytes are not tokens).
 const EXPANSION_FAILED_PESSIMISTIC_OUTPUT_TOKENS = 512;
 const OCR_IMAGE_INPUT_TOKEN_ESTIMATE = 1600;
+/** Fix wave 13 P1.18: OCR's explicit output bound, the same number its tracker reservation holds. */
+const OCR_MAX_OUTPUT_TOKENS = 4096;
+/**
+ * Fix wave 13 P1.18: the tokens one image input can cost a multimodal embedding
+ * provider at most, reserved before the call (Voyage: 16M pixels at 560 pixels
+ * per token). The provider's reported usage settles it when present.
+ */
+const MULTIMODAL_IMAGE_TOKEN_CEILING = Math.ceil(16_000_000 / 560);
 
 /**
  * #4121 — the v6/legacy AI-SDK usage shapes (`inputTokens|promptTokens`,
@@ -2746,12 +2796,15 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
   const estimatedOcrInputTokens =
     estimateChatInputTokens({ system: systemPrompt, messages: [{ content: 'Extract visible text only.' }] }) +
     OCR_IMAGE_INPUT_TOKEN_ESTIMATE;
+  // Fix wave 13 P1.18: reserve before the call with the explicit output bound the call is sent with.
+  const reservation = tracker?.reserve({ modelId: ocrModelId, estimatedInputTokens: estimatedOcrInputTokens, maxOutputTokens: OCR_MAX_OUTPUT_TOKENS, kind: 'chat', label: 'gateway.ocr' });
   const recordOcr = (label: 'gateway.ocr' | 'gateway.ocr.failed', usage: { inputTokens: number; outputTokens: number }): void =>
-    recordOnTracker(tracker, { modelId: ocrModelId, requestedModelId: ocrModel, label, ...usage });
+    recordOnTracker(tracker, { modelId: ocrModelId, requestedModelId: ocrModel, label, reservation, ...usage });
   let result: Awaited<ReturnType<GenerateTextFn>>;
   try {
     result = await guardedGeneration(ocrModelId, _generateTextTransport, {
       model,
+      maxOutputTokens: OCR_MAX_OUTPUT_TOKENS,
       // v0.42.20.0 (codex) — OCR is a 5th unbounded generateText entry point.
       abortSignal: withDefaultTimeout(undefined, AI_CHAT_TIMEOUT_MS),
       messages: [
@@ -2775,7 +2828,7 @@ export async function generateOcrText(imageBytes: Buffer, mime: string): Promise
     if (isAIInvocationPolicyError(err)) throw err;
     recordOcr('gateway.ocr.failed', failedCallUsage(err, {
       inputTokens: estimatedOcrInputTokens,
-      outputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+      outputTokens: OCR_MAX_OUTPUT_TOKENS,
     }));
     // Throw-to-caller contract unchanged: importImageFile routes this to
     // ocr_failed_other. A cap breach surfaces there as a real import failure.
@@ -3348,7 +3401,8 @@ function instantiateChat(recipe: Recipe, modelId: string, cfg: AIGatewayConfig):
     case 'native-google': {
       const apiKey = cfg.env.GOOGLE_GENERATIVE_AI_API_KEY;
       if (!apiKey) throw new AIConfigError(`Google chat requires GOOGLE_GENERATIVE_AI_API_KEY.`, recipe.setup_hint);
-      return createGoogleGenerativeAI({ apiKey }).languageModel(modelId);
+      const baseURL = resolveNativeBaseUrl('google', cfg);
+      return createGoogleGenerativeAI({ apiKey, ...(baseURL ? { baseURL } : {}) }).languageModel(modelId);
     }
     case 'native-anthropic': {
       const apiKey = cfg.env.ANTHROPIC_API_KEY;
@@ -4453,7 +4507,8 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
   // Timeout via AbortController; merges with caller-supplied signal.
   const ctrl = new AbortController();
   const timeoutMs = input.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS;
-  const t = setTimeout(() => ctrl.abort(new Error('rerank timed out')), timeoutMs);
+  let timedOut = false;
+  const t = setTimeout(() => { timedOut = true; ctrl.abort(new Error('rerank timed out')); }, timeoutMs);
   if (input.signal) {
     if (input.signal.aborted) ctrl.abort(input.signal.reason);
     else input.signal.addEventListener('abort', () => ctrl.abort(input.signal!.reason), { once: true });
@@ -4502,7 +4557,7 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
           : 'unknown';
       throw new RerankError(msg, reason, resp.status);
     }
-    const json: any = await resp.json();
+    const json: any = await resp.json().catch((err: unknown) => { throw timedOut ? err : new RerankError('rerank: malformed response (body is not JSON)', 'unknown'); });
     // v0.46.3: two response dialects share the item shape {index,
       // `results[]`, Voyage's REST returns `data[]` ({object: "list", data:
     // [...]}, live-wire verified 2026-08-15; Voyage's Python SDK renames it
@@ -4525,14 +4580,12 @@ export async function rerank(input: RerankInput): Promise<RerankResult[]> {
     if (isAIInvocationPolicyError(err)) throw err;
     _rerankRecord(true);
     if (err instanceof RerankError) throw err;
-    // AbortError on timeout — classify cleanly.
-    if (err && typeof err === 'object' && (err as any).name === 'AbortError') {
-      const msg = (err as Error).message || 'rerank aborted';
-      throw new RerankError(msg, msg.toLowerCase().includes('timed out') ? 'timeout' : 'unknown');
-    }
-    // Network errors (DNS, connection refused, etc.) become network class.
+    // fetch rejects with the abort reason itself (a plain Error, not an AbortError), so the flag is the tell.
+    if (timedOut) throw new RerankError(`rerank timed out after ${timeoutMs}ms`, 'timeout');
+    if (err && typeof err === 'object' && (err as any).name === 'AbortError') throw new RerankError((err as Error).message || 'rerank aborted', 'unknown');
+    // No HTTP response at all (connection refused, DNS, reset) is `unreachable`; a provider 5xx is `network`.
     const msg = err instanceof Error ? err.message : String(err);
-    throw new RerankError(`rerank: ${msg}`, 'network');
+    throw new RerankError(`rerank: ${msg}`, 'unreachable');
   } finally {
     clearTimeout(t);
     tracker?.release(reservation);

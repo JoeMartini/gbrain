@@ -3,6 +3,7 @@ import type { GetVersionsOpts, PageVersionRows } from './page-state/version-type
 import type { PageSnapshotBatch } from './page-snapshot-batch.ts';
 import type { LinkReadScope } from './link-validity.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
+import type { KeywordPageWindow } from './search/keyword-statement.ts';
 import type { DerivedLinkBatchItem, DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
 export type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions, PageMutationPrecondition, PageWithdrawal } from './page-state/types.ts';
 import type {
@@ -195,6 +196,8 @@ export interface LinkBatchInput {
    * legacy / unknown / pre-v98 semantics.
    */
   link_kind?: string;
+  /** #4381: how the authored reference named its target: `qualified` (`[[source:slug]]`) or `unqualified`. NULL for edges no reference derived. */
+  resolution_type?: 'qualified' | 'unqualified';
 }
 
 /** Input row for addTimelineEntriesBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -1142,6 +1145,10 @@ export interface BrainEngine {
 
   // Search
   searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
+  /** Cat 40 Hard F2: pages matching searchKeyword's strict query (never the OR retry), capped at KEYWORD_COUNT_CAP + 1; `timeoutMs` bounds the Postgres statement. */
+  countKeywordPages(query: string, opts?: SearchOpts & { timeoutMs?: number }): Promise<number>;
+  /** Cat 40 Hard F2: `match: "keyword"` pages, best chunk each, ordered (score DESC, page_id ASC) with no global chunk cap. */
+  searchKeywordPages(query: string, opts: SearchOpts | undefined, page: KeywordPageWindow): Promise<SearchResult[]>;
   /**
    * fix/title-retrieval-arm (D1): page-grain title candidate arm.
    *
@@ -2310,15 +2317,16 @@ export interface BrainEngine {
    * Find candidate duplicates for a new fact within a source+entity bucket.
    * Entity-prefilter is mandatory (bounds the contradiction-classifier blast
    * radius). Hard cap k=5 by default. Embedding-cosine when both sides have
-   * embeddings; recency fallback otherwise. `attributedTo` (the new fact's
-   * speaker) drops rows a different known speaker asserted before the k cap;
-   * NULL rows stay candidates.
+   * embeddings; recency fallback otherwise. `arm: 'keyword'` ranks the same
+   * bucket by full-text rank instead (C2 `facts.candidate_fusion`).
+   * `attributedTo` (the new fact's speaker) drops rows a different known
+   * speaker asserted before the k cap, in every arm; NULL rows stay candidates.
    */
   findCandidateDuplicates(
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null },
   ): Promise<FactRow[]>;
 
   /**

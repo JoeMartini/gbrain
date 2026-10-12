@@ -3,6 +3,9 @@
 Each accepted mutation has a durable request UUID scoped to one brain and one
 authenticated principal. A response distinguishes acceptance from commitment.
 Keep the UUID and original arguments until the request reaches a terminal state.
+A caller may send any `request_id` of 1 to 128 printable ASCII characters; a
+non-UUID id maps to a deterministic UUID, receipts echo the original as
+`client_request_id`, and the receipt helpers accept either.
 
 **Say to your agent:** *"Update this page without overwriting a newer revision;
 use `get_page` and `put_page`, then check the durable receipt."* Or: *"Inspect my
@@ -13,8 +16,8 @@ the setup."*
 
 Read an existing page with `get_page` and `include_content: true`. Preserve its
 complete `content`, `revision`, and source. Send the edited complete content to
-`put_page` with `expected_revision` equal to that revision and a newly generated
-`request_id` UUID. Capture replacements, delete, restore, and version revert also
+`put_page` with `expected_revision` equal to that revision and a new
+`request_id` (or none). Capture replacements, delete, restore, and version revert also
 accept the revision precondition. `force: true` is an explicit overwrite choice;
 it is mutually exclusive with `expected_revision`.
 
@@ -371,7 +374,12 @@ The admin health indicators count it as `accepted_pending`, outside the error
 rate, with `pending_writes`, `oldest_pending_write_age_seconds` and
 `pending_writes_later_failed`. `owner_unavailable`
 and `writer_lock_unavailable` do not authorize a competing owner or a fresh
-request ID. `queue_capacity` refuses additional admission without evicting
+request ID. A process that cannot open the worktree lock file at all (a sandbox,
+an unwritable lock directory) leaves its write `queued` with
+`blocked_reason: writer_lock_unavailable` (receipt `next_action:
+inspect_owner`) for an owner process that can take the lock; retrying from the
+same process fails the same way, and the OS error stays in the owner-only
+detail. `queue_capacity` refuses additional admission without evicting
 existing requests. `revision_required`, `revision_conflict`,
 `idempotency_conflict`, and `source_changed` require correcting the caller's
 intent or authority. `recovery_required` names unresolved publication state.

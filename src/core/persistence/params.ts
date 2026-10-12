@@ -16,7 +16,7 @@ import { WRITE_REQUEST_STATES, WRITE_HEALTH_REASONS, WRITE_HEALTH_ASSESSMENTS, W
  */
 export const WRITE_REQUEST_PARAM: ParamDef = {
   type: 'string',
-  description: 'UUID; retry with it on timeout.',
+  description: 'Optional; reuse only to retry.',
 };
 
 /** #6007: transport-only long-poll; never stored with the write or compared on replay. */
@@ -40,6 +40,16 @@ export const PAGE_MUTATION_PARAMS: Record<string, ParamDef> = {
     description: 'Ignore the revision.',
   },
   request_id: WRITE_REQUEST_PARAM,
+};
+
+/**
+ * #5970: the precondition a merging page write (`add_tag`, `remove_tag`, `add_timeline_entry`, `takes_*`) accepts.
+ * The coordinator always honored `expected_revision` / `force` on these; declared so a strict dispatcher admits them.
+ * Full surface only, like `content_origin`: accepted on every surface, off the starter schema budget.
+ */
+export const MERGE_PRECONDITION_PARAMS: Record<string, ParamDef> = {
+  expected_revision: { type: 'string', description: 'Revision read; omit to merge onto the current page.', fullSurfaceOnly: true },
+  force: { ...PAGE_MUTATION_PARAMS.force, fullSurfaceOnly: true },
 };
 
 /**

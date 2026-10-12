@@ -62,7 +62,7 @@ const remember: Operation = {
   name: 'remember',
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'MEMORY VERB (v1): save facts with provenance. Set `entity` to the subject or entity recall misses it. Branch on `status` (inserted|duplicate|superseded); write_pending: poll get_write_request.',
+  description: 'MEMORY VERB (v1): save facts with provenance. Set `entity` (the subject) or recall misses it. Branch on `status` (inserted|duplicate|superseded); write_pending: poll get_write_request.',
   params: {
     ...AGENT_CONTENT_PARAMS,
     fact: { type: 'string', description: 'One claim.' },
@@ -74,15 +74,19 @@ const remember: Operation = {
     provenance: {
       type: 'string',
       // Required for a single fact (the handler refuses with provenance_required); with items it may be given per item.
-      description: 'Fact source (max 500 chars).',
+      description: 'Source (≤500 chars).',
     },
     ttl: {
       type: 'string',
-      description: '"30d", "12h" or ISO 8601; omit = never.',
+      description: '"30d", "12h", ISO; omit = never.',
+    },
+    valid_from: {
+      type: 'string',
+      description: 'When true (ISO).',
     },
     entity: {
       type: 'string',
-      description: 'Subject (name or slug).',
+      description: 'Name or slug.',
     },
     infer_entity: {
       type: 'boolean',
@@ -97,7 +101,7 @@ const remember: Operation = {
       enum: ['world', 'private'],
       description: 'world (default) or private (local CLI).',
     },
-    replaces: { type: 'string', description: 'fact_id this fact replaces (same entity).', fullSurfaceOnly: true },
+    replaces: { type: 'string', description: 'fact_id this fact replaces (same entity, or none).', fullSurfaceOnly: true },
   },
   mutating: true,
   scope: 'write',
@@ -158,6 +162,13 @@ const remember: Operation = {
         'Use "world" (default — agents can recall it) or "private" (local CLI reads only).',
       );
     }
+    if (p.valid_from !== undefined && (typeof p.valid_from !== 'string' || !Number.isFinite(Date.parse(p.valid_from)))) {
+      throw verbError(
+        'invalid_params',
+        'valid_from must be an ISO 8601 date or time.',
+        'Pass when the fact was said or became true, e.g. valid_from: "2026-03-01", or omit it.',
+      );
+    }
     if (p.content_origin !== undefined && !CONTENT_ORIGIN_PARAM.enum!.includes(p.content_origin as string)) {
       throw verbError('invalid_params', `content_origin must be one of ${CONTENT_ORIGIN_PARAM.enum!.join(', ')}; got ${JSON.stringify(p.content_origin)}.`,
         'Pass content_origin as user_said, tool_output (text from a web page, email, file or other tool) or inferred, or omit it.');
@@ -200,15 +211,27 @@ const entity: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: 'MEMORY VERB (v1): person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches and create_safety. Facts: recall.',
+  description: 'MEMORY VERB (v1): person/company/account card, zero LLM. Previews are not evidence: fetch the page before stating status or dates. Miss: found:false with near matches (create_safety). Facts: recall.',
   params: {
-    name: { type: 'string', required: true, description: 'Name, alias or slug (e.g. "Alice Example").' },
+    name: { type: 'string', description: 'Name, alias or slug.' },
+    names: { type: 'array', items: { type: 'string' }, description: 'Or up to 50 names/codes at once: compact rows.' },
   },
   scope: 'read',
   verb: true,
   annotations: { title: 'entity (card lookup, zero LLM)', readOnlyHint: true },
   handler: async (ctx, p) => {
     const { verbError } = await import('./operations.ts');
+    if (p.names !== undefined) {
+      const { ENTITY_NAMES_MAX, lookupEntityNames } = await import('./verbs/entity-names.ts');
+      const names = Array.isArray(p.names) ? p.names.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : [];
+      if (p.name !== undefined || !names.length || names.length > ENTITY_NAMES_MAX) {
+        throw verbError('invalid_params', `names must be 1 to ${ENTITY_NAMES_MAX} non-empty strings, without name.`,
+          `Pass either name: "Alice Example" for one full card, or names: ["Alice Example", "WGCO"] (up to ${ENTITY_NAMES_MAX}) for compact rows.`);
+      }
+      const t0 = Date.now();
+      const out = await lookupEntityNames(ctx.engine, ctx.sourceId ?? 'default', names, { remote: ctx.remote !== false, surfaceCeiling: ctx.surfaceCeiling });
+      return { protocol_version: 1, latency_ms: Date.now() - t0, ...out };
+    }
     const name = typeof p.name === 'string' ? p.name.trim() : '';
     if (!name) {
       throw verbError(
@@ -228,6 +251,10 @@ const entity: Operation = {
       const { mentionCoverageNotice } = await import('./mentions/coverage.ts');
       const notice = mentionCoverageNotice(coverage, result.card?.entity.type);
       if (notice) ctx.emitNotice?.(notice);
+    }
+    if (result.card?.identity_siblings?.capped) {
+      const { siblingsCappedNotice } = await import('./verbs/entity-card-identity.ts');
+      ctx.emitNotice?.(siblingsCappedNotice(result.card.entity.slug));
     }
     return {
       protocol_version: MEMORY_VERBS_VERSION,
@@ -501,7 +528,17 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             provenance: { type: 'string' },
             valid_until: { type: ['string', 'null'] },
             visibility: { type: 'string', enum: ['private', 'world'] },
+            relevance: { type: 'number', description: 'Present when `question` was passed: cosine + term share + 0.1 when dated (about 0 to 2.1). A ranking score within this response, not a probability; not comparable across calls.' },
           },
+        },
+      },
+      facts_order: { type: 'string', enum: ['relevance', 'newest'], description: 'How facts[] is ordered: relevance (question passed) or newest. A server without question ranking omits it.' },
+      facts_degraded: {
+        type: 'object',
+        description: 'Present when question ranking ran without full semantic matching.',
+        properties: {
+          reason: { type: 'string', description: 'Why the cosine arm did not run: keyword_only_no_embedding_provider, keyword_only_embedding_disabled, embed_timeout, embed_unavailable, no_query_terms or facts_embedding_column_missing.' },
+          unembedded: { type: 'integer', description: 'Facts in scope without a comparable embedding (ranked by word overlap only).' },
         },
       },
       results: {
@@ -517,6 +554,7 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
             evidence: { type: 'string', enum: EVIDENCE_ENUM },
             create_safety: { type: 'string', enum: CREATE_SAFETY_ENUM },
             provenance: { type: 'string', description: 'Origin page slug.' },
+            source_id: { type: 'string', description: 'The source the hit came from (#4830; absent only when a federated read cannot name one).' },
           },
         },
       },
@@ -811,6 +849,31 @@ export const RESPONSE_SCHEMAS: Record<VerbName, Record<string, unknown>> = {
       budget_tokens: { type: 'integer', description: 'Present when budget_tokens was passed.' },
       budget_used: { type: 'integer' },
       dropped_count: { type: 'integer' },
+      // C4 pinned questions — additive optional, owner-capable callers only; outside `text` and the budget.
+      pinned_questions: {
+        type: 'array',
+        description: 'Fresh sentences of pinned answers scoped to a packed entity (owner-capable callers only).',
+        items: {
+          type: 'object',
+          required: ['id', 'question', 'answer', 'freshness'],
+          properties: {
+            id: { type: 'string' },
+            question: { type: 'string' },
+            answer: { type: 'array', items: { type: 'string' } },
+            freshness: { type: 'string', enum: ['fresh', 'stale'] },
+          },
+        },
+      },
+      withheld: {
+        type: 'object',
+        required: ['stale_sentences', 'question_ids', 'refresh_command'],
+        description: 'Pinned-answer sentences left out because their evidence changed or is unreadable.',
+        properties: {
+          stale_sentences: { type: 'integer' },
+          question_ids: { type: 'array', items: { type: 'string' } },
+          refresh_command: { type: 'string' },
+        },
+      },
     },
   },
   delta: {

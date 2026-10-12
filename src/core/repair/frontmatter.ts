@@ -46,9 +46,10 @@ import { opError, OperationError, type OperationContext } from '../ops/contract.
 import { shellQuote, type Action } from '../agent-output.ts';
 import { autoFixFrontmatter, createFrontmatterBackup, makeFrontmatterBackupRunId, repairRecoverableFrontmatter } from '../brain-writer.ts';
 import { classifyImportHold, parseMarkdown, type ContentHold, type ParsedMarkdown } from '../markdown.ts';
+import { dataFrontmatter as matter } from '../data-frontmatter.ts';
 import { MAX_FILE_SIZE, type ContentRefusal } from '../import-screen.ts';
 import { importFromFile } from '../import-file.ts';
-import { resolveSlugForPath } from '../sync.ts';
+import { resolveSlugForPath, slugifyPath } from '../sync.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
 import { digest, sha256 } from '../persistence/digest.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
@@ -59,6 +60,7 @@ import { canonicalRepairFields, confinedRepairTarget, managedRepairRoot, prepare
 import { clearApprovedSet, loadApprovedSet, previewChangedError, previewHash, saveApprovedSet } from '../persistence/preview-approval.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { afterCursor, repairRequestId, type RepairHandler, type RepairItem, type RepairItemOutcome, type RepairListing, type RepairPlan, type RepairScope } from './core.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 type Mode = 'managed' | 'legacy';
 type RepairClass = 'safe' | 'interpretive';
@@ -210,7 +212,7 @@ async function sourceRoots(engine: BrainEngine, scope: RepairScope, residuals: R
 function markdownFiles(root: string): string[] {
   let paths: string[];
   try {
-    paths = execFileSync('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'ignore'] })
+    paths = execFileSync('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], { env: gitChildEnv(), encoding: 'utf8', maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'ignore'] })
       .split('\0').filter(Boolean);
   } catch {
     paths = (readdirSync(root, { recursive: true }) as string[]).map(path => path.split('\\').join('/'));
@@ -242,6 +244,26 @@ function pageDamage(page: PageRow | undefined, content: string): string | null {
   const titleLine = /^---[^\n]*\n[\s\S]*?^title:[ \t]*\S/m.test(content.replace(/^\uFEFF/, ''));
   if (titleLine && page.title === slugTitle(page.slug)) return 'its stored title was derived from the slug although the file names a title';
   return null;
+}
+
+/**
+ * #5966 (W14 P1.7): a file an earlier gbrain rendered for a slug its path
+ * cannot derive (a doubled hyphen the path collapses to one) carries no `slug:`
+ * stamp, so every path-derived reader loses the page. The stamp is a SAFE
+ * candidate only when the file is the page's recorded `source_path` (one page
+ * records a path), the file declares no slug and the page slug is not the
+ * derived one; nothing is ever normalized or guessed. Inserted as
+ * `serializeMarkdown` would write it, right after the opening `---`.
+ */
+function slugStampCandidate(content: string, path: string, sourcePath: string, page: PageRow | undefined, parsed: ParsedMarkdown, ctx: SlugContext): { content: string; fixes: string[] } | null {
+  if (!page || page.source_path !== sourcePath || slugifyPath(sourcePath) === page.slug || parsed.slug === page.slug) return null;
+  const open = /^(\uFEFF?---[ \t]*\r?\n)/.exec(content);
+  if (!open) return null;
+  const eol = open[1].endsWith('\r\n') ? '\r\n' : '\n';
+  const line = matter.stringify('', { slug: page.slug }).split('\n')[1] ?? `slug: ${page.slug}`;
+  const stamped = open[1] + line + eol + content.slice(open[1].length);
+  if (!clean(stamped, path, ctx) || reading(stamped, path) !== reading(content, path) || parseMarkdown(stamped, path).slug !== page.slug) return null;
+  return { content: stamped, fixes: [`Stamp slug: ${page.slug} (the path ${sourcePath} derives ${slugifyPath(sourcePath)}, so readers lose the page without it)`] };
 }
 
 interface Analysis {
@@ -282,6 +304,8 @@ async function analyzeFile(ctx: FileContext, path: string, hold: GitHoldRecord |
   }
   const problem = found.errors.length > 0 || found.hold !== null || found.recovered > 0 || found.comments > 0;
   const damage = !problem && !hold ? pageDamage(page, content) : null;
+  const stamp = !problem && !hold && !damage ? slugStampCandidate(content, path, sourcePath, page, found.parsed, slugCtx) : null;
+  if (stamp) return { proposal: { ...stamp, class: 'safe' } };
   if (!problem && !hold && !damage) return null;
   if (damage) {
     const body = parseMarkdown(content, path).compiled_truth;

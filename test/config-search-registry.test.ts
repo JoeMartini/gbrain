@@ -36,6 +36,8 @@ const DIRECTLY_READ_SINGLETONS = [
   'search.hnsw_iterative_scan',              // search/hnsw-iterative-scan.ts via loadConfigWithEngine
   'search.cjk_keyword_deadline_ms',          // search/cjk-keyword-deadline.ts via loadConfigWithEngine
   'search.crag_escalation',                  // ops/search.ts
+  'search.alias_fanout_max',                 // search/alias-fanout.ts
+  'search.demote_generated',                 // search/provenance-demotion.ts
   'search.crag_think',                       // ops/search.ts
   'search.return_unit',                      // search/evidence-delivery.ts
   'search.return_window',
@@ -43,6 +45,10 @@ const DIRECTLY_READ_SINGLETONS = [
   'search.return_budget_conversation',
   'search.return_budget_max_remote',
   'search.auto_packing',                     // search/evidence-delivery.ts (explicit-budget cap)
+  'search.evidence_date_header',             // search/evidence-delivery.ts (C1)
+  'search.entity_anchoring',                 // search/entity-anchor.ts (ops/search.ts)
+  'search.query_facts_arm',                  // search/facts-arm.ts (search/query-arms.ts)
+  'search.temporal_fact_reserve',            // search/facts-arm.ts (search/query-arms.ts)
 ];
 
 describe('KNOWN_CONFIG_KEYS search.* rows mirror what the code reads (#4605)', () => {
