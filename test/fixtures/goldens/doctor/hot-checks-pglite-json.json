@@ -395,6 +395,18 @@
           {
             "category": "ops",
             "details": {
+              "decision": null,
+              "provider_env": []
+            },
+            "message": "No gbrain setup receipt records a provider-use decision for this install; provider calls follow the configured keys.",
+            "name": "provider_consent",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
               "reason": "no_harness_detected"
             },
             "fix": {
@@ -1284,6 +1296,20 @@
             },
             "message": "No stored frontmatter carries a parser-reserved key (type, title, tags, slug).",
             "name": "stale_frontmatter_keys",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "concept_skips": 0,
+              "count": 0,
+              "docs": "docs/guides/troubleshooting.md#maintenance-write-drift",
+              "repair": "file-drift",
+              "sources": [],
+              "window_sequences": 20000
+            },
+            "message": "No page whose writes refuse source_changed still has a canonical file that differs from the database.",
+            "name": "maintenance_write_drift",
             "status": "ok"
           },
           {
@@ -3488,6 +3514,18 @@
           {
             "category": "ops",
             "details": {
+              "decision": null,
+              "provider_env": []
+            },
+            "message": "No gbrain setup receipt records a provider-use decision for this install; provider calls follow the configured keys.",
+            "name": "provider_consent",
+            "readiness_state": "not_applicable",
+            "severity": "info",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
               "reason": "no_harness_detected"
             },
             "fix": {
@@ -4377,6 +4415,20 @@
             },
             "message": "No stored frontmatter carries a parser-reserved key (type, title, tags, slug).",
             "name": "stale_frontmatter_keys",
+            "status": "ok"
+          },
+          {
+            "category": "ops",
+            "details": {
+              "concept_skips": 0,
+              "count": 0,
+              "docs": "docs/guides/troubleshooting.md#maintenance-write-drift",
+              "repair": "file-drift",
+              "sources": [],
+              "window_sequences": 20000
+            },
+            "message": "No page whose writes refuse source_changed still has a canonical file that differs from the database.",
+            "name": "maintenance_write_drift",
             "status": "ok"
           },
           {

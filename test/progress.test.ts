@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PassThrough, type Readable } from 'node:stream';
 import { createProgress, startHeartbeat, __liveReporterCountForTest, __signalHandlerInstalledForTest } from '../src/core/progress.ts';
@@ -150,22 +151,64 @@ describe('progress reporter', () => {
   });
 
   test('json tick cpu_ms counts CPU work since the phase started, not time spent waiting', () => {
-    const { stream, read } = sink(false);
-    const p = createProgress({ mode: 'json', stream, minIntervalMs: 0, minItems: 1 });
-    p.start('import.files', 3);
+    // Under a hypervisor whose guest kernel lacks CONFIG_PARAVIRT_TIME_ACCOUNTING (Ubuntu's generic kernels, the CI
+    // runners included), vCPU time the host steals is billed to whichever thread was current, so a steal burst that
+    // starts right after the wait wakes lands in this thread's CPU clock (run 38467234783: 268 ms billed inside a
+    // 200 ms wait on a runner with 28 % steal). Such a window is an invalid instrument reading, not CPU work: the
+    // measurement is repeated until the VM-wide steal counter did not move across it, and the bound below is
+    // asserted only on that window. Without /proc/stat (macOS) the first window is asserted as before.
+    const stealJiffies = (): number | null => {
+      try {
+        const cpuLine = readFileSync('/proc/stat', 'utf8').split('\n')[0] ?? '';
+        const fields = cpuLine.trim().split(/\s+/);
+        return fields[0] === 'cpu' && fields.length > 8 ? Number(fields[8]) : null;
+      } catch {
+        return null;
+      }
+    };
     const cpuMs = () => { const u = process.threadCpuUsage(); return (u.user + u.system) / 1000; };
-    const spinUntil = cpuMs() + 60;
-    while (cpuMs() < spinUntil) { /* burn 60 ms of CPU */ }
-    p.tick(1);
-    // Block the thread for 200 ms without yielding: an await would let other queued main-thread work (an earlier
-    // test's timer, a GC pause) run and be billed to the phase, and the test means "the thread sat idle".
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
-    p.tick(1);
-    p.finish();
-    const [, worked, waited] = parseJsonl(read()) as Array<{ cpu_ms: number; elapsed_ms: number }>;
+    const measure = () => {
+      const { stream, read } = sink(false);
+      const p = createProgress({ mode: 'json', stream, minIntervalMs: 0, minItems: 1 });
+      p.start('import.files', 3);
+      const spinUntil = cpuMs() + 60;
+      while (cpuMs() < spinUntil) { /* burn 60 ms of CPU */ }
+      p.tick(1);
+      const stealBefore = stealJiffies();
+      const usageBefore = process.resourceUsage();
+      const cpuBeforeWait = cpuMs();
+      // Block the thread for 200 ms without yielding: an await would let other queued main-thread work (an earlier
+      // test's timer, a GC pause) run and be billed to the phase, and the test means "the thread sat idle".
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+      const cpuInWait = cpuMs() - cpuBeforeWait;
+      const usageAfter = process.resourceUsage();
+      p.tick(1);
+      p.finish();
+      const stealAfter = stealJiffies();
+      const [, worked, waited] = parseJsonl(read()) as Array<{ cpu_ms: number; elapsed_ms: number }>;
+      const stealMs = stealBefore === null || stealAfter === null ? null : (stealAfter - stealBefore) * 10;
+      return { worked, waited, cpuInWait, usageBefore, usageAfter, stealMs };
+    };
+    const attempts: ReturnType<typeof measure>[] = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      attempts.push(measure());
+      if (attempts[attempts.length - 1]!.stealMs === null || attempts[attempts.length - 1]!.stealMs === 0) break;
+    }
+    const { worked, waited, cpuInWait, usageBefore, usageAfter, stealMs } = attempts[attempts.length - 1]!;
     expect(worked.cpu_ms).toBeGreaterThanOrEqual(60);
     expect(waited.elapsed_ms - worked.elapsed_ms).toBeGreaterThanOrEqual(190);
-    expect(waited.cpu_ms - worked.cpu_ms).toBeLessThan(100);
+    const waitedCpuMs = waited.cpu_ms - worked.cpu_ms;
+    expect(
+      waitedCpuMs,
+      `the second tick billed ${waitedCpuMs.toFixed(1)} ms of thread CPU (first tick, after the 60 ms spin: ${worked.cpu_ms.toFixed(1)} ms): ` +
+        `${cpuInWait.toFixed(1)} ms inside the 200 ms Atomics.wait, ${(waitedCpuMs - cpuInWait).toFixed(1)} ms in the tick calls around it; ` +
+        `process during the wait: ${usageAfter.minorPageFault - usageBefore.minorPageFault} minor and ` +
+        `${usageAfter.majorPageFault - usageBefore.majorPageFault} major page faults, ` +
+        `${usageAfter.involuntaryContextSwitches - usageBefore.involuntaryContextSwitches} involuntary context switches, ` +
+        `${((usageAfter.userCPUTime + usageAfter.systemCPUTime - usageBefore.userCPUTime - usageBefore.systemCPUTime) / 1000).toFixed(1)} ms CPU on all threads; ` +
+        `hypervisor steal across the window: ${stealMs === null ? 'unknown (no /proc/stat)' : `${stealMs} ms`}` +
+        `${attempts.length > 1 ? ` (attempt ${attempts.length} of 5; steal per attempt: ${attempts.map((a) => `${a.stealMs} ms`).join(', ')})` : ''}`,
+    ).toBeLessThan(100);
   });
 
   test('quiet mode emits nothing', () => {

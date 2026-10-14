@@ -215,6 +215,10 @@
       },
       {
         "category": "ops",
+        "name": "provider_consent"
+      },
+      {
+        "category": "ops",
         "name": "harness_wiring"
       },
       {
@@ -480,6 +484,10 @@
       {
         "category": "ops",
         "name": "stale_frontmatter_keys"
+      },
+      {
+        "category": "ops",
+        "name": "maintenance_write_drift"
       },
       {
         "category": "brain",
