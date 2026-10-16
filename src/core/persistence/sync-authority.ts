@@ -40,6 +40,10 @@ export const SYNC_PROCESSING_KEYS = ['noEmbed', 'noExtract', 'noSchemaPack'] as 
 export function explicitSyncProcessing(values: Record<string, unknown>): Array<keyof SyncProcessingOptions> {
   return SYNC_PROCESSING_KEYS.filter(key => typeof values[key] === 'boolean');
 }
+/** #6696: the processing flags a payload without an explicit list set: an older client sends true for each one typed, nothing for the rest. */
+export function typedSyncProcessing(values: Partial<Record<keyof SyncProcessingOptions, unknown>>): Array<keyof SyncProcessingOptions> {
+  return SYNC_PROCESSING_KEYS.filter(key => values[key] === true);
+}
 export function assertSyncDispatchActive(): void {
   assertSourceFilesystemActive(true);
   throwIfAborted(currentJobSignal());
@@ -129,7 +133,7 @@ export function validateManagedSyncOptions(opts: SyncOpts): void {
   if (current?.kind !== 'remote_generic') return;
   // #6706: the worker's own drain controls (never read from a remote job's data) bound the run; they cannot widen what it writes.
   const allowed = new Set(['repoPath','sourceId','noPull','noEmbed','noExtract','explicitProcessing','signal','concurrency','onProgress','auto_embed_backfill',
-    'drain','deadlineAtMs','drainStartedAt','bulk','lanes']);
+    'drain','deadlineAtMs','drainStartedAt','bulk','lanes','capacityPreflight']);
   if (current.grant.jobName !== 'sync' || opts.repoPath !== current.grant.canonicalRoot || opts.sourceId !== current.grant.sourceId ||
       opts.noPull !== true || opts.noEmbed !== true || opts.noExtract !== true ||
       (opts.drain !== undefined && opts.drain !== true) || (opts.lanes !== undefined && opts.lanes !== 1) ||

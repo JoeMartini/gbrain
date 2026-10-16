@@ -42,6 +42,7 @@ const OOS = {
   dream: 'out-of-scope:dream-verdicts',
   raw: 'out-of-scope:raw-data',
   stub: 'out-of-scope:no-sql-stub',
+  pageBody: 'out-of-scope:page-body (Wave B segmented storage, born in engine-sql/page-body.ts; pinned by test/engine-sql-page-body.test.ts)',
 } as const;
 
 export const DOMAIN_OF: Record<string, string> = {
@@ -112,6 +113,8 @@ export const DOMAIN_OF: Record<string, string> = {
   'setPageEmbeddingSignature': 'chunks', 'invalidateStaleSignatureEmbeddings': 'chunks',
   'invalidateContentDriftEmbeddings': 'chunks', 'listStaleChunks': 'chunks',
   'countChunklessPagesWithContent': 'chunks', 'listChunklessPagesWithContent': 'chunks', 'deleteChunks': 'chunks',
+  'readEmbeddingStateCounts': 'chunks', 'listEmbeddingStateRows': 'chunks',
+  'allocateBodyOccurrenceIds': OOS.pageBody, 'stageSegmentTexts': OOS.pageBody, 'readSegmentTexts': OOS.pageBody, 'stageManifestRows': OOS.pageBody, 'readManifest': OOS.pageBody, 'stageSegmentChunks': OOS.pageBody, 'createSegmentedPageShell': OOS.pageBody, 'flipBodyGeneration': OOS.pageBody, 'openBodyStaging': OOS.pageBody, 'setBodyStagingState': OOS.pageBody, 'sweepSegments': OOS.pageBody,
   'getEmbeddingsByChunkIds': 'chunks', 'getChunksWithEmbeddings': 'chunks',
   // facts (incl. the ontology rows of the facts table)
   'insertFact': 'facts', 'expireFact': 'facts', 'insertFacts': 'facts', 'deleteFactsForPage': 'facts',
@@ -568,6 +571,15 @@ export const SQL_CASES: SqlCase[] = [
   ...variants('listChunklessPagesWithContent', [
     ['default', (e) => e.listChunklessPagesWithContent()],
     ['afterPageId+sourceId', (e) => e.listChunklessPagesWithContent({ afterPageId: 3, sourceId: SRC, batchSize: 5 })],
+  ]),
+  ...variants('readEmbeddingStateCounts', [
+    ['full', (e) => e.readEmbeddingStateCounts({ mode: 'full', purgeWindowHours: 72 })],
+    ['full+sourceIds', (e) => e.readEmbeddingStateCounts({ mode: 'full', sourceIds: [SRC], purgeWindowHours: 72 })],
+    ['ops', (e) => e.readEmbeddingStateCounts({ mode: 'ops', purgeWindowHours: 72 })],
+  ]),
+  ...variants('listEmbeddingStateRows', [
+    ['default', (e) => e.listEmbeddingStateRows({ states: ['pending', 'empty'], limit: 51, purgeWindowHours: 72 })],
+    ['sourceIds', (e) => e.listEmbeddingStateRows({ sourceIds: [SRC], states: ['keyword_only'], limit: 11, purgeWindowHours: 72 })],
   ]),
   ...variants('deleteChunks', [['default', (e) => e.deleteChunks(SLUG)]]),
   ...variants('getEmbeddingsByChunkIds', [

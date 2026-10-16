@@ -48,6 +48,7 @@ import { curatedFlagError } from './help/validate.ts';
 import { cliCommandOf, exitCliError, exitOnRepairFailed, unknownFlagError, usageError, writeCliError, writeCliNotice, writeFatalCliError } from './cli-error.ts';
 import type { Notice } from '../core/agent-output.ts';
 import { opError, opOwnsSource } from '../core/ops/contract.ts';
+import { PAGE_MAX_BYTES } from '../core/page-size-policy.ts';
 import { opParamValue } from './op-param-values.ts';
 import { formatGetPage, readWholePageMarkdown, remoteErrorCode, wantsWholePage } from './page-render.ts';
 import { parseGlobalFlags, setCliOptions, getCliOptions } from '../core/cli-options.ts';
@@ -75,7 +76,7 @@ import {
   type CliDispatchContext,
 } from './command-table.ts';
 import { formatRememberResult } from './remember-format.ts';
-import { applyCliOpNotices, captureOpNotice } from './op-notices.ts';
+import { applyCliOpNotices, captureCapacityNotices, captureOpNotice } from './op-notices.ts';
 
 // db-availability loop: best-effort brain-id for the GBRAIN_DB_ACCESS marker,
 // so a MOUNT's DB failure reads as `brain=<id>` instead of masquerading as a
@@ -688,6 +689,7 @@ async function runSharedOperation(command: string, subArgs: string[], cliOpts: C
       }
     } else {
       rawResult = await op.handler(ctx, params);
+      if (op.mutating) await captureCapacityNotices(engine); // #6696 (A4)
     }
     // ENG-2 (renderer parity by data shape): JSON-round-trip the local-engine
     // path's return value so renderers see the same shape they'd see on the
@@ -1162,7 +1164,7 @@ export async function applyStdinParam(
   params: Record<string, unknown>,
 ): Promise<void> {
   // Branch shape (stdin hint + missing param + `!process.stdin.isTTY` gate +
-  // 5MB cap) is pinned by the R4 regression test for PR #1325's Windows fix
+  // page-ceiling cap) is pinned by the R4 regression test for PR #1325's Windows fix
   // (test/cycle/regression-pr-wave-r1-r2-r4.test.ts) — keep the spelling.
   if (op.cliHints?.stdin && !params[op.cliHints.stdin] && !process.stdin.isTTY) {
     const content = await readStdinBounded();
@@ -1173,9 +1175,9 @@ export async function applyStdinParam(
     // empty write; leaving the param unset makes the required-param usage
     // error fire instead (same fail-fast as the #3513 timeout path).
     if (content.trim() === '') return;
-    const MAX_STDIN = 5_000_000; // 5MB
+    const MAX_STDIN = PAGE_MAX_BYTES; // the 24 MiB page ceiling
     if (Buffer.byteLength(content, 'utf-8') > MAX_STDIN) {
-      exitCliError(opError('payload_too_large', `stdin content exceeds ${MAX_STDIN} bytes.`, 'Split the content into smaller inputs.'), op.cliHints?.name ?? op.name);
+      exitCliError(opError('payload_too_large', `stdin content exceeds ${MAX_STDIN} bytes (the 24 MiB page ceiling).`, 'Nothing was written. A page larger than the ceiling cannot be stored in this version; see docs/guides/memory-boundaries.md#large-pages.'), op.cliHints?.name ?? op.name);
     }
     params[op.cliHints.stdin] = content;
   }
@@ -1185,7 +1187,7 @@ export async function applyStdinParam(
  * Legacy-signature shim over interaction.ts readStdinBounded (A5): the full
  * stdin content, '' for a readable-but-empty stdin, or null for anything else
  * (first-byte or inactivity timeout, stream error, closed fd). No byte cap
- * here: applyStdinParam keeps its own 5MB check and message.
+ * here: applyStdinParam keeps its own page-ceiling check and message.
  */
 export async function readStdinBounded(): Promise<string | null> {
   const r = await readStdinPayload({ maxBytes: Infinity });
@@ -1520,7 +1522,7 @@ export async function makeContext(engine: BrainEngine, params: Record<string, un
     dryRun: (params.dry_run as boolean) || false,
     // Local CLI invocation — the user owns the machine; do not apply remote-caller
     // confinement (e.g., cwd-locked file_upload).
-    remote: false,
+    remote: false, admissionOrigin: 'interactive', // #6696 (A5): the user's own CLI writes
     cliOpts: getCliOptions(),
     writeWaitMs: currentCliWriteWait().waitMs, // #5232
     // v0.34 D4: sourceId is REQUIRED at the type level. Fall back to 'default'
@@ -2257,6 +2259,7 @@ async function routeEngineFreeSubcommands(command: string, args: string[]): Prom
   // through to the engine-connected dispatch path below. (`args` here is the
   // subArgs slice already — no need to re-slice past the command.)
   if (command === 'status') {
+    if (args.includes('--funnel')) { setCliExitVerdict((await import('../commands/status-funnel.ts')).runStatusFunnel(args).exitCode); return true; }
     const cfgPre = loadConfig();
     if (cfgPre && isThinClient(cfgPre)) {
       const { runStatus } = await import('../commands/status.ts');

@@ -2,8 +2,8 @@
   "golden": {
     "exitCode": 0,
     "stderr": "",
-    "stdoutBytes": 236239,
-    "stdoutSha256": "9f6aab59c8b33e9f2318241460f39bafd43ad8aaeeafa2e88cea1bf9e808b2db",
+    "stdoutBytes": 238925,
+    "stdoutSha256": "48e1395287f6d7cc7418aa35788642033780fadcdfc344e549c04be6740a6e47",
     "toolNames": [
       "remember",
       "entity",
@@ -47,6 +47,7 @@
       "get_stats",
       "get_health",
       "run_doctor",
+      "get_brain_health",
       "get_versions",
       "revert_version",
       "get_brain_identity",
@@ -764,12 +765,13 @@
         "scope": "read"
       },
       {
-        "description": "Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag.",
+        "description": "Restore a soft-deleted page (clear deleted_at) and re-create its markdown file on disk (the counterpart to delete_page removing it; the result write_through field reports the outcome). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag. A restore that writes no file refuses (source_changed, detail canonical_file_absent) when the page's recorded file is gone from the checkout, because the next full sync would delete it again; the user chooses between putting the file back and detach: true.",
         "idempotent": true,
         "local_only": false,
         "mutating": true,
         "name": "restore_page",
         "parameters": {
+          "detach": "boolean?",
           "expected_revision": "string?",
           "force": "boolean?",
           "request_id": "string?",
@@ -779,6 +781,10 @@
         "required_scopes": [],
         "schema": {
           "properties": {
+            "detach": {
+              "description": "Restore a page whose recorded canonical file is gone from the checkout as a database-only page: it forgets the file, so sync never deletes it again. Only accepted when a plain restore refuses with canonical_file_absent; ask the user first.",
+              "type": "boolean"
+            },
             "expected_revision": {
               "description": "Revision read; omit to create.",
               "type": "string"
@@ -2431,11 +2437,44 @@
         "scope": "admin"
       },
       {
-        "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface).",
+        "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface). tier \"ops\": only the operational sections under a 4 s deadline; only: just the named checks.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "run_doctor",
+        "parameters": {
+          "only": "array?",
+          "tier": "string?"
+        },
+        "required_scopes": [],
+        "schema": {
+          "properties": {
+            "only": {
+              "description": "Run just these checks (doctor check names, for example persistence_capacity).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "tier": {
+              "description": "ops: capacity, write failures, embedding state, sync movement, compaction, serve build and schema pack, under one 4 s deadline. Omit for the focused remote report.",
+              "enum": [
+                "ops"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "scope": "admin"
+      },
+      {
+        "description": "Brain health as bands for agents without admin scope: write capacity (ok, low or critical, with a days band) and counts of write failures, ghost pages and unsearchable chunks as bands, for the sources you can read. No slugs. Cached 60 s.",
+        "idempotent": true,
+        "local_only": false,
+        "mutating": false,
+        "name": "get_brain_health",
         "parameters": {},
         "required_scopes": [],
         "schema": {
@@ -2443,7 +2482,7 @@
           "required": [],
           "type": "object"
         },
-        "scope": "admin"
+        "scope": "read"
       },
       {
         "description": "Page version history, newest snapshot first: metadata only (id, snapshot_at, title, type, tags, frontmatter) for the newest 20 versions by default. Pass include_body: true for each version's compiled_truth and timeline, and a larger limit (at most 100 over MCP) for older versions. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). revert_version takes the id field.",
@@ -3488,7 +3527,7 @@
         "scope": "read"
       },
       {
-        "description": "Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
+        "description": "Return a page's indexed content chunks (the units search ranks), in chunk_index order, 50 at a time by default. Use when debugging why search did or did not match a page. A large page has more chunks than one call returns: the last chunk of a cut list carries truncated: true and next_from_index, _meta.pagination carries total_chunks and next_from_index, and a listing_truncated notice names the next call (from_index). Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
@@ -6028,9 +6067,11 @@
         "name": "context_pack",
         "parameters": {
           "budget_tokens": "number?",
+          "counterparty": "string?",
           "entities": "string?",
           "include_private": "boolean?",
           "include_quarantined": "boolean?",
+          "intent": "string?",
           "min_trust": "string?",
           "session_id": "string?",
           "since": "string?"
@@ -6041,6 +6082,10 @@
             "budget_tokens": {
               "description": "Token budget; cards pack first.",
               "type": "number"
+            },
+            "counterparty": {
+              "description": "Person or company (name or slug): adds a pulled brief of dated items about them.",
+              "type": "string"
             },
             "entities": {
               "description": "Comma-separated names or slugs (max 8).",
@@ -6053,6 +6098,14 @@
             "include_quarantined": {
               "description": "Admin or memory_confirm: quarantined cards.",
               "type": "boolean"
+            },
+            "intent": {
+              "description": "With counterparty: the task the brief is for.",
+              "enum": [
+                "meeting",
+                "reply"
+              ],
+              "type": "string"
             },
             "min_trust": {
               "description": "Lowest trust tier to return (the connection floor still applies).",
@@ -6308,13 +6361,14 @@
         "scope": "admin"
       },
       {
-        "description": "Stored contradiction reports are temporarily available only to trusted local callers without a source filter. Remote or source-scoped callers receive {contradictions: [], note} with an availability note. For eligible local callers, return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. An eligible read loads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
+        "description": "Return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. Remote, source-scoped or min_trust callers get only findings whose two sides they can read now (each side re-read live, with source_id, trust_tier and origin) and total_visible instead of the run total. Reads the stored run without triggering a new probe; users run `gbrain eval suspected-contradictions` for that.",
         "idempotent": true,
         "local_only": false,
         "mutating": false,
         "name": "find_contradictions",
         "parameters": {
           "limit": "number?",
+          "min_trust": "string?",
           "severity": "string?",
           "slug": "string?"
         },
@@ -6324,6 +6378,18 @@
             "limit": {
               "description": "Max findings to return. Default 20.",
               "type": "number"
+            },
+            "min_trust": {
+              "description": "Lowest trust tier to return (the connection floor still applies).",
+              "enum": [
+                "user_confirmed",
+                "operator_curated",
+                "tool_observed",
+                "agent_written",
+                "unknown",
+                "external_untrusted"
+              ],
+              "type": "string"
             },
             "severity": {
               "description": "Optional severity filter.",

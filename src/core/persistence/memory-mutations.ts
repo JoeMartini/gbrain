@@ -19,7 +19,6 @@ import { assertPersistenceAccepting, registerMutationPreparer, waitForWrite, wri
 import { claimWorktree } from './ownership.ts';
 import { declareDurablePersistence } from './protocol.ts';
 import { resolveFactWriteTarget } from './fact-write-target.ts';
-import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { clientRequestIdOf, parseMutationPrecondition } from './preconditions.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { requestAttribution } from './attribution.ts';
@@ -97,13 +96,16 @@ async function planRememberTarget(ctx: OperationContext, sourceId: string, sourc
   const writeThrough = configuredWriteThrough && !sandbox;
   if (sandbox) authority.databaseOnlyReason = 'subagent_sandbox';
   else if (!configuredWriteThrough) authority.databaseOnlyReason = 'disabled_by_config';
-  const target = fence ? await resolveFactWriteTarget(ctx.engine, sourceId, source, { sandbox }) : null;
+  // An inferred link never designates an owner or reports a missing one.
+  const target = fence ? await resolveFactWriteTarget(ctx.engine, sourceId, source,
+    { sandbox, fileBacked: Boolean(snapshot!.page.source_path), remote: ctx.remote !== false }).catch((error: unknown) => {
+    if (inferred && error instanceof OperationError) throw new InferredTargetRejected('ENTITY_LINK_FAILED');
+    throw error;
+  }) : null;
   let binding = target?.kind === 'publish' ? target.binding : null;
   if (target?.kind === 'publish' && target.databaseOnlyReason) authority.databaseOnlyReason = target.databaseOnlyReason;
   if (target?.kind === 'unbound') {
-    // An inferred link never designates an owner or reports a missing one.
     if (inferred) throw new InferredTargetRejected('ENTITY_LINK_FAILED');
-    if (ctx.engine.kind !== 'pglite') throw new OperationError('owner_unavailable', 'This source has no designated canonical owner.', WRITER_INSPECTION_HINT);
     binding = await claimWorktree(ctx.engine, sourceId, target.root, undefined, undefined, { automatic: true });
   }
   // An inferred link is optional: a canonical file it could not publish (missing,
@@ -173,7 +175,7 @@ export async function submitRememberMutation(ctx: OperationContext, params: Reco
       { pageSlug: slug, remote: ctx.remote !== false, excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote), slugPrefixes: authority.slugPrefixes });
   }
   await assertFactNotWithdrawn(ctx.engine, sourceId, factIntent, { excludePrivate: await resolveExcludePrivatePages(ctx.engine, ctx.remote) });
-  const row = await admitWrite(ctx.engine, { principal, operation: 'remember', sourceId, sourceIncarnation: source.incarnation,
+  const row = await admitWrite(ctx.engine, { origin: ctx.admissionOrigin, principal, operation: 'remember', sourceId, sourceIncarnation: source.incarnation,
     slug, pageId: snapshot?.page.id ?? null, requestId, clientRequestId, callerIntent,
     // The transport's session (MCP `_meta.session_id`) is recorded on the fact, as extract_facts records
     // it, so recall's session_id filter finds single facts too. Identity only — never a trust surface.
@@ -267,7 +269,7 @@ export async function submitForgetMutation(ctx: OperationContext, operation: 'fo
     const slug = fact.source_markdown_slug ?? fact.entity_slug ?? 'memory/unattributed';
     enforceClientSlugFence(ctx, slug, operation); enforceSubagentSlugFence(ctx, slug, operation);
     const authority = await submissionAuthority({ ...ctx, engine: tx }, operation, sourceId, source.incarnation, slug);
-    const row = await admitWriteInTransaction(tx, { principal, operation, sourceId, sourceIncarnation: source.incarnation,
+    const row = await admitWriteInTransaction(tx, { origin: ctx.admissionOrigin, principal, operation, sourceId, sourceIncarnation: source.incarnation,
       slug, requestId, clientRequestId, callerIntent, intent: { ...callerIntent, reason }, authority });
     if (isTerminal(row)) return row;
     return withCoordinatedWrite(tx, [sourceId], async () => {

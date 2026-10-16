@@ -1,4 +1,5 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
+import { recordRecallOutcome } from '../funnel.ts';
 import type { RelationalPlanMeta } from '../search/relational-recall.ts';
 import type { Notice } from '../agent-output.ts';
 import { readHolders } from './context.ts';
@@ -35,7 +36,7 @@ import { leanRowsKeepId, projectRows, resultRowsFor } from '../search/lean-rows.
 import { buildScoreDetails } from '../search/explain-formatter.ts';
 import { SearchTimings } from '../search/stage-timings.ts';
 import { TargetTrace, diagnoseProbe, diagnoseTrace, probeTarget, type ExplainTargetDiagnosis } from '../search/explain-target.ts';
-import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, effectivePlan, pagePlanHits, resolveEvidencePlan, unsupportedDelivery, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
+import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, pagePlanHits, resolveEvidencePlan, selectLongPages, unsupportedDelivery, withLongPagePolicy, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
 import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
@@ -117,6 +118,7 @@ function searchOutput(ctx: OperationContext, p: Record<string, unknown>, results
   const shown = ctx.remote !== false || p.fields !== undefined ? { rows } : {};
   // Stage timings are read last, after the returned rows are assembled (meta only, never content).
   const emit = (output: { meta: Record<string, unknown> }, returned: SearchResult[]) => {
+    recordRecallOutcome(returned);
     ctx.emitResponseMeta?.('retrieval', { ...output.meta, timings: timings.snapshot() });
     return returned;
   };
@@ -155,10 +157,11 @@ const RETURN_WINDOW_PARAM = {
 /**
  * With a plan, `token_budget` budgets the delivered evidence, so query's
  * chunk-level budget stays off; query's token_budget without a return_unit
- * keeps its chunk-mode meaning.
+ * keeps its chunk-mode meaning. The long-page policy (`search.long_page_unit`)
+ * is resolved here, at the search/query caller, and nowhere else.
  */
 async function evidencePlanFor(ctx: OperationContext, p: Record<string, unknown>, snippetCap: number, op: 'search' | 'query'): Promise<EvidencePlan | null> {
-  return resolveEvidencePlan(ctx.engine, {
+  return withLongPagePolicy(ctx.engine, await resolveEvidencePlan(ctx.engine, {
     legacyBudget: op === 'query' && typeof p.token_budget === 'number',
     remote: ctx.remote,
     viaSubagent: ctx.viaSubagent,
@@ -168,7 +171,7 @@ async function evidencePlanFor(ctx: OperationContext, p: Record<string, unknown>
     snippetChars: p.snippet_chars,
     snippetCap,
     op,
-  });
+  }));
 }
 
 /**
@@ -178,9 +181,10 @@ async function evidencePlanFor(ctx: OperationContext, p: Record<string, unknown>
  */
 async function withEvidence(ctx: OperationContext, p: Record<string, unknown>, results: SearchResult[], plan: EvidencePlan | null,
   scope: DeliveryScope, meta: HybridSearchMeta | null): Promise<{ rows: SearchResult[]; evidence?: { delivery: DeliveryMeta; explicitSnippet: boolean } }> {
-  const applied = effectivePlan(plan, results);
+  const deliveryScope = { ...scope, requireSafeChunks: ctx.remote !== false };
+  const { plan: applied, longPages } = await selectLongPages(ctx.engine, plan, results, deliveryScope);
   if (!applied) return { rows: results };
-  const d = await deliverEvidence(ctx.engine, results, applied, { ...scope, requireSafeChunks: ctx.remote !== false }, { liveHits: meta?.cache?.status !== 'hit' });
+  const d = await deliverEvidence(ctx.engine, results, applied, deliveryScope, { liveHits: meta?.cache?.status !== 'hit', ...(longPages ? { longPages } : {}) });
   return { rows: d.results, evidence: { delivery: d.delivery, explicitSnippet: typeof p.snippet_chars === 'number' && Number.isFinite(p.snippet_chars) } };
 }
 
@@ -754,8 +758,9 @@ const search: Operation = {
           if (hit && !text.includes(names[0]!.toLowerCase())) row.matched_alias = hit;
         }
       }
-      const keywordCount = page ? null : timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, undefined, keywordOpts));
-      const results = (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts })))).map(r => ({ ...r }));
+      const lexicalDone = Promise.withResolvers<void>();
+      const keywordCount = page ? null : timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, undefined, keywordOpts, lexicalDone.promise));
+      const results = (page ? page.rows : dedupResults(await timings.stage('lexical', () => ctx.engine.searchKeyword(queryText, { limit, offset, ...keywordOpts })).finally(lexicalDone.resolve))).map(r => ({ ...r }));
       await stampKeywordRows(ctx, results, { ...scope, excludePrivate }, queryText, startedAt, timings);
       // #3800: cap AFTER capture/meta so eval + cache see the real payload.
       return evidenceOutput(ctx, p, results, plan, { ...scope, excludePrivate }, null, snippetCap, timings,
@@ -766,7 +771,8 @@ const search: Operation = {
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
     // expansion OFF (no per-call LLM cost). `query` op is the full-control variant.
     let capturedMeta: HybridSearchMeta | null = null;
-    const keywordCount = timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, types, readOpts));
+    const searchDone = Promise.withResolvers<void>();
+    const keywordCount = timings.overlap('keyword_count', startKeywordCount(ctx.engine, queryText, types, readOpts, searchDone.promise));
     const explainPrep = await setup(() => prepareExplainTarget(ctx, p, scope, excludePrivate, 'search'));
     const searchOpts = {
       limit,
@@ -787,7 +793,7 @@ const search: Operation = {
     };
     const primary = await hybridSearchCached(ctx.engine, queryText, {
       ...searchOpts, onMeta: (m) => { capturedMeta = m; }, explain: p.explain === true, explainTarget: explainPrep?.trace,
-    });
+    }).finally(searchDone.resolve);
     const declarations = new DeclarationMemo();
     const fanned = offset === 0
       ? await timings.stage('alias_fanout', () => withAliasFanOut(ctx.engine, primary, queryText, { ...scope, excludePrivate },

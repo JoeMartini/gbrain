@@ -8,10 +8,10 @@ import { readPreparationPolicy } from '../../../core/persistence/switches.ts';
 import { resolvePrepare, resolveSessionTimeouts } from '../../../core/db.ts';
 import { agentFix, checkError, doctorVerify } from '../check-fix.ts';
 import { lostCallerWrites } from '../../../core/repair/failed-writes.ts';
+import { readCapacityForecast, readCapacityThresholds } from '../../../core/persistence/capacity-forecast.ts';
 
 const WINDOW_DAYS = 7;
 const SAMPLE = 10_000;
-const WARN_DAYS = 90;
 const HORIZON_DAYS = 3650;
 
 /**
@@ -46,8 +46,9 @@ export async function requestIndexesCheck(engine: BrainEngine): Promise<Check> {
  * over the last 7 days (sampled from the newest 10,000 admissions per scope,
  * one bounded index read each), lifetime request IDs against
  * `persistence.limits.*`, and the projected days until admission refuses.
- * Warns when a scope would exhaust its lifetime IDs within 90 days, with the
- * same `gbrain config set` value `persistence_capacity` prints.
+ * Warns when a scope would exhaust its lifetime IDs within
+ * `persistence.capacity.warn_days` (30), the threshold `persistence_capacity`
+ * uses, with the same `gbrain config set` value it prints.
  */
 export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
   const docs = 'docs/guides/repair.md#request-growth';
@@ -58,6 +59,7 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
     const counters = await engine.executeRaw<{ key: string; lifetime_ids: string }>(
       "SELECT key,lifetime_ids::text FROM persistence_counters WHERE key='brain' OR key LIKE 'principal:%' ORDER BY key");
     const limits = await readJournalLimits(engine);
+    const { warnDays } = await readCapacityThresholds(engine);
     const now = Date.now();
     const scopes = [];
     for (const counter of counters) {
@@ -78,11 +80,14 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
         days_to_exhaustion: daysLeft === null ? null : Math.floor(daysLeft),
         exhaustion_date: daysLeft === null ? null : new Date(now + daysLeft * 86_400_000).toISOString().slice(0, 10) });
     }
-    const soon = scopes.filter(scope => scope.days_to_exhaustion !== null && scope.days_to_exhaustion < WARN_DAYS);
+    const soon = scopes.filter(scope => scope.days_to_exhaustion !== null && scope.days_to_exhaustion < warnDays);
     // Every principal shares one brain-wide key, so each key gets the largest value any scope needs.
     const needed = new Map<string, number>();
+    const forecast = soon.length ? await readCapacityForecast(engine, { limits }).catch(() => null) : null;
     for (const scope of soon) {
-      const value = await oneYearCapacity(engine, scope.scope, 'LifetimeIds', scope.lifetime_ids, scope.limit);
+      const predicted = forecast?.rows.find(row => row.scope === scope.scope && row.resource === 'lifetime_ids');
+      const value = predicted && predicted.per_day_7d > 0 ? predicted.recommended_limit
+        : await oneYearCapacity(engine, scope.scope, 'LifetimeIds', scope.lifetime_ids, scope.limit);
       needed.set(scope.config_key, Math.max(needed.get(scope.config_key) ?? 0, value));
     }
     const commands = [...needed].map(([key, value]) => `gbrain config set ${key} ${value}`);
@@ -90,7 +95,7 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
       commands, verify: 'gbrain doctor --json (check persistence_request_growth)', docs };
     const rows = `${details.rows_exact ? '' : '~'}${details.rows} request row(s)`;
     if (!soon.length) return { name: 'persistence_request_growth', status: 'ok', details,
-      message: `${rows}; no scope exhausts its lifetime request IDs within ${WARN_DAYS} days at its last-${WINDOW_DAYS}-day rate.` };
+      message: `${rows}; no scope exhausts its lifetime request IDs within ${warnDays} days at its last-${WINDOW_DAYS}-day rate.` };
     return { name: 'persistence_request_growth', status: 'warn', details,
       message: `${rows}. ${soon.map(scope => `${scope.scope} admits ${scope.per_day}/day over the last ${scope.window_days} day(s) and reaches `
         + `${scope.config_key}=${scope.limit} (${scope.lifetime_ids} used) around ${scope.exhaustion_date}`).join('; ')}; admission refuses then. `
@@ -113,6 +118,9 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
  * #6278: each stall also carries the claim's step, what it waits on, the owner
  * process and, for a preparation past its budget, `claim.stall`
  * (`preparation_overdue`); the budgets in effect are in the details.
+ * A claim that is released and taken again every few seconds never ages past
+ * `max_claim_ms`, so a running request is also a stall once it is that old and
+ * no request on its root reached a terminal state within the same window.
  */
 export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
   const docs = 'docs/guides/troubleshooting.md#persistence-write-stall';
@@ -120,22 +128,31 @@ export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
     const maxClaimMs = await readMaxClaimMs(engine);
     const policy = await readPreparationPolicy(engine);
     const rows = await engine.executeRaw<{ request_id: string; source_id: string; worktree_id: string | null; operation: string; intent_kind: string | null; state: string; claim_phase: unknown;
-      execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean; request_age_ms: string; waiting: number }>(
+      execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean; request_age_ms: string; no_root_progress: boolean; waiting: number }>(
       `SELECT r.request_id::text,r.source_id,r.worktree_id::text,r.operation,r.intent->>'kind' AS intent_kind,r.state,r.claim_phase,r.execution_token::text,r.claim_expires_at<now() AS claim_lapsed,
         r.publication_started,(EXTRACT(EPOCH FROM (now()-r.created_at))*1000)::bigint::text AS request_age_ms,
+        NOT EXISTS (SELECT 1 FROM persistence_requests q WHERE ((r.worktree_id IS NOT NULL AND q.worktree_id=r.worktree_id)
+          OR (r.worktree_id IS NULL AND q.worktree_id IS NULL AND q.source_id=r.source_id))
+          AND q.state IN ('committed','conflict','failed','cancelled') AND q.completed_at>=now()-($1::double precision*interval '1 millisecond')
+          AND q.recovery IS NULL AND NOT q.compacted) AS no_root_progress,
         (SELECT count(*)::int FROM persistence_requests q WHERE q.worktree_id=r.worktree_id AND q.state='queued' AND q.sequence>r.sequence) AS waiting
-      FROM persistence_requests r WHERE r.state='running' ORDER BY r.sequence LIMIT 100`);
+      FROM persistence_requests r WHERE r.state='running' ORDER BY r.sequence LIMIT 100`, [maxClaimMs]);
     const now = Date.now();
     const stalls = rows.flatMap(row => {
       const claim = claimStateOf(row, now);
       if (!claim) return [];
       // An owner that predates phase recording never stamps its claims; the request's own age bounds the claim's.
       const held = claim.claim_age_ms ?? (row.claim_phase == null ? Math.max(0, Number(row.request_age_ms)) : null);
-      if (held === null || !(held >= maxClaimMs)) return [];
+      const stalledWithoutProgress = row.no_root_progress && Number(row.request_age_ms) >= maxClaimMs;
+      if (!(held !== null && held >= maxClaimMs) && !stalledWithoutProgress) return [];
+      const claimAgeMs = held ?? claim.claim_age_ms ?? 0;
+      const requestAgeMs = Math.max(0, Number(row.request_age_ms));
       const budget = preparationBudgetMs({ operation: row.operation, intent: row.intent_kind ? { kind: row.intent_kind } : null }, policy, 30_000);
       return [{ request_id: row.request_id, source_id: row.source_id, root: row.worktree_id, operation: row.operation, intent_kind: row.intent_kind, phase: claim.phase,
-        claim_age_ms: held, phase_age_ms: claim.phase_age_ms, step: claim.step, step_age_ms: claim.step_age_ms, waiting_on: claim.waiting_on, owner: claim.owner,
-        budget_ms: budget, stall: claimStall(claim, budget), waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own, why: claim.why }];
+        claim_age_ms: claimAgeMs, request_age_ms: requestAgeMs, phase_age_ms: claim.phase_age_ms, step: claim.step, step_age_ms: claim.step_age_ms, waiting_on: claim.waiting_on, owner: claim.owner,
+        budget_ms: budget, stall: claimStall(claim, budget), waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own,
+        why: stalledWithoutProgress && !(held !== null && held >= maxClaimMs)
+          ? `${claim.why} No request on this root reached a terminal state during the claim window, even though its claim was renewed.` : claim.why }];
     });
     const details = { max_claim_ms: maxClaimMs, config_key: MAX_CLAIM_CONFIG_KEY, count: stalls.length, stalls, docs,
       preparation_policy: { sync_preparation_ms: policy.syncMs, maintenance_preparation_ms: policy.maintenanceMs, preparation_ceiling_ms: policy.ceilingMs, max_preparation_attempts: policy.maxAttempts } };
@@ -144,9 +161,9 @@ export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
     const first = stalls[0]!;
     const minutes = (ms: number) => `${Math.round(ms / 60_000)} min`;
     return { name: 'persistence_write_stall', status: 'warn', details,
-      message: `${stalls.length} write request(s) have held their claim longer than ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms). `
+      message: `${stalls.length} write request(s) have stalled beyond ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms). `
         + stalls.slice(0, 3).map(stall => `Request ${stall.request_id} (${stall.operation}) on source ${stall.source_id}, root ${stall.root ?? 'database-only'}, `
-          + `is stuck in phase ${stall.phase} after ${minutes(stall.claim_age_ms)}; ${stall.waiting_behind} queued write(s) wait behind it. ${stall.why}`).join(' ')
+          + `is stuck in phase ${stall.phase} after ${minutes(Math.max(stall.claim_age_ms, stall.request_age_ms))}; ${stall.waiting_behind} queued write(s) wait behind it. ${stall.why}`).join(' ')
         + ` Next: inspect it with gbrain sources writer status --source ${first.source_id} --json, then restart the gbrain serve that owns the root`
         + `${first.resumes_on_its_own ? ' if it is still stuck after its transaction ends' : ''}. The root trigger of a hang is not known yet; attach that status output when reporting it.`,
       fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', first.source_id, '--json'],
@@ -210,11 +227,14 @@ export async function lostCallerWritesCheck(engine: BrainEngine, sourceIds?: str
   const docs = 'docs/guides/repair.md#failed-writes';
   try {
     const sources = sourceIds ?? (await engine.executeRaw<{ id: string }>('SELECT id FROM sources WHERE archived IS NOT TRUE ORDER BY id')).map(row => row.id);
-    const { lost, compacted } = await lostCallerWrites(engine, sources);
+    const { lost, compacted, not_replayable } = await lostCallerWrites(engine, sources);
     const count = lost.reduce((sum, row) => sum + row.count, 0);
-    const details = { count, writes: lost, compacted_unreplayable: compacted, repair: 'failed-writes', docs };
+    const kept = not_replayable.unpinned_target + not_replayable.revision_superseded;
+    const details = { count, writes: lost, ...(kept ? { not_replayable } : {}), compacted_unreplayable: compacted, repair: 'failed-writes', docs };
     const compactedNote = compacted ? ` ${compacted} older refused receipt(s) were compacted (persistence.receipt_retention_days) and cannot be replayed.` : '';
-    if (!count) return { name: 'lost_caller_writes', status: 'ok', details, message: `Every caller write with a retained receipt committed or was superseded.${compactedNote}` };
+    const keptNote = kept ? ` ${kept} refused caller write(s) cannot be replayed (${not_replayable.unpinned_target} remember whose subject was inferred, `
+      + `${not_replayable.revision_superseded} put_page whose page changed after the revision the caller read); the caller has to write them again.` : '';
+    if (!count) return { name: 'lost_caller_writes', status: 'ok', details, message: `Every caller write with a retained receipt committed or was superseded.${keptNote}${compactedNote}` };
     const bySource = new Map<string, number>();
     for (const row of lost) bySource.set(row.source_id, (bySource.get(row.source_id) ?? 0) + row.count);
     const first = [...bySource.keys()][0]!;
@@ -223,9 +243,10 @@ export async function lostCallerWritesCheck(engine: BrainEngine, sourceIds?: str
     return { name: 'lost_caller_writes', status: 'warn', details,
       message: `${count} caller write(s) never landed (${memory} remember; ${drift} refused source_changed because the page's canonical file did not match its database copy `
         + `or was missing, ${count - drift} refused by the managed writer guard): ${[...bySource].map(([source, n]) => `${source}: ${n}`).join(', ')}. The callers saw an error and `
-        + `the fact or page edit was dropped. Preview the replay on the brain host: gbrain repair failed-writes --source ${first} — then run the apply command it prints after the user agrees.${compactedNote}`,
+        + `the fact or page edit was dropped. Preview the replay on the brain host: gbrain repair failed-writes --source ${first} — it lists which writes can be replayed and records `
+        + `an approval checkpoint for that set (no page content changes); then run the apply command it prints after the user agrees.${keptNote}${compactedNote}`,
       fix: agentFix(['gbrain', 'repair', 'failed-writes', '--source', first],
-        'Read-only preview: lists each lost write with its disposition (replay, already_written, duplicate, superseded) and prints the apply command.', 'lost_caller_writes', { docs }) };
+        'Preview: lists each lost write with its disposition (replay, already_written, duplicate, superseded, unpinned_target, file_database_drift), records an approval checkpoint for the replay set (no page content changes) and prints the apply command.', 'lost_caller_writes', { docs }) };
   } catch (error) {
     return checkError('lost_caller_writes', 'inspect refused caller writes', error, { details: { count: 'unknown', docs } });
   }

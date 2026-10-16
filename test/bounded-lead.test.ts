@@ -23,7 +23,7 @@ import { stripFactsFence } from '../src/core/facts-fence.ts';
 import { redactFindings } from '../src/core/secret-scan.ts';
 import { sanitizeRemoteBody } from '../src/core/remote-body.ts';
 import { BOUNDED_PREFIX_BYTES } from '../src/core/page-window/document.ts';
-import { boundedPrefixSql, boundedRawPrefix, overlaidBoundedRows, prefixNeedsOverlay, projectedLead } from '../src/core/page-window/bounded-lead.ts';
+import { boundedBodyPrefixSql, boundedRawPrefix, overlaidBoundedRows, prefixNeedsOverlay, projectedLead } from '../src/core/page-window/bounded-lead.ts';
 import { structuralExactLookup } from '../src/core/search/exact-lookup.ts';
 import { applyAliasHop } from '../src/core/search/alias-hop.ts';
 import { normalizeAlias } from '../src/core/search/alias-normalize.ts';
@@ -33,6 +33,7 @@ import { extractCandidates } from '../src/core/context/entity-salience.ts';
 import { lookupEntityNames, pageLead } from '../src/core/verbs/entity-names.ts';
 import { runGather } from '../src/core/think/gather.ts';
 import { installFixtureChunks } from './helpers/page-projection.ts';
+import { cpuMs } from './helpers/cpu-time.ts';
 
 const SENTINEL = 'PRIVATE-TAKE-SENTINEL';
 const FACTS = renderFactsTable([
@@ -81,6 +82,13 @@ function bestMs(fn: () => unknown): number {
   return best;
 }
 
+/** Best of three runs, in ms of process CPU time: it measures the work rather than how long the scheduler made it wait. */
+function bestCpuMs(fn: () => unknown): number {
+  let best = Infinity;
+  for (let i = 0; i < 3; i++) best = Math.min(best, cpuMs(fn));
+  return best;
+}
+
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
@@ -107,13 +115,13 @@ afterAll(async () => { await engine.disconnect(); });
 const pageBody = async (slug: string) => (await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth;
 
 describe('bounded-lead building blocks', () => {
-  test('boundedRawPrefix cuts on a code point within the byte budget; boundedPrefixSql bounds the column', () => {
+  test('boundedRawPrefix cuts on a code point within the byte budget; boundedBodyPrefixSql bounds the column or its lead', () => {
     const body = 'é'.repeat(BOUNDED_PREFIX_BYTES);
     const prefix = boundedRawPrefix(body);
     expect(Buffer.byteLength(prefix, 'utf8')).toBeLessThanOrEqual(BOUNDED_PREFIX_BYTES);
     expect(prefix).toBe('é'.repeat(prefix.length));
     expect(boundedRawPrefix('short')).toBe('short');
-    expect(boundedPrefixSql('p.compiled_truth')).toBe(`left(p.compiled_truth, ${BOUNDED_PREFIX_BYTES})`);
+    expect(boundedBodyPrefixSql('p')).toBe(`left(coalesce(p.compiled_truth, p.truth_lead), ${BOUNDED_PREFIX_BYTES})`);
     expect(prefixNeedsOverlay('x <!--- gbrain:facts:begin -->')).toBe(true);
     expect(prefixNeedsOverlay(small('x').replace(FACTS, ''))).toBe(false);
   });
@@ -228,8 +236,9 @@ describe('bounded work on a 4 MB page', () => {
     const body = await pageBody('people/erin-example');
     const row = { slug: 'people/erin-example', source_id: 'default', title: 'Erin Example', type: 'person', frontmatter: null, compiled_truth: body };
     const whole = bestMs(() => sanitizeRemoteBody(body));
-    expect(bestMs(() => safeSynopsis(row))).toBeLessThan(whole / 4);
-    expect(bestMs(() => pageLead(body))).toBeLessThan(whole / 4);
+    const wholeCpu = bestCpuMs(() => sanitizeRemoteBody(body));
+    expect(bestCpuMs(() => safeSynopsis(row))).toBeLessThan(wholeCpu / 4);
+    expect(bestCpuMs(() => pageLead(body))).toBeLessThan(wholeCpu / 4);
     expect(pageLead(body).length).toBeLessThanOrEqual(200);
     let lead = '';
     let best = Infinity;
