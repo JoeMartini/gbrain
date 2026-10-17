@@ -9,7 +9,9 @@ import { managedForbiddenFlag, managedSyncFlagRefusal } from './managed-sync-fla
 import type { Action } from '../agent-output.ts';
 import type { RegistryCode } from '../error-registry.ts';
 import { buildDetachedWorkingTreeManifest, computeSyncDelta } from '../sync-delta.ts';
-import { isSyncable, isCodeFilePath, isImageFilePath, matchesAnyGlob, resolveSlugForPath } from '../sync.ts';
+import { isSyncable, isCodeFilePath, isImageFilePath, matchesAnyGlob, resolveSlugForPath, slugifyPath } from '../sync.ts';
+import { databaseOnlyPageSql } from './unbound-pages.ts';
+import { validateSlug } from '../utils.ts';
 import { resolveSlugRootMode } from '../sync-anchor.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { getWorktreeBinding, type WorktreeBinding } from './ownership.ts';
@@ -23,9 +25,10 @@ import type { CompanyBrainPlan } from '../company-brain/types.ts';
 import { assertDistinctSyncOrigins, legacySyncOrigin, sameSyncOrigin, selectOriginClaimant, sharedOriginExit, syncOriginPath, type SyncOriginScope } from './sync-origin.ts';
 import { assertManagedSyncActive } from './sync-authority.ts';
 import { isReservedSkillBundlePath } from '../skill-reserved-paths.ts';
-import { holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
+import { holdBasisMoved, holdRescreenDue, readGitHoldRetryPaths, readGitSourceHolds, readSyncImportProvenances } from './sync-holds.ts';
 import { readBlobContents, readTreeBlobs, SYNC_READ_BOUND } from './sync-blobs.ts';
 import { gitChildEnv } from '../git-env.ts';
+import { movedDriftHolds, prescreenSyncEntries, type SyncDriftSide } from './sync-prescreen.ts';
 import { readSyncSlice, sliceEntries, syncCursorOptions, type SyncSliceCursor, type SyncSliceState } from './sync-slices.ts';
 
 /** The page an import takes over from its previous origin: a Git rename, or a file that replaced a vanished origin at the same slug. */
@@ -35,7 +38,13 @@ export interface SyncEntry { path: string; sourcePath: string; action: 'import' 
   /** #5565: a deleted file no page records as its origin; its slug's page keeps another origin, so the deletion is a fenced no-op. */
   unownedDeletion?: boolean;
   /** #5988: a held rename destination whose source page changed since the rename was recorded; the freeze screen holds it as `rename_held`. */
-  renameHeld?: SyncRename; }
+  renameHeld?: SyncRename;
+  /** #6712 PR 1: the import provenance matches the pinned blob, the frozen revision and this parser; the no-op kernel decides (sync-prescreen.ts). */
+  prescreened?: true;
+  /** #6712 PR 1: the page moved since its last recorded import (or has no record); imported only when the freeze proves it a no-op, else held `file_drift`. */
+  drift?: SyncDriftSide;
+  /** #6727: live pages with no recorded origin whose slugs fold to this file's slug, several or one the importer cannot write; the freeze holds it `legacy_slug_conflict`. */
+  legacySlugs?: string[]; }
 /** Files that map to a slug another origin keeps; they are left out of the manifest until one is renamed. */
 export interface SyncSlugCollision { slug: string; kept: string; skipped: string[]; }
 /** #5032: a file sync skipped on this host with a named refusal, without failing the run. */
@@ -258,12 +267,12 @@ function cutDiscoveryToSlice(discovered: SyncDiscovery, slicing: Pick<SyncSliceC
   if (cut.done && discovered.target === head) delete discovered.stagedHead; else discovered.stagedHead = head;
 }
 export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, context?: ManagedSyncContext,
-  stage?: { target: string; head: string; slice?: Pick<SyncSliceCursor, 'phase' | 'after'> }): Promise<SyncDiscovery> {
+  stage?: { target: string; head: string; slice?: Pick<SyncSliceCursor, 'phase' | 'after'> }, walk = false): Promise<SyncDiscovery> {
   const { binding, root, gitRoot, sourceId, incarnation, source } = context ?? await resolveManagedSyncContext(engine, opts);
   const company = currentCompanyBrainSync(sourceId);
   if (!company && !stage && !opts.dryRun) {
     const resume = await resumableSliceStage(engine, opts, gitRoot, sourceId, incarnation);
-    if (resume) return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, resume);
+    if (resume) return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, resume, walk);
   }
   const strategy = opts.strategy ?? source.config?.strategy ?? 'markdown';
   const nativeRoot = realpathSync.native(root), nativeGitRoot = realpathSync.native(gitRoot);
@@ -287,7 +296,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
   // #6349: a staged run stops at a commit, so uncommitted working-tree changes wait for the stage that reaches HEAD.
   const working = !company && !stage && (detached || (opts.workingTree ?? (await engine.getConfig('sync.include_working_tree') === 'true')));
   const dirty = company ? { added: [], modified: [], deleted: [], renamed: [] } : buildDetachedWorkingTreeManifest(gitRoot);
-  const delta = !opts.full && source.last_commit ? computeSyncDelta(gitRoot, source.last_commit, target) : null;
+  const delta = !opts.full && !walk && source.last_commit ? computeSyncDelta(gitRoot, source.last_commit, target) : null;
   const entries = new Map<string, SyncEntry>();
   const renamedFrom = new Map<string, string>();
   let workingTreeKept: string[] | undefined;
@@ -383,11 +392,12 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
       const hold = holdByPath.get(path), blob = blobs.get(toGitPath(path));
       return hold && !hold.meta.blob_oid && !hold.meta.working && blob ? [blob] : [];
     });
-    const contents = readBlobContents(gitRoot, unversioned);
+    const contents = readBlobContents(gitRoot, unversioned), movedDrift = await movedDriftHolds(engine, sourceId, holds);
+    const moved = await holdBasisMoved(engine, sourceId, holdByPath, checked);
     for (const path of checked) {
       const hold = holdByPath.get(path), gitPath = toGitPath(path), blob = blobs.get(gitPath);
       const workingHold = working && (hold?.meta.working === true || !blob);
-      let changed = !hold || holdRescreenDue(hold, retry.has(path));
+      let changed = !hold || holdRescreenDue(hold, retry.has(path)) || moved.has(path) || movedDrift.has(path);
       let present = !!blob;
       if (workingHold) {
         let bytes: Buffer | null = null;
@@ -440,7 +450,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
       `This sync of ${sourceId} selected ${selected.length} entries, above the 100,000-entry and 16 MiB cursor bound; nothing was written. Narrow it with --exclude or the sync.exclude config, then run gbrain sync --no-pull --source ${sourceId}.`);
     // #6349 (P4.4): a first sync or a `--full` tree walk has no commit axis to stage on; the target is cut into path slices
     // (re-entered as a stage so the slices read the pinned tree alone, never the working tree).
-    return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, { target, head, slice: { phase: 'import', after: null } });
+    return discoverManagedSync(engine, opts, context ?? { binding, root, gitRoot, sourceId, incarnation, source }, { target, head, slice: { phase: 'import', after: null } }, walk);
   }
   const discovered: SyncDiscovery = { discoveredAt, ...(released.length ? { releasedHolds: released } : {}), ...(retryTaken.length ? { retryTaken } : {}),
     ...(refused.size ? { fileRefusals: [...refused.values()] } : {}), binding: { ...binding, owner_epoch: String(binding.owner_epoch), topology_generation: String(binding.topology_generation) }, root, gitRoot, sourceId, incarnation, from: source.last_commit, target, entries: selected, slugMode, ...(company ? { companyPlan: company.plan } : {}), ...(stage ? { stagedHead: stage.head } : {}),
@@ -471,6 +481,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     if (!slug) throw opError('invalid_params', 'The imported file has no usable page slug.',
       `${entry.sourcePath} in ${sourceId} yields no page slug from its path or frontmatter; nothing was written. Rename the file or set a frontmatter slug and commit, then run gbrain sync --no-pull --source ${sourceId}.`);
     if (!company && entry.action === 'import' && !origin && !isCodeFilePath(entry.sourcePath)) {
+      slug = await adoptLegacyPage(engine, identities, bySlug.get(slug), slug, entry);
       entry.slug = slug;
       claims.set(slug, [...(claims.get(slug) ?? []), entry]);
       continue;
@@ -481,7 +492,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     const unownedDeletion = foreignOrigin && entry.action === 'delete' && !origin && !company;
     if (foreignOrigin && !unownedDeletion) {
       const error = new OperationError('page_identity_changed', 'A different origin occupies the imported slug.',
-        `Page ${slug} in source ${sourceId} records the origin '${page.source_path}', but sync found it at '${entry.sourcePath}'. On the brain host, rename or move one of the two files so each page has one origin, commit, then run gbrain sync --source ${sourceId} --no-pull --retry-failed.`);
+        `Page ${slug} in source ${sourceId} records the origin '${page.source_path}', but sync found it at '${entry.sourcePath}'. On the brain host, rename or move one of the two files so each page has one origin, commit, then run gbrain sync --source ${sourceId} --no-pull.`);
       error.detail = 'sync_origin_mismatch';
       throw error;
     }
@@ -546,6 +557,7 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
   if (collisions.length) discovered.slugCollisions = collisions;
   // Identities and origin collisions were resolved over the whole target above; only the frozen manifest is cut.
   if (slicing) cutDiscoveryToSlice(discovered, slicing, head);
+  await prescreenSyncEntries(engine, discovered, { full: !!opts.full, treeWalk: delta?.status !== 'ok', noSchemaPack: !!opts.noSchemaPack, dryRun: !!opts.dryRun, held: holdByPath });
   if (!working) {
     const uncommitted = { added: new Set([...dirty.added,...dirty.renamed.map(r=>r.to)].filter(eligible)).size,
       modified: new Set(dirty.modified.filter(eligible)).size,
@@ -553,6 +565,36 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
     if (uncommitted.added || uncommitted.modified || uncommitted.deleted) discovered.uncommitted = uncommitted;
   }
   return discovered;
+}
+type LegacyIdentity = { id: number; slug: string; source_path: string | null; deleted_at: Date | string | null };
+/**
+ * #6727: per discovery, its live pages with no recorded origin whose slug the current fold changes, by folded slug. Built on
+ * first need; database-only pages (never imported from a file) are left out by one read over just those candidates, so a
+ * source without legacy pages issues no extra statement.
+ */
+const legacyByFold = new WeakMap<LegacyIdentity[], Promise<Map<string, string[]>>>();
+async function foldLegacyPages(engine: BrainEngine, identities: LegacyIdentity[]): Promise<Map<string, string[]>> {
+  const candidates = identities.filter(page => page.deleted_at == null && page.source_path == null && slugifyPath(page.slug) !== page.slug);
+  const databaseOnly = new Set(candidates.length ? (await engine.executeRaw<{ id: number }>(
+    `SELECT p.id FROM pages p WHERE p.id=ANY($1::bigint[]) AND ${databaseOnlyPageSql('p')}`, [candidates.map(page => Number(page.id))])).map(row => Number(row.id)) : []);
+  return candidates.filter(page => !databaseOnly.has(Number(page.id)))
+    .reduce((map, page) => map.set(slugifyPath(page.slug), [...map.get(slugifyPath(page.slug)) ?? [], page.slug]), new Map<string, string[]>());
+}
+/**
+ * #6727: the slug a file with no recorded origin imports as. With no live page at its folded slug, exactly one legacy page
+ * (an older gbrain imported it before the current fold) folding to it is the file's: it imports into that page (same id,
+ * links and history). Several, or one whose slug the importer cannot write as it stands (`validateSlug` lowercases), keep
+ * the folded slug and are named on the entry, so the freeze holds the file `legacy_slug_conflict`.
+ */
+async function adoptLegacyPage(engine: BrainEngine, identities: LegacyIdentity[], holder: LegacyIdentity | undefined, slug: string, entry: SyncEntry): Promise<string> {
+  if (holder && holder.deleted_at == null) return slug;
+  let folded = legacyByFold.get(identities);
+  if (!folded) legacyByFold.set(identities, folded = foldLegacyPages(engine, identities));
+  const legacy = (await folded).get(slug) ?? [];
+  const writable = () => { try { return validateSlug(legacy[0]!) === legacy[0]; } catch { return false; } };
+  if (legacy.length === 1 && writable()) return legacy[0]!;
+  if (legacy.length) entry.legacySlugs = [...legacy].sort();
+  return slug;
 }
 /** #6517: several live pages (the soft-delete exit is named) or several tombstones record one imported origin. */
 function ambiguousOriginRefusal(sourceId: string, sourcePath: string, named: Array<{ slug: string }>, ambiguous: 'several_live' | 'several_tombstones'): OperationError {

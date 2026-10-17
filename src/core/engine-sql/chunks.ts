@@ -102,12 +102,12 @@ export async function upsertChunksOnce(
       gatewayModel = gw.getEmbeddingModelProvenance();
     } catch {}
     const writesRows = chunks.length > 0;
-    const columnRows = writesRows && !opts?.embeddingColumn ? memo('config:embedding-columns', async () =>
-      (await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns')`)).rows)
+    // #6712 L6: the column and model keys are one statement (a round trip where pipelining is off).
+    const configRows = writesRows && (!opts?.embeddingColumn || !gatewayModel) ? memo('config:embedding-write', async () =>
+      (await exec.run<{ key: string; value: string }>(sqlFragment`SELECT key, value FROM config WHERE key IN ('search_embedding_column', 'embedding_columns', 'embedding_model')`)).rows)
       .then(rows => rows, () => null) : undefined;
-    const modelRows = writesRows && !gatewayModel ? memo('config:embedding-model', async () =>
-      (await exec.run<{ value?: string }>(sqlFragment`SELECT value FROM config WHERE key = 'embedding_model'`)).rows)
-      .then(rows => rows, () => null) : undefined;
+    const columnRows = opts?.embeddingColumn ? undefined : configRows;
+    const modelRows = gatewayModel ? undefined : configRows?.then(rows => rows && rows.filter(row => row.key === 'embedding_model'));
     const sealed = seal !== undefined && opts?.pageId !== undefined && chunks.length > 0 ? opts.pageId : undefined;
     const sealPage = () => exec.run<{ id: number }>(sqlFragment`UPDATE pages SET chunker_version = ${seal} WHERE slug = ${slug} AND source_id = ${sourceId} RETURNING id`);
     const pages = sealed !== undefined ? [{ id: sealed }] : (await (seal === undefined
@@ -1023,6 +1023,26 @@ export async function getEmbeddingsByChunkIds(exec: LegacyUnscopedRead, ids: num
     }
     return result;
   }
+
+/**
+ * The text-space cosine re-score in SQL (`search/cosine-rescore.ts`): one
+ * `(id, cosine)` row per hydrated chunk, the rows `getEmbeddingsByChunkIds`
+ * returns (same active column, halfvec read exactly as vector, same
+ * visibility). A hydrated vector whose dimensions differ from the query's,
+ * or a zero-norm vector or query, scores 0 without reaching the operator, as
+ * `cosineSimilarity` does; an absent or invisible chunk returns no row.
+ */
+export function cosineByChunkIdsStatement(ids: number[], column: string, query: Float32Array): { text: string; params: unknown[] } {
+  if (!COLUMN_NAME_REGEX.test(column)) throw new EmbeddingColumnNotRegisteredError(column, []);
+  const col = trustedSql(`cc.${quoteIdentifier(column)}`);
+  const q = `[${Array.from(query).join(',')}]`;
+  return renderFragment(sqlFragment`
+    SELECT cc.id, CASE WHEN vector_dims(${col}::vector) <> ${query.length}::int OR vector_norm(${col}::vector) = 0 OR vector_norm(${q}::vector) = 0
+                       THEN 0::float8 ELSE 1 - (${col}::vector <=> ${q}::vector) END AS cosine
+      FROM content_chunks cc JOIN pages p ON p.id = cc.page_id
+     WHERE cc.id = ANY(${ids}::int[]) AND ${col} IS NOT NULL AND ${trustedSql(chunkVisibleFilter('p', 'cc'))}
+  `);
+}
 
 /**
  * Evidence delivery: ONE batched read of chunk_index windows, keyed by

@@ -131,9 +131,10 @@ work behind exits 0, so scripts should also check `results[].complete`.
 | `request-indexes` | `persistence_request_indexes` | Creates a missing managed sync request index, or drops an INVALID one (left by an interrupted concurrent build) and rebuilds it, on a brain whose schema version is already current. Postgres builds each index `CONCURRENTLY`, one at a time, so writes continue; PGLite builds inline. It changes no user data, takes no journal admission and runs brain-wide (`--source` does not narrow it). See [managed sync request indexes](#request-indexes). | `building`: an index another session is still building; it is never dropped. |
 | `connector-fences` | none (a `connector_fence_below_timeline` refusal names it) | Moves a facts or takes fence that sits below the timeline sentinel of a Google or GitHub page into the page body through a revision-bound `put_page`, so the connector's next re-render carries the fence instead of refusing. Then re-attempt the held item with `gbrain sources retry-held <source>`. | `kept_ambiguous_pages`: pages whose fences are duplicated, unbalanced or unparseable. Move the fence by hand: read the page, place the fence above the `<!-- timeline -->` line, and save it with the current `expected_revision`. |
 | `take-supersession` | none | Rebuilds `takes.superseded_by` for supersession chains written before the pointer moved onto the old fence row (#5886). Each struck take is linked to the row that replaced it only from evidence: a committed `takes_supersede` receipt, a stored `superseded_by`, or a row carrying the old `superseded by #<own row>` pointer with exactly one possible predecessor. The pointer is written onto the old row (`<source>; superseded by #N`) and stale self-pointers are dropped through a revision-bound `put_page`; a page whose fence is already right but whose stored pointers differ is reprojected without a page write. See [take supersession](#take-supersession). | `ambiguous_pages` / `ambiguous_rows`: pages where a new row has two or more possible predecessors, or where evidence conflicts. The preview lists each with its candidates and the manual edit; nothing on them changes. `unparsed_pages`: pages whose takes fence does not parse cleanly. |
+| `accepted-takes` | none | Explicit-only, preview-bound. Restores takes that accepting a held strike-through or kind change removed on v0.60.253.0 (`gbrain trust confirm tp<id>` ran a `takes_remove` instead of applying the change). It restores only what the records prove: the accepted proposal, the `takes_remove` receipt bound to it, the page version that receipt archived (the row the accept should have applied) and the reservation row still holding its number. `--apply --expect <hash>` republishes each page with that row through a revision-bound `put_page`. See [accepted takes](#accepted-takes). | `version_missing` (the archived version was pruned), `row_number_in_use` (the number holds a take again), `page_missing`, `fence_unreadable`. A grade or resolution the database alone held is not in any record and is not restored. |
 | `connector-checkpoints` | `connector_checkpoints` | Deletes managed connector checkpoint rows and retry pointers that no registered connector source can load and that are older than 7 days. They accumulate after a content setting such as `g_history_days` changes, or when a connector host older than v0.60.11.0 runs during an upgrade. Cleanup only: it never copies or re-keys a checkpoint, takes no journal admission and runs brain-wide (`--source` does not narrow it). | Rows a queued or running connector write, or a connector's recorded pending set, still references. |
 | `orphan-bindings` | `orphan_persistence_bindings` | Deletes persistence source bindings whose source was removed, or that belong to an earlier incarnation of a source re-added under the same id. `gbrain sources remove` and `gbrain sources purge` delete the binding; one an older gbrain left behind makes the re-added source read as claimed, so every `gbrain sync --source <id>` fails with `writer_coordinator_required`. Bookkeeping only: no journal admission, no page or file changes, and it runs brain-wide (`--source` does not narrow it). See [orphan bindings](#orphan-bindings). | A binding that a queued, running or recovering write request of the same source incarnation still references. |
-| `managed-sync-orphans` | `sync_failures` | Explicit-only, preview-bound. Retires managed sync bookkeeping nothing current can resume or clear: a `managed-sync-failure` row whose cursor key has no cursor, and an unfinished `managed-sync` cursor recorded by a principal that is no longer an active local writer (or a pre-options cursor a later run superseded) whose pending request is terminal. `op_checkpoints` rows only; no journal admission, no page or file changes. The preview prints a hash; `--apply --expect <hash>` retires exactly that set. See [managed sync orphans](#managed-sync-orphans). | An unfinished cursor whose pending request is still queued, running or recovering, or one the live writer can resume with its recorded options (doctor prints that sync command). |
+| `managed-sync-orphans` | `sync_failures` | Explicit-only, preview-bound. Retires managed sync bookkeeping nothing current can resume or clear: a `managed-sync-failure` row whose cursor key has no cursor, and an unfinished `managed-sync` cursor recorded by a principal that is no longer an active local writer (or a pre-options cursor a later run superseded) whose pending request is terminal, or (#6834) a cursor whose checkpoint can never publish because the source's `last_commit` moved elsewhere (`checkpoint_moved`). `op_checkpoints` rows only; no journal admission, no page or file changes. The preview prints a hash; `--apply --expect <hash>` retires exactly that set. See [managed sync orphans](#managed-sync-orphans). | An unfinished cursor whose pending request is still queued, running or recovering, or one the live writer can resume with its recorded options (doctor prints that sync command). |
 | `stuck-recovery` | none (`gbrain sources writer status` shows the request `recovering` with `unexpected_file_bytes`) | Explicit-only, preview-bound, destructive consent. Resolves a live page publication recovery whose file matches neither its recorded prior nor its published bytes, which stops every write on its worktree. The preview lists each blocked file with both fingerprints and writes a private diff; `--apply --expect <hash> --keep prior\|disk --yes` backs up both versions, then restores the prior (the write publishes again) or keeps the edit and abandons the write. See [stuck recovery](#stuck-recovery). | A terminal request with its recovery still set (listed as refused, `recovery_choice_refused`), a withdrawal-mirror effect recovery (listed as refused, `recovery_effect_unsupported`), a shared-skill bundle recovery (`recovery_bundle_unsupported`), a recovery blocked on staging bytes, and a recovery whose file already matches a recorded version (the resident writer finishes those). |
 | `frontmatter-keys` | `stale_frontmatter_keys` | Explicit-only, preview-bound. Strips the parser's reserved top-level keys (`type`, `title`, `tags`, `slug`) that an older import stored inside `pages.frontmatter`. Since v0.60.176.0 those keys are not file/database drift and never render (#6454), so this is hygiene: database rows only, in source-scoped coordinated batches of up to 1,000 pages, no file, body or embedding change. Each swept page advances its `knowledge_revision` once, so a client holding an older revision of a swept page gets one `revision_conflict` and re-reads. See [frontmatter keys](#frontmatter-keys). | A page whose keys were cleared by a write between preview and apply (`already_clean`). |
 | `embedding-effects` | `stale_embedding_effects` | Settles stale queued and failed embedding effects of committed writes, which block receipt compaction and activation: `reconciled` when current vectors pass the effect verifier, `superseded` when the page was deleted or a newer revision owns its own effect, `retry_queued` for the owner (paid; a used-up retry allowance gets one new bounded cycle per explicit apply). See [stale queued embedding effects](#stale-queued-embedding-effects). | `blocked` effects, counted by reason (`owner_unavailable`, `embedding_disabled`, `embedding_unconfigured`, `projection_pending`, `no_replacement_obligation`). |
@@ -229,7 +230,7 @@ and is not retried ahead of other writes.
 valid, a warning with progress while one is still building (leave it
 running), and a warning naming `gbrain repair request-indexes --apply` when one
 is missing or INVALID. After the rebuild, run the retry the refusal printed
-(`gbrain sync --source <source> --no-pull --retry-failed` plus the saved
+(`gbrain sync --source <source> --no-pull` plus the saved
 processing flags).
 
 <a id="request-growth"></a>
@@ -297,7 +298,32 @@ To drain now:
 gbrain projections drain            # until every page queued at the start was tried once
 gbrain projections drain --limit 5000
 gbrain projections drain --json     # {rebuilt, superseded, failed: [{source_id, slug, reason}], remaining}
+gbrain projections drain --dry-run  # rebuild nothing: list the queued rows in the order a drain tries them
 ```
+
+`--dry-run` is the preview: it reads the queue only and prints the rows a
+drain with the same `--limit` (default 50) would try, in that order, each with
+its queue reason (`rebuild_failed` for a row whose last rebuild failed);
+`--json` gives `{pending, failed, rows}`.
+
+<a id="embed-backfill-stalled"></a>
+**An automatic embed-backfill that keeps failing the same way.** A page whose
+projection cannot be rebuilt (`rebuild_failed`) leaves its chunks
+unembeddable, so every automatic `embed-backfill` for that source ends
+`incomplete; N chunks remain and M projections are blocked` with nothing
+embedded. After the first such failure the next automatic submission waits
+twice the cooldown (20, then 40 minutes); after three identical failures
+automatic submission stops for that source, and a retry inside one job that
+finds the same blockers dead-letters instead of running again. Doctor
+`embed_backfill_stalled` names the blocked pages, their page kind and queue
+reason. Preview with `gbrain projections drain --dry-run`, then run
+`gbrain projections drain`: it retries each queued Markdown or code page in the
+foreground and prints why a page still fails and its next step. Image and media
+pages are rebuilt only by their importer (`gbrain sync --full --source <id>` or
+`gbrain embed --stale --images --source <id>`). Automatic backfill resumes by
+itself once the blocked pages or the stale chunks change, or a run embeds
+anything; `gbrain embed --stale --source <id>` and
+`gbrain jobs submit embed-backfill` are never held back.
 
 | Exit | Meaning |
 | --- | --- |
@@ -393,6 +419,39 @@ hand: read the page (`gbrain get --source <source> -- <slug>`), append
 replaced, save it with the current `expected_revision`, then run the repair
 again; it drops the leftover self-pointers and stores the pointers.
 
+<a id="accepted-takes"></a>
+### Accepted takes
+
+**Say to your agent:** *"I accepted held take changes on v0.60.253.0. Check whether any take was removed and restore it."*
+
+On v0.60.253.0, accepting a held change to a take you had confirmed
+(`gbrain trust confirm tp<id>`, or `gbrain trust review --accept-all`) removed
+the take when the change kept its claim: an agent struck it through
+(`~~claim~~`) or changed its kind or holder. The take left the page's takes
+fence and the takes index; the accept should have applied the change instead.
+A later sync or publish cannot bring it back, because the page no longer
+carries the row. A take with a grade in its fence was safe: the removal
+refused it.
+
+Preview, then apply after you agree:
+
+```bash
+gbrain repair accepted-takes                     # each removed take, its proposal and the page version it comes from
+gbrain repair accepted-takes --json              # listing[] and residuals
+gbrain repair accepted-takes --apply --expect <preview-hash>
+```
+
+A take is listed only when every record agrees: the accepted proposal (a strike
+or same-claim change, filed by a page publish or reconcile), the committed
+`takes_remove` receipt bound to it, the page version that removal archived
+(whose fence holds the row at that number) and the reservation row the removal
+left in the live fence. The apply puts that fence row back in place of the
+reservation through a revision-bound `put_page`, at the tier of the write you
+accepted, which is what a correct accept leaves. Not restored, because no
+record holds it: a grade or resolution stored only in the database, the take's
+id (the row gets a new one) and its embedding (re-embedded). A second preview
+lists nothing.
+
 <a id="orphan-bindings"></a>
 ### Orphan persistence bindings
 
@@ -419,7 +478,7 @@ request uses it.
 <a id="managed-sync-orphans"></a>
 
 **Say to your agent:** *"doctor has reported the same two sync failures for a
-week, every sync ends up to date, and `--retry-failed` changes nothing."*
+week, every sync ends up to date, and rerunning the sync changes nothing."*
 
 A managed sync run keeps its cursor under a key derived from the source
 incarnation, the writer principal and the sync options. A cursor written under
@@ -428,7 +487,7 @@ principal before the local-CLI cutover, a revoked local writer), can never be
 resumed: the live writer reads only its own key. Doctor still reads every
 unfinished cursor, so `sync_failures` reports `sync_incomplete` forever, and a
 `managed-sync-failure` row whose key has no cursor at all is only cleared by a
-success under that same key, which never comes. `--retry-failed` follows the
+success under that same key, which never comes. A plain sync follows the
 live cursor; `--skip-failed` is refused on a managed source. Nothing an
 operator can run clears either.
 
@@ -449,13 +508,15 @@ Classes in the preview:
 | `no_cursor` | a `managed-sync-failure` row with no `managed-sync` cursor under its key | cleared only by a success under the same key |
 | `principal_unadoptable` | an unfinished cursor recorded by a principal that is not an active local writer | the live writer never reads that key, and the pending request is invisible to it |
 | `superseded` | an unfinished cursor from before sync options were recorded, with a later completed run for the same source and incarnation | its exact options are unknown, so no command resumes it |
-| `incarnation_retired` | an unfinished cursor, or a failure row, recorded under a source incarnation the source no longer has (it was re-pointed at a new checkout, or removed and added again) | the cursor key digests the incarnation, so no current sync selects it, and every incarnation-joined reader (doctor's durable read, `--retry-failed`, `--acknowledge-managed`) drops it; only the local ledger mirror still shows it. `gbrain sync status` reports it as `cursor: null` with `last_error.code: cursor_incarnation_retired` |
+| `incarnation_retired` | an unfinished cursor, or a failure row, recorded under a source incarnation the source no longer has (it was re-pointed at a new checkout, or removed and added again) | the cursor key digests the incarnation, so no current sync selects it, and every incarnation-joined reader (doctor's durable read, the sync retry, `--acknowledge-managed`) drops it; only the local ledger mirror still shows it. `gbrain sync status` reports it as `cursor: null` with `last_error.code: cursor_incarnation_retired` |
+| `checkpoint_moved` | an unfinished cursor whose pages all committed and whose checkpoint was refused `revision_conflict` "The source checkpoint changed during this sync." because `sources.last_commit` moved to a commit that is neither the run's start nor its target (another run, or an older gbrain sharing the database, checkpointed the source elsewhere) | the checkpoint's compare-and-swap can never succeed, so every plain sync resumes the cursor into the same refusal; its slug `__managed_sync_checkpoint__` is bookkeeping, not a page, so there is nothing to read. After the apply the next sync discovers from the commit the source records. No sync retries it, because rediscovering a path-sliced run would move `last_commit` backward; the orphan repair is the only exit. A cursor whose source already stands at its target is not listed: the next plain sync finishes it. The apply keeps the cursor when the rule no longer holds |
+| `slug_mode_refused` | an unfinished cursor whose checkpoint was refused `slug_root_mode_mismatch` (a source in a subdirectory of its repository pins one `slug_root_mode`, the run used the other) while the source keeps the other pin | the two modes give different slugs, so the checkpoint can never publish under the kept pin. Preview, then `--apply --expect <hash>`: the apply retires the cursor and the next sync discovers the source again under the kept pin. Setting the pin back to the run's mode instead lets the next plain sync retry the checkpoint by itself. No sync retries this one without a person's choice |
 | `mirror_only` | a row of the local ledger (`~/.gbrain/sync-failures.jsonl`) carrying a `managed_cursor_key` with no durable failure row under that key in any incarnation | the mirror is pruned only after a durable delete, so one whose durable row is already gone keeps `gbrain doctor --fast` warning. The apply removes the ledger row after reading the durable rows again; a successful sync of the source prunes its own mirror-only rows too |
 
 Kept and counted, never retired: a cursor whose pending request is still
 queued, running or recovering (`pending_request_live`), and a cursor the live
 writer can still resume with its recorded options (`resumable`; doctor prints
-the exact `gbrain sync ... --retry-failed` command). An `incarnation_retired`
+the exact `gbrain sync ...` command). An `incarnation_retired`
 cursor is retired even when its recording principal is the live local writer
 with recorded options: that veto is for a cursor the writer could still
 resume, which no retired key can be. Rows on an archived source are never
@@ -486,8 +547,10 @@ bytes or finishes the write. When the file matches neither the recorded prior
 nor the published bytes (usually a hand edit made while the write was
 publishing), recovery refuses to overwrite it: the request stays `recovering`
 with `unexpected_file_bytes`, no write on that worktree is claimed, and the
-resident writer re-checks it every 30 seconds without progress. Do not delete
-the file to unblock it.
+resident writer re-checks it every 30 seconds without progress. A sync queued
+behind it stops at once with
+[`drain_stalled`, `cause: head_blocked`](write-refusals.md#head-blocked),
+naming the file and this command. Do not delete the file to unblock it.
 
 `gbrain repair stuck-recovery` is the sanctioned exit. Run it on the host that
 owns the source.
@@ -1044,7 +1107,7 @@ candidate one class:
 | `superseded` | A later write or delete of the page committed or is pending; for `put_page`, also a later failed `put_page` (newer content) or a page changed since the caller read it. | Kept; re-issue by hand if still wanted. |
 | `unpinned_target` | A `remember` saved unattributed; replaying would infer its subject again and could pick another page. | Kept. Re-issue it with an explicit `entity` if it is still wanted. |
 | `file_database_drift` | Its last replay hit `source_changed` and the file still differs from the database. | Kept until the file matches again (a reconcile that writes only the file counts) or the page changes; reconcile it first. |
-| `producer_owned` | gbrain produced it (sync or file import, reconcile, relink, maintenance page, job). | Kept. The preview prints the command that produces it again from current content (sync: `gbrain sync --source <id> --no-pull --retry-failed`). |
+| `producer_owned` | gbrain produced it (sync or file import, reconcile, relink, maintenance page, job). | Kept. The preview prints the command that produces it again from current content (sync: `gbrain sync --source <id> --no-pull`). |
 
 The apply replays exactly the previewed set. Each write is classified again
 and its original caller's authority is checked again first: a write that
@@ -1143,6 +1206,7 @@ gbrain repair file-drift --source <id> --slug notes/a --prefer file        # pre
 gbrain repair file-drift --source <id> --all-drifted --class structurally_additive --prefer file
 gbrain repair file-drift --source <id> --all-drifted --class structurally_additive --prefer file --apply --expect <hash>
 gbrain repair file-drift --source <id> --all-drifted --only 'concepts/**' --prefer database   # preview every drifted page filed under concepts/
+gbrain repair file-drift --source <id> --all-drifted --since 7d --prefer database             # only pages that drifted in the last 7 days
 ```
 
 Select pages with `--slug` (repeatable), `--request <id>` (a conflict receipt,
@@ -1172,6 +1236,17 @@ run on the selected pages only, and the globs are bound into the preview hash
 and printed in the apply command, so running that exact command applies
 exactly the previewed pages (an apply under other globs refuses
 `preview_changed`). Quote a glob so the shell does not expand it.
+
+<a id="file-drift-since"></a>`--since <ISO-8601 | age>` narrows `--all-drifted` to the pages whose newest
+drift receipt was recorded at or after that instant (#6712 PR 2). An age
+(`90s`, `30m`, `12h`, `7d`) is converted to one concrete UTC instant when the
+command runs, and the preview hash and the printed apply command carry that
+instant, not the age, so the apply selects the same pages the preview did.
+Any other value refuses before anything is read. `--since` with `--slug` or
+`--request` refuses: it only narrows `--all-drifted`. The fix that
+`gbrain sources writer failures` prints for a group of drift receipts already
+carries `--since` with the oldest receipt's time. One parser serves this flag
+and `gbrain agent logs --since`.
 
 `--keep` belongs to `stuck-recovery`; file-drift refuses it and names the
 equivalent: `--prefer database` keeps the database copy, `--prefer file`
@@ -1363,7 +1438,7 @@ gbrain older than v0.60.47.0 blocks the source on the first file it refuses.
    ```
 
 Doctor reports the same state: `git_held_files` (warn per source with counts,
-the first paths and the commands; `fail` above `sync.hold_escalate_count`,
+the first paths and the commands; `fail` above `GBRAIN_SYNC_HOLD_ESCALATE_COUNT`,
 default 50) and `frontmatter_repairable` (files the repair can fix, including
 ones that import only after quoting). Both are explicit-only findings:
 `gbrain doctor --remediation-plan --json` lists them as `explicit_kind_required`
@@ -1392,14 +1467,16 @@ gbrain sync --source notes --no-pull --no-embed     # the option-preserving comm
 Runbook: [catch-up stuck / held N files](troubleshooting.md#catch-up-stuck);
 reference: [`preparation_stalled`](write-refusals.md#preparation_stalled).
 
-Settings, all read by every sync:
+Settings, all read by every sync (`sync.holds` is a brain config key; the `GBRAIN_SYNC_*` variables are read from the
+environment of the process that syncs and replace the `sync.hold_*` and `sync.parser_regression` keys retired in
+0.60.266.0, see [sync config keys](live-sync.md#sync-config-keys)):
 
-| Key | Default | Effect |
+| Setting | Default | Effect |
 | --- | --- | --- |
 | `sync.holds` | `hold` | `fail` makes sync fail closed: a content refusal blocks the sync. |
-| `sync.hold_cap` | `500` | How many holds a sync result lists in detail; storage is never capped and valid files always import. |
-| `sync.hold_escalate_count` / `sync.hold_escalate_pct` | `50` / `5` | A source holding more files, or a run holding more than that share of at least 40 screened imports, reports `holds_escalated` and doctor `git_held_files` fails. A run whose `preparation_stalled` holds would cross it stops as `preparation_systemic` instead of holding them. |
-| `sync.parser_regression` | `stop` | `hold` holds a file whose exact bytes imported under an earlier gbrain (`parser_regression`) instead of stopping the run with `sync_parser_regression`. |
+| `GBRAIN_SYNC_HOLD_CAP` | `500` | How many holds a sync result lists in detail; storage is never capped and valid files always import. |
+| `GBRAIN_SYNC_HOLD_ESCALATE_COUNT` / `GBRAIN_SYNC_HOLD_ESCALATE_PCT` | `50` / `5` | A source holding more files, or a run holding more than that share of at least 40 screened imports, reports `holds_escalated` and doctor `git_held_files` fails. A run whose `preparation_stalled` holds would cross it stops as `preparation_systemic` instead of holding them. |
+| `GBRAIN_SYNC_PARSER_REGRESSION` | `stop` | `hold` holds a file whose exact bytes imported under an earlier gbrain (`parser_regression`) instead of stopping the run with `sync_parser_regression`. |
 
 To prevent new broken files, write brain files through `put_page`/`capture`
 or a YAML serializer, check generated content with
@@ -2008,8 +2085,8 @@ walk me through it before changing anything."*
 | Symptom or error text | Preview | Apply | Verify | Who acts | Consent |
 | --- | --- | --- | --- | --- | --- |
 | Sync `BLOCKED` on one file (`Invalid YAML frontmatter`, a frontmatter slug conflict, `Content too large`); after upgrading, sync prints `Held <path>: …`; doctor `git_held_files` or `frontmatter_repairable` warns; the upgrade banner prints `frontmatter_holds:` | `gbrain sources status <source>`, then `gbrain repair frontmatter --source <source>` (add `--include-ambiguous` for interpretations) | nothing to unblock: the next sync converts the blocked request in place (`gbrain sync --source <source> --no-pull` does it now); for the backlog, the printed `gbrain repair frontmatter … --apply --expect <hash> --yes` ([held files](#held-files)) | `gbrain doctor --only git_held_files,frontmatter_repairable --json` (both ok) | brain host; the repair apply after the user agrees | `destructive` (repair apply rewrites the previewed lines) |
-| Tag, timeline or take writes fail with `writer_coordinator_required` or `storage_error: Publication failed (P0001)` on a managed brain; sync ends `PARTIAL` at a tagged page | `gbrain doctor --json` (`schema_version` is 197 or later) | the original `gbrain sync --source <source> … --no-pull --retry-failed --json`, then `gbrain extract --stale --source-id <source>` and `gbrain extract timeline --source db --source-id <source>`, then `gbrain facts relink --source <source> --dry-run` (paid tier only after the user agrees), then `gbrain repair failed-writes --source <source>` and, after the user agrees, its printed `--apply --expect <hash>` | `gbrain sources status` shows the new `last_commit`; a second `gbrain extract timeline --source db` run adds no rows; a second `gbrain repair failed-writes` preview lists nothing to replay | brain host; the replay apply after the user agrees | paid (relink tier), destructive (replay apply) |
-| Sync `BLOCKED` with `checkpoint_validation_timeout` | `gbrain doctor` (`persistence_request_indexes`) | `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <source> --no-pull --retry-failed …` | `gbrain doctor --only persistence_request_indexes --json` reports `ok`; `gbrain sources status` shows the new `last_commit` | brain host | none |
+| Tag, timeline or take writes fail with `writer_coordinator_required` or `storage_error: Publication failed (P0001)` on a managed brain; sync ends `PARTIAL` at a tagged page | `gbrain doctor --json` (`schema_version` is 197 or later) | the original `gbrain sync --source <source> … --no-pull --json`, then `gbrain extract --stale --source-id <source>` and `gbrain extract timeline --source db --source-id <source>`, then `gbrain facts relink --source <source> --dry-run` (paid tier only after the user agrees), then `gbrain repair failed-writes --source <source>` and, after the user agrees, its printed `--apply --expect <hash>` | `gbrain sources status` shows the new `last_commit`; a second `gbrain extract timeline --source db` run adds no rows; a second `gbrain repair failed-writes` preview lists nothing to replay | brain host; the replay apply after the user agrees | paid (relink tier), destructive (replay apply) |
+| Sync `BLOCKED` with `checkpoint_validation_timeout` | `gbrain doctor` (`persistence_request_indexes`) | `gbrain repair request-indexes --apply` when an index is missing or INVALID, then the printed `gbrain sync --source <source> --no-pull …` | `gbrain doctor --only persistence_request_indexes --json` reports `ok`; `gbrain sources status` shows the new `last_commit` | brain host | none |
 | Doctor `persistence_request_indexes` warns | `gbrain repair request-indexes` | `gbrain repair request-indexes --apply` | `gbrain doctor --only persistence_request_indexes --json` | brain host | none |
 | Doctor `persistence_request_growth` warns | `gbrain doctor --json` | the printed `gbrain config set persistence.limits.<limit> <value>` | `gbrain doctor --only persistence_request_growth --json` | brain host | none |
 | Working-tree sync prints `legacy file(s) skipped … no contextual retrieval mode` | `gbrain repair contextual-mode` | `gbrain repair contextual-mode --apply` | the next `gbrain sync --working-tree` no longer prints the line | brain host, after the user agrees | none |
@@ -2137,7 +2214,7 @@ Then recover what doctor names, in this order (skip a step whose check is ok):
 `orphan-bindings` and `embedding-effects` also run under `gbrain repair --all`
 and `gbrain doctor --remediate --include-repairs`; `embedding-effects` is paid
 work when it queues a retry. Retry commands: `gbrain sources writer retry-effects <source> --request-id <id>`
-(one failed or parked effect), `gbrain sync --source <id> --no-pull --retry-failed`
+(one failed or parked effect), `gbrain sync --source <id> --no-pull`
 (a failed sync write) and `gbrain repair embedding-effects --source <id> --apply`
 (stuck embedding effects, including a used-up retry allowance).
 
@@ -2200,6 +2277,55 @@ owner's run commits it. The preview marks retries as paid work; through
 covers the whole retry budget each grant authorizes. A resumed run replays the
 grant it already made instead of granting another cycle. A signature-mismatched
 vector is never reconciled; it is re-embedded.
+
+## Recorded-time reads
+
+`get_page {known_as_of}` and `get_versions {known_as_of}` read a page as this
+brain had recorded it at an instant, from the belief ledger
+([design, section 10](../designs/BELIEF_LEDGER.md#10-what-w2s-first-slice-needs-from-w1)).
+`known_as_of` is recorded time: an ISO 8601 instant with a zone. It is not
+`as_of` on `get_links`, which is valid time (a date). A read answers with the
+interval the instant falls in, `certified` (false with `uncertified_reason` on
+an unmanaged source, a drifted interval or a truncated walk), and a `body` of
+`live`, `version`, `segmented` (read it through `body_ref`) or `unavailable`
+with a `body_reason` (`purged`, `expired`, `hard_deleted`, `pruned`,
+`version_missing`). A body no retained version holds is disclosed, never
+borrowed from the version next to it. The refusals below change nothing; run
+`gbrain beliefs status --source <id> --json` to see the coverage a read is
+checked against.
+
+### Coverage from
+
+The ledger does not cover the instant: it is before the ledger was enabled on
+the source, or before the page's baseline cut. Earlier times are unknown, not
+empty. `reason` is `not_recorded`, or `backfill_only` / `backfill_incomplete`
+when `gbrain beliefs backfill` seeded best-effort history for the page: that
+history carries source times only, so it never answers a recorded-time read.
+Ask about an instant at or after the time the message names.
+
+### Coverage gap
+
+The ledger was not recording at the instant: coverage was stopped
+(`reason: not_covered`), or a backup restore replaced the ledger with an
+archive, and what happened between the archive's time and the restore is
+unknown (`reason: restore`). Ask about an instant outside the gap the message
+names.
+
+### Clock mismatch
+
+`known_as_of` got a calendar date (`reason: date_for_instant`). A date is
+valid time; recorded time needs an instant. Pass a full instant such as
+`2026-10-01T12:00:00Z`.
+
+### Known as of unproven
+
+A change to the page was recorded before the instant, but nothing proves it
+had committed by then: its commit mark is later, and no later write to the
+same page was recorded by the instant (section 5.3 of the design). The page at
+that instant can't be stated either way, so the read refuses rather than
+guess. The refusal is `retryable`: ask about an instant before the write's
+recorded time, or after its commit was observed (the message names the write).
+A stalled transaction stays unproven until it commits and is marked.
 
 ## Repair refusal codes
 
@@ -2273,7 +2399,9 @@ writer status --source <id> --json` and ask the user whether the edited file
 may be replaced by its withdrawn version; the resident writer finishes the
 effect once the file matches one of its recorded versions. The preview lists
 the effect as `refused`; naming its request with `--request-id` refuses with
-this code.
+this code. A sync queued behind such an effect stops at once with
+[`drain_stalled`, `cause: head_blocked`](write-refusals.md#head-blocked), and
+its fix names the file.
 
 ### Legacy job authority
 

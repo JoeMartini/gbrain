@@ -90,8 +90,9 @@ function gitNextStep(sourceId: string, dryRun: boolean, scheduled: Scheduled): {
   const concurrent = scheduled.items.filter(item => item.code === 'concurrent_write').length;
   const stalled = scheduled.items.filter(item => item.code === 'preparation_stalled').length;
   const dirty = scheduled.items.filter(item => item.code === 'worktree_dirty').length;
+  const drift = scheduled.items.filter(item => item.code === 'file_drift').length;
   return { text: `${count} held file(s) scheduled for a re-screen; none has run yet. ${automatic} Run it now with: ${sync}, then verify with: gbrain sources status ${sourceId}. `
-      + `A file that still refuses stays held; ${holdRepairSteps(sourceId, { fences, others: count - fences - concurrent - stalled - dirty, concurrent, stalled, dirty }, scheduled.fenceAuto).text}.`,
+      + `A file that still refuses stays held; ${holdRepairSteps(sourceId, { fences, others: count - fences - concurrent - stalled - dirty - drift, concurrent, stalled, dirty, drift }, scheduled.fenceAuto).text}.`,
     fix: { argv: scheduled.sync, consent: [], actor: 'agent', requires_exclusive: false, verify,
       why: `The sync re-screens the ${count} scheduled file(s): each one that now passes imports and its hold clears; the rest stay held without blocking the sync.` } };
 }
@@ -133,6 +134,8 @@ export async function runRetryHeld(engine: BrainEngine, args: string[]): Promise
   if (unknown) throw new OperationError('invalid_params', `Unknown option: ${unknown}.`, 'Usage: gbrain sources retry-held <id> [--dry-run] [--json]');
   if (positional.length !== 1) throw new OperationError('invalid_params', 'Name one source.', 'Usage: gbrain sources retry-held <id> [--dry-run] [--json]');
   const receipt = await retryHeld(engine, positional[0], { dryRun: args.includes('--dry-run') });
+  // #6712 PR 2: a soak intervention (soak-counters.ts).
+  if (!args.includes('--dry-run')) await (await import('../core/persistence/soak-counters.ts')).recordSoakEvent(engine, 'retry_held');
   if (json) { console.log(JSON.stringify(receipt, null, 2)); return; }
   for (const item of receipt.items) console.log(`  ${item.key} (${item.code}${item.reason ? `, ${item.reason}` : ''}): ${item.action}`);
   console.log(receipt.next_action);

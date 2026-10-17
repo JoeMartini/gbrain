@@ -78,6 +78,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'safe_index_pending',
   'self_capture',
   'brain_score',
+  // W1: belief ledger coverage intervals, drift, orphan lifetimes and unsafe restores.
+  'belief_ledger_coverage',
   'calibration_freshness',
   'child_table_orphans',
   'chronicle_projection_health',
@@ -104,6 +106,8 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'embed_staleness',
   'embedding_column_registry',
   'embedding_env_override',
+  // #6113: a bare legacy embedding_model DB row; the fix previews migrate embeddings.
+  'embedding_identity_unqualified',
   // #5137: an env provider key shadowing a different config key.
   'embedding_key_source',
   'embedding_migration_state',
@@ -259,6 +263,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'db_only_collector_collision',
   'federation_health',
   'google_file_modes',
+  // #5012 item 9: a Google source's configured calendar was unreadable at its last sync (doctor/checks/google-calendar.ts).
+  'google_calendar_readable',
   'google_oauth',
   'home_dir_in_worktree',
   'index_audit',
@@ -268,6 +274,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'orphan_clones',
   'persistence_capacity',
   'persistence_compaction',
+  // #6712 PR 2: the managed-sync soak counters (interventions, content decisions), informational.
+  'sync_soak_counters',
   'persistence_counter_drift',
   'worktree_refresh_stuck',
   'managed_guard_schema_drift',
@@ -281,6 +289,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'stale_frontmatter_keys',
   'maintenance_write_drift',
   'managed_sync_not_moving',
+  // #6858: a managed sync run stopped on a page that did not commit, failed past an hour (doctor/checks/managed-sync-blocked.ts).
+  'managed_sync_blocked',
   'persistence_session_timeouts',
   // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
   'two_consumers_on_host',
@@ -294,6 +304,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'writer_version',
   'pgbouncer_prepare',
   'pglite_data_dir',
+  // #6573: a local IPC socket path over the platform's AF_UNIX budget (doctor/checks/local-ipc.ts).
+  'ipc_socket_path',
   // db-availability loop: engine-fit + repair-recurrence signals.
   'pglite_scale',
   'db_repair_recurrence',
@@ -308,6 +320,8 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'queue_health',
   // #4578: brain-wide maintenance jobs dying at their deadline.
   'global_maintenance_timeouts',
+  'embed_backfill_stalled',
+  'connector_account_mismatch',
   // #5157: queued jobs from before the v0.50 authority cutover block every worker.
   'legacy_job_authority',
   // F3: legacy tokens on the JSONB-only grant shape (info) and grant drift (warn).
@@ -368,6 +382,8 @@ export const META_CHECK_NAMES: ReadonlySet<string> = new Set([
   'schema_pack_source_drift',
   'schema_version',
   'slug_fallback_audit',
+  // #6712 PR 2: retired sync.* keys stored on the brain and no longer applied.
+  'sync_config_keys',
   'timeline_dedup_index',
   'type_proliferation',
   'upgrade_errors',

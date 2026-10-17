@@ -15,6 +15,7 @@ import { prepareManagedSyncMutation, type SyncIntent } from '../src/core/persist
 import { publishMutation } from '../src/core/persistence/coordinator.ts';
 import { sha256 } from '../src/core/persistence/digest.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
+import { recordManagedSyncFailure } from '../src/core/persistence/sync-failures.ts';
 import { discoverManagedSync } from '../src/core/persistence/sync-discovery.ts';
 import { withCoordinatedWrite } from '../src/core/persistence/context.ts';
 import { TEST_WRITE_ATTRIBUTION } from './helpers/write-attribution.ts';
@@ -445,7 +446,7 @@ test.each([false, true])('managed terminal receipts survive a missing ledger and
       expect(recorded[0].error).toContain(id);
       expect(recorded[0].error).toContain('source_changed');
       expect((await engine.executeRaw<{ last_commit: string }>('SELECT last_commit FROM sources WHERE id=$1', [f.id]))[0].last_commit).toBe(f.head);
-      writeFileSync(path, pinned);
+      // #6712 PR 3 (L7): while the file keeps the bytes that refused, every sync replays the receipt; the fix below retries it.
       rmSync(syncFailuresPath(), { force: true });
       const replay = await performManagedSync(engine, opts);
       expect(replay.managedWrite?.write_request).toEqual(blocked.managedWrite!.write_request);
@@ -457,6 +458,7 @@ test.each([false, true])('managed terminal receipts survive a missing ledger and
           write_request: { request_id: id, state: 'conflict' } } });
       });
       await expect(performManagedSync(engine, { ...opts, skipFailed: true })).rejects.toMatchObject({ code: 'managed_sync_flag_refused', detail: '--skip-failed' });
+      writeFileSync(path, pinned);
       const corrected = await performManagedSync(engine, { ...opts, retryFailed: true });
       expect(corrected.status).toBe('synced');
       expect(loadSyncFailures().filter(row => row.source_id === f.id)).toHaveLength(0);
@@ -632,10 +634,11 @@ test('retry-failed resets cursor when pending write is committed but failure rec
       expect((await engine.getPage('a', { sourceId: f.id }))?.compiled_truth).toContain('First observation');
       expect(await engine.getPage('b', { sourceId: f.id })).toBeNull();
 
-      // A real mismatched invocation records the failure against that run.
-      await expect(performManagedSync(engine, {
-        sourceId: f.id, noPull: true, noEmbed: true, noExtract: true,
-      })).rejects.toThrow('processing options');
+      // #6712 PR 1: a mismatched invocation no longer refuses (the cursor's processing opt-outs are inherited), so the
+      // failure an older release recorded against that run on such a refusal is written as that release wrote it.
+      await recordManagedSyncFailure(engine, { source_id: f.id, source_incarnation: cursor.incarnation, path: '', code: 'invalid_params',
+        message: 'Unfinished sync uses different processing options.', request_id: null, run_id: cursor.runId, target: null,
+        cursor_key: row.fingerprint, phase: 'resume', state: 'failed', observation_id: randomUUID() });
       const failuresBefore = await engine.executeRaw(
         "SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [row.fingerprint, cursor.runId]);
       expect(failuresBefore).toHaveLength(1);

@@ -1,4 +1,5 @@
 import { isEmbedSkipped } from '../embed-skip.ts';
+import { appendPurgeCommitted } from '../belief/purge-mirror.ts';
 import { sizeStateField } from '../page-embedding-budget.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { boundedReads } from './bounded-reads.ts';
@@ -66,6 +67,7 @@ import { fenceWhere } from '../fence-repair/refusal.ts';
 import { pageFencesNormalized } from '../fence-repair/report.ts';
 import { parseFenceRepairReceipt } from '../fence-repair/receipt.ts';
 import { fenceRepairCommit } from './effect-model.ts';
+import { withoutSafetyAssessments } from './reconcile-safety.ts';
 import { preparePagePurge, purgePageInTransaction, type PreparedPagePurge } from './page-purge.ts';
 import { withTrustKeep } from './context.ts';
 import { isFenceEditWrite, pageGateTrust, pageWriteTrust, recordAgentPageLowering, stampPageTrustMarker, storedPageTier } from '../trust/page-write.ts';
@@ -163,7 +165,7 @@ export function readCanonicalAsImported(bytes: string, sourcePath: string): { co
  */
 export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, bytes: string, snapshot: PageSnapshot,
   sourcePath: string | (() => Promise<string>), activePack?: ParseOpts['activePack']): Promise<boolean> {
-  const expected = digest(canonical(snapshot.page, snapshot.tags));
+  const expected = digest(canonical({ ...snapshot.page, frontmatter: withoutSafetyAssessments(snapshot.page.frontmatter ?? {}) }, snapshot.tags));
   const matches = async (content: string, inferred: boolean) => {
     const parsed = parseMarkdown(content, slug, { activePack });
     // #5521 parity for subtype (#5928): a pack rule is not part of the file's bytes, so a file
@@ -179,7 +181,7 @@ export async function fileMatchesSnapshot(engine: BrainEngine, slug: string, byt
     const type = parsed.typeExplicit && !inferred ? parsed.type : snapshot.page.type;
     // Withdrawal overlays intentionally precede physical mirroring. The ledger
     // is applied by the import preparation and cannot be undone by this check.
-    const actual = canonical({ ...parsed, type, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
+    const actual = canonical({ ...parsed, frontmatter: withoutSafetyAssessments(parsed.frontmatter), type, ...await overlayCanonicalBodies(engine.executeRaw.bind(engine),
       parsed.compiled_truth, parsed.timeline ?? '', snapshot.withdrawals, { sourceId: snapshot.page.source_id, marker: snapshot.globalPurges }) }, parsed.tags);
     return digest(actual) === expected;
   };
@@ -339,8 +341,9 @@ async function prepareDeleteFileTarget(engine: BrainEngine, row: WriteRequest, s
 
 /** #6517: the recorded-origin census of a delete's file (file-claims.ts) and the other live pages that record it. */
 export interface SharedOrigin { target: FileClaimTarget; claimants: FileClaimant[] }
-export const sharedOriginReceipt = (sourceId: string) => 'The selected database page is hidden; the file and the surviving page remain. This does not erase that file\'s contents. '
-  + `The file's current content will be imported into the surviving page by the next sync that imports it (gbrain sync --source ${sourceId} --no-pull --full imports every file now); edit the file first if it holds the deleted page's text.`;
+export const sharedOriginReceipt = (sourceId: string, survivor: string | null) => 'The selected database page is hidden; the file and the surviving page remain. This does not erase that file\'s contents. '
+  + `Sync does not overwrite the surviving page with the file (#6712: a file whose page differs from it is held file_drift); import the file's current content into it with gbrain repair file-drift --source ${sourceId} --slug ${survivor ?? '<surviving-slug>'} --prefer file `
+  + '(it previews and writes nothing; run the apply command it prints), then gbrain sync --source ' + sourceId + ' --no-pull. Edit the file first if it holds the deleted page\'s text.';
 /**
  * #6517 [R8]: the survivor is revalidated under publication: the kept file must still resolve to the same real file and the
  * same live pages must still record it; otherwise the delete refuses and the file is never removed as a fallback.
@@ -355,7 +358,7 @@ async function validateSharedOrigin(tx: BrainEngine, row: WriteRequest, shared: 
   const named: string[] = [];
   for (const page of claimants) if (await slugDisclosable(tx, row.authority, page.slug)) named.push(page.slug);
   const who = named.length ? `Another page of this source records the same file: ${named.join(', ')}.` : 'Another page of this source records the same file.';
-  return `${who} ${sharedOriginReceipt(row.source_id)}`;
+  return `${who} ${sharedOriginReceipt(row.source_id, named.length === 1 ? named[0]! : null)}`;
 }
 function sharedOriginChanged(row: WriteRequest, what: string): OperationError {
   const error = pageRefusal('source_changed', `The shared canonical file changed while the delete was prepared: ${what} before it published, so nothing was written and the file was not removed. Submit the delete again with a new request_id; it re-reads the file's claimants.`, row,
@@ -398,6 +401,12 @@ async function prepareDeletePageMutation(engine: BrainEngine, row: WriteRequest,
   // #6511: the purge's journal sweep runs here, under the preparation budget, never inside the 5 s publication transaction.
   const preparedPurge: PreparedPagePurge | null = purge ? await preparePagePurge(engine, row, snapshot, clock) : null;
   const prepared: PreparedMutation = { observedRevision, noop, file, ...await pageDatabaseOnlyPublication(engine, row, file),
+    // W1: a purge bumps sources.purge_epoch, so it holds the source row exclusively from the start (retention bumps nothing, #26);
+    // the derived rows' and cascaded links' streams are locked with the page.
+    ...(purge && !preparedPurge?.retention ? { sourceExclusive: true } : {}),
+    // The purge mirror's `committed` line comes from the coordinator after the commit, whoever waits for the reply (#23).
+    ...(preparedPurge && !preparedPurge.retention ? { afterCommit: async () => { appendPurgeCommitted(row.id); } } : {}),
+    ...(preparedPurge?.derivedSlugs.length ? { additionalPageKeys: preparedPurge.derivedSlugs.map(slug => ({ sourceId: row.source_id, slug })) } : {}),
     ...(excludedPath !== null ? { databaseOnlyReason: 'sync_excluded' as const } : {}), ...(shared ? { databaseOnlyReason: 'shared_origin' as const } : {}),
     ...(shared ? { validate: async (tx: BrainEngine) => { prepared.databaseOnlyWarning = await validateSharedOrigin(tx, row, shared); } } : {}),
     apply: async tx => {

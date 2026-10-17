@@ -43,6 +43,7 @@ import { connectorCheckpointsRepair } from './connector-checkpoints.ts';
 import { requestIndexesRepair } from './request-indexes.ts';
 import { connectorFencesRepair } from './connector-fences.ts';
 import { takeSupersessionRepair } from './take-supersession.ts';
+import { acceptedTakesRepair } from './accepted-takes.ts';
 import { orphanBindingsRepair } from './orphan-bindings.ts';
 import { managedSyncOrphansRepair } from './managed-sync-orphans.ts';
 import { embeddingEffectsRepair } from './embedding-effects.ts';
@@ -89,6 +90,12 @@ export interface RepairKindSpec {
   consentText?: { what: string; why: string; risk: string; user_message: string };
   /** `llm`: the kind may call a paid chat model; its spend is metered by the daily USD ledger and reported in `cost.llm_usd`. */
   spends?: 'llm';
+  /**
+   * `unbound`: the remediation approval (`--expect <plan_hash>`) leaves this kind out. Its plan follows live server
+   * statistics that autovacuum changes between preview and run, and its apply changes no stored record; the run
+   * still applies what is pending then.
+   */
+  approval?: 'unbound';
 }
 
 const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
@@ -133,6 +140,14 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + '`superseded by #<own row>` pointer with exactly one possible predecessor. The pointer is written onto the old row and stale self-pointers are '
       + 'dropped through a revision-bound put_page; a page whose fence is right but whose stored pointers differ is reprojected. Ambiguous pages are '
       + 'listed with the manual edit and never changed.',
+  },
+  'accepted-takes': {
+    handler: acceptedTakesRepair, embeds: 'effect', checks: [], explicit_only: true, preview_bound: true,
+    summary: 'Restore takes that accepting a held strike-through or kind change removed on v0.60.253.0 (gbrain trust confirm tp<id> ran a takes_remove '
+      + 'instead of applying the change). Only what the records prove: the accepted proposal, the takes_remove receipt bound to it, the page version that '
+      + 'receipt archived (the fence row the accept should have applied) and the reservation row still holding its number. --apply --expect <hash> '
+      + 'republishes each page with that row (a revision-bound put_page) at the tier of the write the owner accepted. A grade or resolution only the '
+      + 'database held is not in any record and is not restored. Runs only when named.',
   },
   'orphan-bindings': {
     handler: orphanBindingsRepair, embeds: 'none', checks: ['orphan_persistence_bindings'],
@@ -262,7 +277,7 @@ const SPECS: Record<RepairKind, Omit<RepairKindSpec, 'kind'>> = {
       + 'Preview-bound: --apply --expect <hash> applies exactly the previewed set. gbrain repair content runs fences, then this kind.',
   },
   'planner-stats': {
-    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'],
+    handler: plannerStatsRepair, embeds: 'none', checks: ['planner_stats_stale'], approval: 'unbound',
     summary: 'ANALYZE the hot tables (pages, links, facts, takes, content_chunks, timeline_entries) whose planner statistics are stale (F4b), '
       + 'so search and graph reads stop planning as slow nested loops. PGLite also resets each table\'s pending row count; Postgres runs each '
       + 'ANALYZE with a 60 s statement and 2 s lock timeout. No journal admission and no user data changes. Brain-wide.',
@@ -420,7 +435,7 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
      */
     async run(kind: RepairKind, scope: RepairScope, run: { limit?: number; sourceFlag?: string; explicit?: boolean; expect?: string; includeAmbiguous?: boolean; only?: string[]; skip?: string[];
       slugs?: string[]; noLlm?: boolean; maxLlmUsd?: number; deadline?: number;
-      prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string;
+      prefer?: 'file' | 'database'; requests?: string[]; allDrifted?: boolean; driftClass?: string; since?: string;
       keep?: 'prior' | 'disk'; requestId?: string; olderThan?: string; includeFailures?: boolean; force?: boolean } = {}): Promise<RepairResult> {
       const ctx = { engine, config, logger, dryRun: !opts.apply, remote: false, sourceId: scope.source_ids[0], writeWaitMs } as OperationContext;
       const spec = repairSpec(kind, opts.registry);
@@ -428,7 +443,7 @@ export async function repairRunner(engine: BrainEngine, opts: { apply: boolean; 
         embed: !opts.noEmbed && embeddingModel !== undefined, applyArgs: [...(opts.noEmbed && spec.embeds === 'inline' ? ['--no-embed'] : []),
           ...(run.olderThan ? ['--older-than', run.olderThan] : []), ...(run.includeFailures ? ['--include-failures'] : []), ...(run.force ? ['--force'] : [])],
         explicit: run.explicit, expect: run.expect, includeAmbiguous: run.includeAmbiguous, only: run.only, skip: run.skip, slugs: run.slugs, noLlm: run.noLlm,
-        maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass,
+        maxLlmUsd: run.maxLlmUsd, deadline: run.deadline, prefer: run.prefer, requests: run.requests, allDrifted: run.allDrifted, driftClass: run.driftClass, since: run.since,
         keep: run.keep, requestId: run.requestId, olderThan: run.olderThan, includeFailures: run.includeFailures, force: run.force });
     },
   };

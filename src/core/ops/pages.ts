@@ -21,6 +21,7 @@ import { pageTrustForRead, projectFetchText, projectGetPage, readQuarantined } f
 import { assertLargePageAdmission } from '../persistence/large-page-guard.ts';
 import { assertFullReadFits, bodyBytes, fetchWindowResult, GET_PAGE_BODY_PARAMS, inlineBodyBytes, parseBodyRequest, readPartialBody } from './get-page-body.ts';
 import { MIN_TRUST_PARAM } from '../eligibility/policy.ts';
+import { getPageKnownAsOf, KNOWN_AS_OF_PARAM } from './known-as-of.ts';
 import { stampRowTrust } from '../eligibility/stamp.ts';
 import { isAutoLinkEnabled } from '../link-extraction.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
@@ -100,8 +101,10 @@ const get_page: Operation = {
     source_id: { type: 'string', description: "One source, or '__all__'." },
     include_quarantined: { type: 'boolean', description: 'Admin: quarantined body.' },
     min_trust: MIN_TRUST_PARAM,
+    known_as_of: KNOWN_AS_OF_PARAM,
   },
   handler: async (ctx, p) => {
+    if (p.known_as_of !== undefined) return getPageKnownAsOf(ctx, p);
     const slug = p.slug as string;
     const fuzzy = (p.fuzzy as boolean) || false;
     const includeDeleted = (p.include_deleted as boolean) === true;
@@ -406,7 +409,7 @@ const delete_page: Operation = {
   name: 'delete_page',
   idempotent: true,
   outputRedaction: 'no_stored_text',
-  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the next sync imports the file\'s current content into the surviving page. purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.',
+  description: 'Soft-delete a page and remove its markdown file from the source working tree (the source local_path, or sync.repo_path when the source has none). File removal is skipped when sync.write_through is off; the committed receipt reports the persistence mode and write_through outcome. Read the page revision first and pass expected_revision; retain request_id for replay. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h, which re-creates the file. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed. A page whose file another live page of the source records is hidden without touching that file (receipt write_through.skipped: shared_origin): the file and the surviving page remain, nothing is erased, and the warning names gbrain repair file-drift --prefer file, which imports the file\'s current content into the surviving page (sync holds that page file_drift rather than overwrite it). purge: true is trusted-local CLI only and removes the row, chunks, links and raw data immediately after its recorded markdown artifact is removed. Purge uses the same revision, request_id and recovery protocol, including for existing tombstones. A removal failure preserves the prior row and never reports purge success; repair the artifact and submit a new request_id. A purge of a page whose file is shared refuses and names the soft delete. A committed purge warns that git history, synced copies, exports and derived rows may retain content; rotate exposed credentials.',
   params: {
     ...PAGE_MUTATION_PARAMS,
     slug: { type: 'string', required: true, description: "Slug of the page to soft-delete, e.g. 'people/alice-example'." },

@@ -188,6 +188,7 @@ Response — an additive SUPERSET of the plain facts envelope on EVERY call
 | `facts_order` | string | `relevance` (question passed) or `newest` |
 | `facts[].relevance` | number? | question calls only: the ranking score (about 0 to 2.1); not a probability and not comparable across calls |
 | `facts_degraded` | object? | question calls only: `reason` (`keyword_only_no_embedding_provider`, `keyword_only_embedding_disabled`, `embed_timeout`, `embed_unavailable`, `no_query_terms`, `facts_embedding_column_missing`) and `unembedded` (facts in scope without a comparable embedding; the `facts_unembedded` notice carries the `gbrain embed --stale --facts` preview) |
+| `facts_calibration` | object? | question calls only, informational (additive since #6590): present when semantic matching ranked the facts on an embedding model whose fact admission floors were never measured; `status` (`unmeasured`) and `model_key` (`provider:model@dims`, the key doctor `fact_admission_floors` reports). A short or empty `facts[]` is then weaker evidence of "nothing matched". It never replaces `facts_degraded`; one `facts_calibration_unmeasured` notice (kind `info`) per brain per session explains it |
 | `budget_tokens` / `budget_used` / `dropped_count` | int? | present for a positive finite numeric budget, including when its floor is zero |
 | `budget_packing` | object? | present only when a valid `budget_policy` is supplied; effective policy and per-arm accounting |
 
@@ -556,7 +557,10 @@ pending-decision loops — the ADDITIVE-FOREVER optional fields disambiguate:
 
 All five are absent on threads not backed by a loop row and on servers that
 do not implement them; a server that omits them still certifies. Same propagation to the
-per-entity cards and top-level `open_threads` of `context_pack`.
+per-entity cards and top-level `open_threads` of `context_pack`. Loop rows carry
+no visibility or source grant of their own, so only the trusted local caller's
+cards derive threads from them (`entity`, and `context_pack` / `delta` with
+`include_private`); a remote caller's card has no loop-backed entries.
 - `edges`: top ~10 typed edges, mentions excluded, out-edges first, live relationships first. Additive fields: `status` (`live`, `ended`, `ended_unknown_date`, `event`, …), `since` / `until` (latest stint). `relationship_note` (additive) summarizes current and ended relationships and flags a summary that still names an ended one ([temporal edges](../guides/temporal-edges.md)).
 - The p99 < 100ms promise is op-layer latency (transport excluded), CI-gated
   on a 20K-page corpus. 200K validation recipe below.

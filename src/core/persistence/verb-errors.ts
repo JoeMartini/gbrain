@@ -5,6 +5,10 @@ import { UNBOUND_COLLISION_MESSAGE, UNBOUND_PUBLICATION_MESSAGE } from './unboun
 import { isFrontmatterHoldMessage } from '../markdown.ts';
 import { fenceLocationFromMessage, fenceWhere } from '../fence-repair/refusal.ts';
 import { FACT_WITHDRAWN_SUGGESTION } from '../facts/withdrawal.ts';
+import { CHECKPOINT_MOVED_MESSAGE } from './sync-slug-mode.ts';
+
+/** The refusal of a fact-batch completion request whose per-entity requests did not all commit (facts-prepare.ts). */
+export const FACTS_BATCH_INCOMPLETE_MESSAGE = 'Some extracted facts have not committed.';
 
 const FRONTMATTER_SLUG_CONFLICT = /^The frontmatter slug "[^"\n]{1,300}" in [^/"\n][^"\n]{0,1000} conflicts with its path, which expects slug "[^"\n]{1,300}"\. Remove `slug:` or make it match the path\.$/;
 
@@ -17,6 +21,8 @@ export function frontmatterSlugConflictMessage(path: string, found: string, expe
 const HELD_FILE = /^(?:The canonical file is held by sync|A file held by sync) \(([a-z_]+)\) (and differs from the page|occupies the canonical page path); the page is read-only for put_page until the file is repaired\.$/;
 
 /** #6693: the refusal of a page write whose file holds a committed Git change sync has not imported yet (pending-import.ts). */
+/** #6858: the receipt prefix of a write `gbrain repair stuck-recovery --keep disk` abandoned: its canonical file was kept as edited on disk. */
+export const KEEP_DISK_ABANDONED_PREFIX = 'Publication abandoned by gbrain repair stuck-recovery --keep disk';
 export const PENDING_IMPORT_MESSAGE = 'The canonical file holds a committed Git change that sync has not imported yet.';
 
 export function heldFileMessage(kind: 'drift' | 'occupied', code: string): string {
@@ -61,7 +67,7 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
       suggestion: 'Inspect the exact working-tree bytes and pinned Git version, including CRLF/LF differences. Preserve local edits; do not normalize or discard them automatically. If the file and database disagree, preview gbrain sources reconcile <source> <slug> --brain <brain> --preview on the source host.',
     };
     if (['The imported file changed after sync admission.', 'The canonical file changed after preparation.',
-      'The canonical file changed during preparation.'].includes(message ?? '')) return {
+      'The canonical file changed during preparation.'].includes(message ?? '') || (message ?? '').startsWith(KEEP_DISK_ABANDONED_PREFIX)) return {
       reason: 'raw_file_changed', message: 'The source file bytes changed after this request was accepted.',
       suggestion: 'Review the changed file before starting a corrected attempt. Exact byte checks remain required even when Git reports a clean file.',
     };
@@ -98,6 +104,11 @@ export function writeFailureDiagnostic(code: string, message?: string | null): {
     suggestion: 'Check the existing owner and its availability. Do not claim, transfer, or activate a source to repair content.' };
   if (code === 'permission_denied' || code === 'scope_denied') return { reason: code, message: 'The caller is not authorized for this write.',
     suggestion: 'Check the current caller grant for this source and operation. Content reconciliation does not grant permissions.' };
+  // #6834: the checkpoint and fact-batch completion requests name bookkeeping slugs, not pages; there is nothing to read.
+  if (code === 'revision_conflict' && message === CHECKPOINT_MOVED_MESSAGE) return { reason: 'sync_checkpoint_moved', message: 'The source\'s sync checkpoint moved while this run published; no page is in conflict.',
+    suggestion: '__managed_sync_checkpoint__ is sync bookkeeping, not a page, so there is nothing to read or edit. gbrain sync status --source <source> --json names the next step: when the source already stands at this run\'s target the next sync finishes the run; otherwise preview gbrain repair managed-sync-orphans --source <source> and apply it with the hash it prints, and the next sync discovers from the commit the source records.' };
+  if (code === 'revision_conflict' && message === FACTS_BATCH_INCOMPLETE_MESSAGE) return { reason: 'facts_batch_incomplete', message: 'Not every per-entity fact request of this extraction batch committed, so the batch was not recorded complete.',
+    suggestion: '__managed_facts_complete__ is the batch\'s completion record, not a page, so there is nothing to read or edit. The facts that did commit stay; inspect the batch\'s entity requests with gbrain write-request <request_id>, and run the extraction again with a new request_id only if facts are still missing.' };
   if (code === 'revision_conflict' || code === 'page_identity_changed') return { reason: code, message: 'The accepted page identity or revision no longer matches.',
     suggestion: 'Read the current page and review the intended change before submitting a corrected write.' };
   if (code === 'invalid_params' && message && FRONTMATTER_SLUG_CONFLICT.test(message)) return { reason: code, message,

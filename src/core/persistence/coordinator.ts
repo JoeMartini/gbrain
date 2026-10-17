@@ -26,12 +26,13 @@ import { withFilesystemPublication } from './filesystem-guard.ts';
 import { mayReprepare } from './semantic.ts';
 import { tryAcquirePublicationCapacity } from './pool-capacity.ts';
 import { queuePublicationEffects } from './effect-journal.ts';
+import { timePublicationStep } from './publication-timing.ts';
 import type { GitCommitNote } from './effect-model.ts';
 import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
 import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, upgradeRecoveryStaging } from './staging.ts';
-import { bindPublicationTimeouts, publicationTransaction } from './publication-deadline.ts';
+import { declarePublication, publicationTransaction } from './publication-deadline.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
@@ -44,6 +45,8 @@ import { withdrawalFailureDetail } from '../facts/withdrawal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
 import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
 import { segmentWriteScope } from '../page-body/ingest.ts';
+import { publicationBeliefOptions, withBeliefBatch } from '../belief/ledger.ts';
+import { markBeliefCommits } from '../belief/append.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
@@ -281,6 +284,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
   let afterCommitDue = false;
   const skill = prepared.target === 'skill_bundle';
   const files = skill ? prepared.files ?? [] : prepared.file ? [prepared.file] : [];
+  const beliefReport = { appended: 0 };
   try {
     assertMutationProtocol(row);
     if ((row.target_kind ?? 'page') !== (prepared.target ?? 'page') || (skill ? !!prepared.file || !files.length : prepared.files !== undefined)) {
@@ -361,8 +365,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       await hooks.boundary?.('prepared', row);
     }
     const done = await publicationTransaction(engine, async tx => {
-      await bindPublicationTimeouts(tx);
-      await declareDurablePersistence(tx);
+      await declarePublication(tx);
       const liveBinding = await guardOwnership(tx, row, hostId);
       if (prepared.sourceExclusive && !prepared.exclusiveSources?.length) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
       if (prepared.exclusiveSources?.length) await lockCoreSources(tx, prepared.sourceExclusive ? [row.source_id, ...prepared.exclusiveSources] : prepared.exclusiveSources);
@@ -421,19 +424,23 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         await hooks.boundary?.('after_publication', row);
       }
       prepared.postimage = undefined;
-      const outcome = await withCoordinatedWrite(tx, [row.source_id], () => prepared.apply(tx, snapshot), publicationAttribution(row, prepared.trust));
+      // W1 finalization contract (docs/designs/BELIEF_LEDGER.md 5.1): the ledger append is the last canonical write before the receipt.
+      const apply = () => timePublicationStep('apply', row.slug, () => prepared.apply(tx, snapshot));
+      const outcome = await withCoordinatedWrite(tx, [row.source_id], skill ? apply
+        : () => withBeliefBatch(tx, publicationBeliefOptions(row, prepared.additionalPageKeys, beliefReport), apply), publicationAttribution(row, prepared.trust));
       if (!skill) await classifyUnboundPage(tx, row);
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
       await recordPublicationFenceTrend(tx, row, outcome);
-      await queuePublicationEffects(tx, row, final, outcome, prepared);
+      await timePublicationStep('effects', row.slug, () => queuePublicationEffects(tx, row, final, outcome, prepared));
       await hooks.boundary?.('before_commit', row);
       const committed = await completeWrite(tx, current, 'committed', outcome, undefined, current);
       transactionBodyCompleted = true;
       return committed;
     });
     await hooks.boundary?.('after_commit', done);
+    if (beliefReport.appended && done.state === 'committed') await markBeliefCommits(engine, [row.id]).catch(() => undefined);
     if (recovery) await clearResolvedRecovery(engine, row.id, done);
     afterCommitDue = done.state === 'committed';
     return done;

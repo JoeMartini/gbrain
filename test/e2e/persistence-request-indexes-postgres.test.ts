@@ -55,7 +55,7 @@ async function fixture() {
   await engine.executeRaw('INSERT INTO sources(id,name,local_path,config) VALUES($1,$1,$2,\'{}\')', [id, root]);
   await claimWorktree(engine, id, root);
   await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
-  return { id, root, opts: { sourceId: id, noPull: true, noEmbed: true, noExtract: true, explicitProcessing: [] } };
+  return { id, root, opts: { sourceId: id, noPull: true, noEmbed: true, noExtract: true } };
 }
 const planNodes = (plan: Record<string, unknown>): Array<Record<string, unknown>> =>
   [plan, ...((plan.Plans as Array<Record<string, unknown>> | undefined) ?? []).flatMap(planNodes)];
@@ -74,7 +74,7 @@ test('#5762 on a 512k-row request table every probe is an index scan, and the fo
   await engine.executeRaw('ANALYZE persistence_requests');
   const runId = randomUUID();
   const [{ 'QUERY PLAN': [probe] }] = await engine.executeRaw<{ 'QUERY PLAN': Array<{ Plan: Record<string, unknown> }> }>(
-    `EXPLAIN (FORMAT JSON) ${INCOMPLETE_SYNC_RECEIPT_SQL}`, [binding.worktree_id, runId, [], [], [], 0]);
+    `EXPLAIN (FORMAT JSON) ${INCOMPLETE_SYNC_RECEIPT_SQL}`, [binding.worktree_id, runId, [], [], []]);
   const nodes = planNodes(probe.Plan);
   expect(nodes.filter(node => node['Node Type'] === 'Seq Scan' && node['Relation Name'] === 'persistence_requests')).toEqual([]);
   const used = new Set(nodes.map(node => node['Index Name']).filter(Boolean));
@@ -169,7 +169,7 @@ test('#5762 recovery journey: a checkpoint timeout with a dropped index is fixed
   const suggestion = result.managedWrite!.suggestion;
   expect(result.managedWrite).toMatchObject({ write_error: 'checkpoint_validation_timeout', detail: 'index_missing' });
   const commands = [...suggestion.matchAll(/gbrain [^—]+?(?= — |$)/g)].map(match => match[0].trim());
-  expect(commands).toEqual(['gbrain repair request-indexes --apply', `gbrain sync --source ${f.id} --no-pull --retry-failed --no-embed --no-extract`]);
+  expect(commands).toEqual(['gbrain repair request-indexes --apply', `gbrain sync --source ${f.id} --no-pull --no-embed --no-extract`]);
   // Command 1: the printed rebuild.
   expect(await runRepair(ctx(), requestIndexesRepair, await resolveRepairScope(engine), { apply: true })).toMatchObject({ applied: 1 });
   // Command 2: the printed retry.
