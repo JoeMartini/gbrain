@@ -246,7 +246,8 @@ or a physical projection that leaves attribution untouched):
 - `src/core/embedding-dim-check.ts` (1): embedding columns only (physical projection).
 - `src/core/extract/receipt-writer.ts` (1): the extraction receipt page runs in `maintenanceTransaction`.
 - `src/core/facts/backstop.ts` (1): the facts backstop's DB-only fallbacks insert each fact through one helper, in `maintenanceTransaction` at the extraction's derived tier; managed brains publish through the facts request preparer.
-- `src/core/facts/conversation-publication.ts` (3): the managed conversation-facts preparer clears each member page's prior rows and inserts its frozen entry (or a blocked outcome row) inside the coordinator publication of its admitted batch request; the unmanaged cleanup runs the same clear in `maintenanceTransaction`.
+- `src/core/facts/conversation-publication.ts` (4): the managed conversation-facts preparer clears each member page's prior rows and inserts its frozen entry (or a blocked outcome row) inside the coordinator publication of its admitted batch request; the unmanaged cleanup runs the same clear in `maintenanceTransaction`. Its page clear also expires the rows `gbrain facts relink --conversation` linked (after deleting the previous clear's expired copies), inside the same transaction (#6764).
+- `src/core/facts/conversation-relink.ts` (1): `gbrain facts relink --conversation`: a `managed_maintenance_conversation_relink` request on managed brains; the unmanaged relink runs in `writeDerivedFacts` (`maintenanceTransaction`).
 - `src/core/facts/derivation-inputs.ts` (3): `hideDerivedRows` expires derived facts, deactivates derived takes and soft-deletes derived pages inside the purge's coordinated transaction, attributed to the purge request.
 - `src/core/facts/fence-write.ts` (2): the markdown-first fence reconcile insert and its page body mirror each run in `maintenanceTransaction`.
 - `src/core/facts/forget.ts` (4): the legacy fence expiry, withdrawal and strike-through each run in `maintenanceTransaction` (nested inside a caller's coordinated write, they keep its actor).
@@ -261,6 +262,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/minions/handlers/ingest-capture.ts` (1): the capture ingest tombstone soft delete runs in `maintenanceTransaction`.
 - `src/core/ops/extraction.ts` (2): extraction review promote (frontmatter) and reject (soft delete) each run in `maintenanceTransaction`.
 - `src/core/output/writer.ts` (4): `BrainWriter.transaction` is a `maintenanceTransaction`, so its pages and timeline rows carry the maintenance principal.
+- `src/core/page-body/segment-rewrite.ts` (2): a segmented page's fence rewrite (the soft-delete `deleted_at` restore after its generation flip, and the purged version's `page_versions` hash redaction) runs in its caller's transaction: `forget`'s `maintenanceTransaction`, the withdrawal inside the `forget` request's coordinated write, and `purge_fact`'s `withCoordinatedWrite`.
 - `src/core/page-body/streamed-import.ts` (1): the streamed segmented import's pre-replace version snapshot runs in its `maintenanceTransaction`.
 - `src/core/page-state/materialize.ts` (1): coordinated maintenance.
 - `src/core/page-state/rename-alias.ts` (5): the fact slug rewrite runs inside its caller's `updateSlug` transaction, and `movePageIdReferences` (#5431: page_versions, timeline_entries and links moved to the row that materialized under a fallback rename) runs inside `carryRenameIdentity`'s `maintenanceTransaction`; every caller is attributed.
@@ -277,11 +279,12 @@ or a physical projection that leaves attribution untouched):
 - `src/core/persistence/loop-fact-retirement.ts` (1): request preparer.
 - `src/core/persistence/memory-mutations.ts` (1): `forget` inside its request's coordinated write.
 - `src/core/persistence/memory-prepare.ts` (3): `remember` request preparer.
-- `src/core/persistence/page-prepare.ts` (6): page request preparer.
+- `src/core/persistence/page-prepare.ts` (12): page request preparer (including the restore of a segmented page over 24 MiB, which flips `deleted_at` without re-serializing, and the tag flip of a segmented page, which versions it and changes its tag rows and `content_hash` without re-serializing).
 - `src/core/persistence/prepared-maintenance.ts` (3): managed maintenance request preparer.
 - `src/core/persistence/semantic-pages.ts` (1): `add_timeline_entry` request preparer.
 - `src/core/persistence/sync-image.ts` (2): managed sync image request preparer; a Git rename retires the old page inside the same publication.
 - `src/core/persistence/sync-prepare.ts` (4): managed sync request preparer.
+- `src/core/persistence/sync-streamed.ts` (1): the streamed sync of a file over the single-string ceiling moves a renamed page (`updateSlug`) in its request's apply, inside the coordinated publication.
 - `src/core/persistence/takes-prepare.ts` (3): takes request preparer.
 - `src/core/repair/captured-facts.ts` (1): a request on managed brains; the unmanaged captured-facts expiry runs in `maintenanceTransaction`.
 - `src/core/repair/conversation-labels.ts` (4): a request on managed brains; the unmanaged label retirement runs in `maintenanceTransaction`.
@@ -289,6 +292,7 @@ or a physical projection that leaves attribution untouched):
 - `src/core/repair/frontmatter.ts` (1): a `managed_file_repair` request on managed sources; the unmanaged rename runs in `maintenanceTransaction`.
 - `src/core/repair/ghost-pages.ts` (2): `gbrain repair ghost-pages` retirement: a receipted `managed_maintenance_retire_ghost_page` request (a prepared `delete_page` with no file bytes) on managed brains; the unmanaged version and soft delete run in `maintenanceTransaction` after the same recheck.
 - `src/core/repair/ontology-facts.ts` (1): a coordinated database-only write (`coordinatedDatabaseWrite`, the `ontology_propose` path) on managed brains; the unmanaged ontology-facts restore runs in `maintenanceTransaction`.
+- `src/core/repair/rename-identity.ts` (5): `gbrain repair rename-identity` carry, unmanaged brains only (a managed brain refuses `managed_remedy_unavailable` before writing); the fence-row merge, the provisional page's retirement, the slug move and the import run in one `maintenanceTransaction` under both page locks after the plan-hash recheck.
 - `src/core/repair/stale-atoms.ts` (3): a request on managed brains; the unmanaged retirement runs in `maintenanceTransaction`.
 - `src/core/repair/take-supersession.ts` (1): `gbrain repair take-supersession` reprojection: a receipted `managed_maintenance_take_reproject` request on managed brains, `maintenanceTransaction` on unmanaged ones; fence edits go through a revision-bound `put_page`.
 - `src/core/repair/timeline-comments.ts` (1): `gbrain repair timeline-comments` row cleanup: `withCoordinatedWrite` under the page key on managed brains, `maintenanceTransaction` otherwise.

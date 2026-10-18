@@ -4370,6 +4370,7 @@ that work in this conversation.
 | 10 | write accepted, still pending | poll the receipt (`gbrain write-request -- <id>`) |
 | 11 | partial, resumable budget stop | run `resume_command` |
 | 13 | `pending_verify`: a harness wired, verification waits for the serve | start the serve, then run `fix.command` |
+| 14 | `bootstrap_cleanup_pending`: a harness is wired; old shared-skills enrollments or token ids still await cleanup | follow `fix.next` (re-run, or relay the owner's revoke step), then re-run |
 | 75 | another runner holds the migration lock | wait, then retry |
 | 124 | the command's deadline elapsed | inspect what is still running |
 | 130 | interrupted | ask the user whether to re-run |
@@ -4845,7 +4846,7 @@ I'm Garry Tan, President and CEO of Y Combinator. I built GBrain to run my own A
 Alongside keyword and semantic retrieval, GBrain offers two optional ways to use your stored knowledge:
 
 - **A synthesis layer that gives you the actual answer.** Synthesized, well-cited prose across people, companies, deals, and ideas. Not "here are 10 chunks that mention your query"; an actual answer with citations and an explicit note on what the brain doesn't know yet. The gap analysis is the part that changes how you use the brain.
-- **A typed knowledge graph.** Trusted local page writes extract supported references without LLM calls when auto-linking is enabled. Remote `put_page` does not extract graph edges inline: stdio has best-effort startup/idle sweeps; HTTP needs explicit maintenance or authorized `add_link` calls. Ask "who works at acme-example?" to use stored relationships. On BrainBench relationship questions a graph adapter scored **P@5 0.3421, R@5 0.9791** vs 0.1917 / 0.6874 plain hybrid ([2026-09-09 refresh](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-09-09-retrieval-refresh.md)): whole systems, not a graph-only lift or a general guarantee.
+- **A typed knowledge graph.** Trusted local page writes extract supported references without LLM calls when auto-linking is enabled. Remote `put_page` edges arrive later, via sweeps, maintenance or `add_link`. Ask "who works at acme-example?": walks are breadth-first, milliseconds on dense clusters ([how](docs/architecture/RETRIEVAL.md#breadth-first-graph-walks)). On BrainBench relationship questions a graph adapter scored **P@5 0.3421, R@5 0.9791** vs 0.1917 / 0.6874 plain hybrid ([2026-09-09 refresh](https://github.com/garrytan/gbrain-evals/blob/main/docs/benchmarks/2026-09-09-retrieval-refresh.md)): whole systems, not a graph-only lift or a general guarantee.
 
 The point of building a 150K-page brain is to use it as a strategic moat. To never lose context. To query what's in your own head without re-reading it. The brain layer is what makes the moat usable. The 24/7 dream cycle is what keeps it sharp. Both run on your hardware, your DB, your keys.
 
@@ -5437,7 +5438,7 @@ RRF fusion, multi-query expansion, and 4-layer dedup are engine-agnostic. They o
 - `tsvector` + `GIN` index for full-text search with `ts_rank` weighting
 - `pgvector` HNSW index for cosine similarity vector search
 - `pg_trgm` + `GIN` for fuzzy slug resolution
-- Recursive CTEs for graph traversal
+- Recursive CTEs for graph traversal (breadth-first, each page visited once)
 - Trigger-based search_vector (spans pages + timeline_entries)
 - JSONB for frontmatter with GIN index
 - Connection pooling via Supabase Supavisor (port 6543)
@@ -5457,14 +5458,14 @@ describes bounded candidate recovery and incomplete-result metadata.
 
 On Postgres the same refresh also analyzes the page columns every search
 filter reads (`deleted_at`, `source_id`, `type`, `slug`) and
-`content_chunks(model, modality, page_id, body_generation, retired_generation)`, and an embed drain that embedded
+`content_chunks(model, modality, page_id, body_generation)`, and an embed drain that embedded
 anything analyzes those chunk columns once at its end (each ANALYZE bounded by
 a 30 s statement and 2 s lock timeout). Without those statistics the vector
 candidate statement sorts every eligible chunk instead of walking the HNSW
 index, and at 1M chunks and above that sort runs past the 8 s vector budget,
 so hybrid search falls back to keyword-only results until autovacuum
 analyzes the tables. If a refresh is skipped (a lock, or a role that does not
-own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation, retired_generation)` and
+own the tables), run `ANALYZE content_chunks(model, modality, page_id, body_generation)` and
 `ANALYZE pages` as the table owner.
 
 ### Vector index sizing
@@ -5532,6 +5533,88 @@ per-request scope binding — unwrapped paths (writes, admin/maintenance reads)
 run under the role default and are not backstopped per caller. This is layer 2;
 the app-layer source filters remain layer 1 and stay mandatory. Behavioral pins
 live in `test/postgres-engine-rls-scope.test.ts`.
+
+**Segmented page tables.** A page over 1 MiB stored in segments (`pages.segmented_storage`)
+keeps its text in `page_segment_texts`, its layout and headings in
+`page_body_manifest`, uploads in progress in `page_body_stagings` /
+`page_body_staging_parts` (with the segment texts each one holds in
+`page_body_staging_texts`), and view sizes in `page_view_digests`. gbrain
+enables RLS on all six on every schema replay, as it does on `pages` and
+`content_chunks`, so with no policy a role that does not bypass RLS reads no row
+of them. Title search, the source-scoped vector scan, the chunk windows search
+reads around its hits, `get_chunks` and get_page check a chunk of a page stored
+in segments against `page_body_manifest`. A restricted read role that can see
+such a chunk (a segmented page of one of its sources) needs `SELECT` on it;
+without it those reads fail with `permission_denied` (42501). A role that sees
+no such chunk, as every role does while no page is segmented
+(`pages.segmented_storage` is off by default), reads as before without the
+grant (`test/e2e/segmented-switch-off-rls.test.ts`). Grant it together with
+these policies, never with an open one, or the role reads every source's segment
+text. A scoped role then sees exactly the segment rows of its sources:
+
+<!-- gbrain:segmented-rls-recipe:begin (applied verbatim by test/e2e/segmented-rls-scope.test.ts) -->
+```sql
+-- The pages_scope_filter predicate, on each table's own source_id.
+CREATE POLICY page_segment_texts_scope_filter ON page_segment_texts
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_body_manifest_scope_filter ON page_body_manifest
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+CREATE POLICY page_body_stagings_scope_filter ON page_body_stagings
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- A write role records the texts each staging holds here; without a policy its
+-- segmented writes are refused.
+CREATE POLICY page_body_staging_texts_scope_filter ON page_body_staging_texts
+  USING (current_setting('app.scopes', true) = '*'
+         OR source_id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- Search joins sources; a scoped role sees its own.
+CREATE POLICY sources_scope_filter ON sources
+  USING (current_setting('app.scopes', true) = '*'
+         OR id = ANY(string_to_array(current_setting('app.scopes', true), ',')));
+-- No source_id of their own: visible exactly when their staging or page is
+-- (the pages policy filters the subquery). content_chunks holds every page's
+-- chunk text, segmented or not.
+CREATE POLICY page_body_staging_parts_scope_filter ON page_body_staging_parts
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM page_body_stagings s WHERE s.id = staging_id));
+CREATE POLICY page_view_digests_scope_filter ON page_view_digests
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+CREATE POLICY content_chunks_scope_filter ON content_chunks
+  USING (current_setting('app.scopes', true) = '*'
+         OR EXISTS (SELECT 1 FROM pages p WHERE p.id = page_id));
+
+-- A read role that searches and reads pages. The other tables it reads
+-- (config, timeline_entries, facts, ...) need policies of their own.
+GRANT SELECT ON pages, content_chunks, page_body_manifest, page_segment_texts,
+  page_view_digests, sources TO <reader-role>;
+
+-- If the runtime role OWNS these tables, as for pages:
+ALTER TABLE page_segment_texts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_manifest FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_stagings FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_staging_parts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_body_staging_texts FORCE ROW LEVEL SECURITY;
+ALTER TABLE page_view_digests FORCE ROW LEVEL SECURITY;
+ALTER TABLE content_chunks FORCE ROW LEVEL SECURITY;
+```
+<!-- gbrain:segmented-rls-recipe:end -->
+
+A role whose reads do not run through the scoped helper is scoped by its own
+default (`ALTER ROLE <reader-role> SET app.scopes = 'source-a,source-b'`). The
+policies read `app.scopes` only; the app-layer source filters stay layer 1.
+
+A write role that does not own the tables needs `SELECT, INSERT, UPDATE, DELETE`
+on all six, as on any table a migration adds, even while no page is segmented:
+purging soft-deleted pages, fact withdrawal (`forget_fact`, `purge_fact`), the
+maintenance sweep's facts pass, doctor's credential check and the segment
+storage sweep name them. Its ordinary writes (`put_page`, `remember`, sync
+imports, their embedding and the unchanged-file check) do not, while it sees no
+segmented chunk (`test/e2e/segmented-switch-off-write-role.test.ts`). With the
+policies above it creates segmented pages and sees only its sources' rows
+(`test/e2e/segmented-rls-scope.test.ts`).
 
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
@@ -5627,6 +5710,7 @@ and the fix is the read-only `gbrain migrate --to postgres --plan --json`.
 | Cost | Free | Supabase Pro ($25/mo) |
 | Concurrency | Single process | Connection pooling |
 | Backups | Manual (file copy) | Managed by Supabase |
+| Largest page | 24 MiB; 128 MiB stored in segments with `pages.segmented_storage on` (`pages.max_bytes`) | 24 MiB; 256 MiB stored in segments with `pages.segmented_storage on` (`pages.max_bytes`) |
 
 **The belief ledger lives only in the database.** `belief_events` and its side tables record what the brain had recorded, and when (`gbrain beliefs status`). Markdown carries only current state, so a rebuild from Markdown, `gbrain reinit-pglite` or a dropped database starts an empty history; back up the database itself. After restoring a Postgres (or PGLite) backup, replay the purges made after the backup was taken: until then content purged later is readable again, and `gbrain doctor --only belief_ledger_coverage` reports a restore whose purge replay was partial, unavailable or unverified. Graduation copies the ledger verbatim (equal event keys and digests); the legacy copier refuses a brain that has one.
 
@@ -6347,7 +6431,7 @@ Every method in `BrainEngine`. The full interface. No optional methods, no featu
 | Keyword search | tsvector + ts_rank | tsvector + ts_rank | Identical (real Postgres) |
 | Vector search | pgvector HNSW | pgvector HNSW | Same operators; bounded fallback/cancellation differs |
 | Fuzzy slug | pg_trgm | pg_trgm | Identical (real Postgres) |
-| Graph traversal | Recursive CTE | Recursive CTE | Same SQL |
+| Graph traversal | Breadth-first recursive CTE (one row per layer) | Breadth-first recursive CTE (one row per layer) | Same SQL |
 | Transactions | Full ACID | Full ACID | Both support this |
 | JSONB queries | GIN index | GIN index | Identical |
 | Concurrent access | Connection pooling | Single process | PGLite limitation |
@@ -6963,7 +7047,13 @@ its soft-deleted slug. The sync report prints each such pair, `gbrain sync
 status --source <id> --json` lists it under `identity_downgrades`, doctor
 `rename_identity_downgrades` names it, and the purge leaves the old page alone
 until the pair gets a disposition; there is no time limit, so a pair can still
-be repaired later. Restoring the old page settles it: run
+be repaired later. Each pair names its remedy, `gbrain repair rename-identity
+--source <id> --slug <new-slug>`: preview it, and after the user agrees apply it
+to carry the old page's identity (history, links, facts) onto the new page, or
+add `--close` to release the hold without carrying it. On a managed source only
+`--close` is available (`managed_remedy_unavailable`). See
+[rename identity](repair.md#rename-identity). Restoring the old page also
+settles the pair: run
 `gbrain restore <old-slug> --source-id <id> --force` (it then lives beside the
 new page; where the old file cannot be re-created the restore names
 `--detach`). An unbound classic source on Postgres refuses page writes outside
@@ -7376,7 +7466,9 @@ Every hold and error has three fields, from one table
   reruns the same sync; `retry_when_clean` re-screens a held file once its edit
   is committed; `repair` previews and applies a hash-bound file repair;
   `reconcile` previews two diverged versions; `upgrade` installs a newer gbrain;
-  `none` waits for a person.
+  `migrate` applies the pending schema migrations (`gbrain apply-migrations
+  --yes`, as the database role that owns the gbrain tables) before the write is
+  resubmitted; `none` waits for a person.
 - `needs_human`: a person has to choose or act before it clears;
   `human_reason` says what. A page whose safe action failed three times with
   the same code (`attempts`: a re-hold, or a failed `unblock --apply` or
@@ -7608,6 +7700,13 @@ days, so a soak can show that sync keeps moving on its own.
 Each line has one count per kind and a `total`; `by_day` lists both line
 totals for each day that recorded anything. Fields are only ever added.
 
+## Dry-run convergence classes
+
+`sync --dry-run --json` adds a read-only `convergence` receipt. Class actions:
+- `none`: settled.
+- `owner`: sync finishes it.
+- `repair`: a person decides.
+
 ## See also
 
 - [`write-refusals.md`](write-refusals.md#held-files-and-content-refusals): every hold code with its recovery.
@@ -7761,8 +7860,13 @@ per-transcript synthesis subagents. The dials:
 - `dream.triage.threshold` (default 0.5) — the score bar, and the first of the
   two ways a transcript passes the gate (the verified-segment rescue below is
   the second). Scores are cached, so retuning it re-gates instantly with
-  **zero** new LLM calls. Raise it if too much routine content synthesizes;
-  lower it if real signal is being skipped.
+  **zero** new LLM calls. Lower it if real signal is being skipped. Raising it
+  alone may not cut volume (#6753): the rescue band below is
+  `[rescue_floor, threshold)`, so it widens with the threshold, and
+  transcripts that stop passing directly can still pass through the rescue.
+  To cut volume, raise `dream.triage.rescue_floor` or
+  `dream.triage.rescue_min_segments` along with it (`0` turns the rescue
+  off), and compare `details.triage.rescue_fired` before and after.
 - `models.dream.triage` — the triage model (default: utility tier / Haiku).
 - `dream.triage.max_chars` (default 24000, floor 1000) — per-transcript
   sample window (head/middle/tail) sent to the judge. Not part of cache
@@ -8041,209 +8145,6 @@ echo "Dream cycle complete at $(date)"
 ---
 
 *Part of the [GBrain Skillpack](../GBRAIN_SKILLPACK.md). See also: [Quiet Hours](quiet-hours.md), [Operational Disciplines](operational-disciplines.md)*
-
----
-
-## docs/guides/quiet-hours.md
-
-Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/quiet-hours.md
-
-# Quiet Hours and Timezone-Aware Delivery
-
-## Goal
-
-Hold all notifications during sleep hours, merge held messages into the morning briefing, and adjust automatically when the user travels.
-
-## What the User Gets
-
-Without this: 3 AM pings from cron jobs. One bad notification and the user
-disables the entire system.
-
-With this: the brain works overnight (dream cycle, collectors, enrichment)
-but notifications are held until morning. Travel to Tokyo? The system adjusts
-automatically from your calendar, no config change needed.
-
-## Implementation
-
-### Quiet Hours Gate
-
-Every cron job that sends notifications must check quiet hours FIRST.
-
-```
-QUIET_START = 23  // 11 PM local time
-QUIET_END = 8     // 8 AM local time
-
-is_quiet(local_hour):
-  return local_hour >= QUIET_START OR local_hour < QUIET_END
-```
-
-**Before sending any notification:**
-1. Determine user's current timezone (from config or heartbeat state)
-2. Convert current UTC time to local time
-3. If quiet hours: hold the message, don't send
-
-### Held Messages
-
-During quiet hours, output goes to a held directory instead of being sent:
-
-```
-if is_quiet():
-  mkdir -p /tmp/cron-held/
-  write("/tmp/cron-held/{job-name}.md", output)
-  exit  // don't send
-else:
-  send(output)
-```
-
-The morning briefing picks up held messages:
-
-```
-morning_briefing():
-  held_files = list("/tmp/cron-held/*.md")
-  if held_files:
-    briefing += "## Overnight Updates\n\n"
-    for file in held_files:
-      briefing += read(file)
-      delete(file)
-```
-
-This way nothing is lost. Overnight cron results get folded into the
-first thing the user sees in the morning.
-
-### Timezone Awareness
-
-The agent should know what timezone the user is in. Store it in
-the agent's operational state:
-
-```json
-{
-  "userAwake": true,
-  "currentLocation": {
-    "timezone": "Europe/Zurich",
-    "city": "Basel",
-    "source": "user-confirmed"
-  },
-  "homeLocation": {
-    "timezone": "Europe/Zurich",
-    "city": "Basel"
-  }
-}
-```
-
-`homeLocation` is optional. The context engine shows a separate home clock only
-when an explicit home timezone differs from the current timezone. It never
-guesses a home city or timezone. The `garryAwake` alias remains readable
-for compatibility; producers should write `userAwake`.
-
-**Update the timezone when:**
-- Calendar shows the user flying somewhere (check for airline/hotel events)
-- User mentions being in a different city
-- User's active hours shift (they're responding at 3 AM PT = they're probably traveling)
-
-**All times shown to the user should be in their LOCAL timezone.** Never
-show UTC or a timezone the user isn't in.
-
-### Shell Implementation
-
-```bash
-#!/bin/bash
-# quiet-hours-gate.sh — run before any notification
-
-TIMEZONE="${USER_TIMEZONE:-US/Pacific}"
-LOCAL_HOUR=$(TZ="$TIMEZONE" date +%H)
-
-if [ "$LOCAL_HOUR" -ge 23 ] || [ "$LOCAL_HOUR" -lt 8 ]; then
-  echo "QUIET_HOURS=true"
-  exit 1  # don't send
-fi
-
-echo "QUIET_HOURS=false"
-exit 0  # ok to send
-```
-
-**In cron job scripts:**
-```bash
-# Check quiet hours first
-if ! bash scripts/quiet-hours-gate.sh; then
-  mkdir -p /tmp/cron-held
-  echo "$OUTPUT" > /tmp/cron-held/$(basename "$0" .sh).md
-  exit 0
-fi
-
-# Not quiet hours — send normally
-send_notification "$OUTPUT"
-```
-
-### GBrain-native hooks
-
-Two places gbrain already understands quiet hours natively — use these
-before rolling your own gate for the same job:
-
-- **Self-upgrade** — `auto` mode only applies upgrades during quiet hours,
-  configured via `gbrain config set self_upgrade.quiet_hours
-  '{"start":23,"end":8,"tz":"US/Pacific"}'`. See
-  [upgrades-auto-update.md](upgrades-auto-update.md).
-- **Cron prompts** — schedule-driven notification jobs should carry the
-  gate described in this doc; [cron-schedule.md](cron-schedule.md) covers
-  the scheduling side.
-
-The shell pattern below is for everything else: your own cron jobs,
-collectors, and notification paths that gbrain doesn't gate for you.
-
-### Configurable Hours
-
-Some users want different quiet hours. Store the config:
-
-```json
-{
-  "quiet_hours": {
-    "start": 23,
-    "end": 8,
-    "enabled": true
-  }
-}
-```
-
-Set `enabled: false` to disable quiet hours entirely (e.g., for 24/7 monitoring).
-
-## Tricky Spots
-
-1. **Gate on EVERY job.** The quiet hours check must run before every single
-   cron job that produces notifications. If even one job skips the gate, the
-   user gets a 3 AM ping and loses trust in the entire system. No exceptions.
-
-2. **Held messages MUST be picked up.** If the morning briefing doesn't read
-   `/tmp/cron-held/`, overnight results vanish silently. Verify the briefing
-   skill reads and clears the held directory. Orphaned held files mean the
-   pickup integration is broken.
-
-3. **`/tmp` doesn't survive reboots (or, on macOS, periodic cleanup).** If a
-   held message must not be lost across a restart, use a durable held
-   directory (e.g. `~/.local/state/cron-held/`) instead of `/tmp/cron-held/`.
-
-4. **Timezone auto-detection is fragile.** Calendar-based timezone detection
-   relies on the user having airline/hotel events with location data. If the
-   user books travel without calendar entries, the system won't detect the
-   move. Fall back to activity-hour analysis (responding at 3 AM PT = probably
-   not in PT anymore) and ask the user if uncertain.
-
-## How to Verify
-
-1. **Set quiet hours to the current hour.** Temporarily set `QUIET_START` to
-   one hour before now and `QUIET_END` to one hour after. Trigger a cron job.
-   Verify the output goes to `/tmp/cron-held/` instead of being sent.
-
-2. **Check held message pickup.** After step 1, run or simulate the morning
-   briefing. Verify the held message appears in the "Overnight Updates"
-   section and the file is deleted from `/tmp/cron-held/`.
-
-3. **Verify timezone adjustment.** Change the timezone config to a zone where
-   it's currently quiet hours. Trigger a notification. Verify it's held. Change
-   back to your real timezone during active hours. Trigger again. Verify it sends.
-
----
-
-*Part of the [GBrain Skillpack](../GBRAIN_SKILLPACK.md).*
 
 ---
 
@@ -9598,6 +9499,32 @@ verbatim name-like lines from the remote-sanitized body, 600 characters per
 page and 1,200 per card, `identity_excerpt_omitted[]`); `alias_guidance`
 (`{ text, requires_surface? }`). `recent_facts[]` (`{ id, fact, kind, valid_from, entity_slug? }`, the 5 newest active saved facts, also those saved under an identity sibling or the bare subject slug, which carry that `entity_slug`); `active_fact_count` and `recall {entity}` cover the same slugs.
 
+#### entity source resolution and `source_id` (additive)
+
+Without `source_id`, `name` and each of `names` resolve across every source
+the caller can read: the home source first (the connection's source, or the
+ambient GBRAIN_SOURCE / .gbrain-source binding), then the other readable
+sources sorted by id, so one brain always resolves a name the same way. The
+first source with a hit owns the card, and every read behind it (aliases,
+facts, edges, references, identity) uses that source; sources outside the
+caller's grant are never read and look like a miss. A remote `__all__` names
+no source and still resolves nothing.
+
+`source_id` (one readable source) pins the lookup. A pin outside the grant,
+for a removed source or with a malformed id is refused with recall's selector
+errors: `scope_denied`, `not_found`, `invalid_params`. `prefer_source_id`
+reorders the walk without narrowing it (thin clients send their
+.gbrain-source there). When the ambient binding's source has no match, a
+`source_binding_narrowed` notice names where each name resolved.
+The starter MCP tool list does not advertise `source_id`, `prefer_source_id`
+or `context_pack`'s `entity_refs` (it keeps the list inside its size budget);
+the full surface does, and every surface accepts them.
+
+Every card carries `card.entity.source_id`, every `names` row `source_id`,
+and each suggestion its `source_id`: `(source_id, slug)` is the entity's
+identity, and two pages sharing a slug in two sources are two entities. A
+row's `next` names `source_id` when the page is outside the home source.
+
 #### entity open_threads loop backing (additive)
 
 On brains running the open-loop engine, `open_threads` entries may
@@ -9937,14 +9864,43 @@ synced to a cloud model). `include_private` widens ALL arms in
 lockstep, and is honored ONLY for trusted-local callers (`remote === false`); a
 remote caller never widens (fail-closed).
 
-Response: `{ protocol_version, entities, cards[], open_threads[], facts[], text,
+Response: `{ protocol_version, entities, cards[], open_threads[], facts[], entity_facts[], text,
 degraded_reason?, budget_tokens?, budget_used?, dropped_count?, core?, pinned_questions?, withheld?, brief? }`. `text` is the
 envelope-wrapped injectable block, rendered from the packed sets within `budget_tokens`.
 
-`entities` scopes cards and threads, not the hot facts (the session's recent
+`entities` scopes cards, threads and `entity_facts`, not the hot facts (the session's recent
 memory), so other facts can appear; `recall` with `entity` reads one entity
 strictly. `facts[]` here and in `delta` carry `fact_id` (what `forget` takes)
 and `provenance` (the stored source), never rendered into `text`.
+
+#### context_pack sources: `source_id`, `entity_refs` (additive)
+
+`entities` resolve like `entity` names: across the caller's readable sources,
+home first then by id, unless `source_id` pins one (same selector errors;
+`prefer_source_id` reorders only). `entity_refs`
+(`[{"source_id": "wiki", "slug": "people/alice-example"}]`, inside the same cap
+of 8 after `entities`) packs source-qualified entities, each read only in its
+own source and checked like a pin. Every card carries `source_id`; a card
+from outside the home source renders as `slug` (source <id>) in `text`, and
+its newer-mention continuation names the source. Each card's activation
+verdict, newer mentions, records and `page_status` come from its own source,
+never from a same-slug page in another source, and cards are deduplicated by
+`(source_id, slug)`. `pinned_questions` carries a published pin only when its
+source and `scope_entity` match an accepted card's `(source_id, slug)`.
+
+#### context_pack entity_facts (additive)
+
+`entity_facts[]` holds the packed entities' own facts: up to 5 per card, newest
+first, read in the card's own source with the card's visibility (world-only
+unless a trusted-local caller passed `include_private`) and eligibility. Each
+row is `{ source_id, slug, fact_id, fact, kind, entity_slug, valid_from?,
+context, confidence, attributed_to, provenance, trust_tier?, origin? }`, where
+`(source_id, slug)` names the card. `facts[]` is unchanged hot memory, so a
+fact can appear in both arrays. `text` renders entity facts under `## Entity
+facts (about the standing entities)` before hot memory, and a fact in both
+renders once, there. Under `budget_tokens` entity facts pack after cards and
+before hot facts, leave with a dropped card (counted in `dropped_count`), and
+a hot fact already shown as an entity fact costs nothing.
 
 #### context_pack records (additive)
 
@@ -10270,6 +10226,11 @@ gbrain doctor --json
   skip this check; the embedded engine has no remote surface)
 - `schema_version`: current
 - `embeddings`: coverage percentage
+
+A check that carries `skipped_segmented: N` (message ending in
+`skipped (segmented): N`) did not read N pages stored in segments, so its
+`ok` covers only the pages it read; see
+[segmented page storage](guides/memory-boundaries.md#segmented-doctor-skips).
 
 **If it fails:** The doctor output includes specific fix instructions for each
 check. See `skills/setup/SKILL.md` Error Recovery table.
@@ -10649,6 +10610,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 
 | Symptom | Next step | Who acts | Consent | Verify |
 |---|---|---|---|---|
+| The dream cycle's purge phase fails every night with `managed_purge_failed` (`42P01`, relation `query_cache` does not exist), or doctor `schema_missing_tables` warns | upgrade (#6911: the purge skips a missing rebuildable cache), then preview recreating it: `gbrain repair missing-tables` ([missing tables](repair.md#missing-tables)); apply the printed `--apply --expect <hash>` command. Pages parked by the earlier failures: `gbrain pages purge-deleted --retry-parked --dry-run`, then without `--dry-run` | agent, after the user agrees | `destructive` (the parked-page retry purges them) | `gbrain doctor --only schema_missing_tables --json` reports ok |
 | A managed source's autopilot freshness `sync` jobs each land about one page, or `sources status` says `parked` while a sync job runs | upgrade (#6706: sync jobs drain to their deadline and count as the source's live drain), then restart `gbrain jobs work` / the supervisor so the worker loads the handler; a job result with `incomplete: true` names its follow-up (`continuation_job_id`) or the next step in `next` | agent | none | `gbrain sync status --source <id> --json` shows `live_job_id` or a cursor at `done`; `gbrain jobs get <id> --json` shows `outcome` |
 | Doctor `sync_freshness` says a source has "no successful sync recorded" or "first sync running" | follow the check's `fix`: `first sync running` (code `sync_first_run_in_progress`, warn) means wait; `no successful sync recorded` (code `sync_no_successful_sync`, fail) names the last attempt and its `reason`: wait for a queued job, inspect holds (`gbrain sync status --source <id> --json`), or retry (`gbrain sync --source <id>`) ([details](#sync-freshness-no-successful-sync)) | agent | none | `gbrain doctor --only sync_freshness --json` |
 | Recall returns conversation facts like "Date said …", "Attendees said …" or "Summary said …" | `gbrain repair conversation-labels` previews them ([conversation labels](repair.md#conversation-labels)); apply the printed command with `--yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only conversation_label_facts --json` is ok |
@@ -10761,6 +10723,8 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="doctor-residue"></a>**`gbrain doctor` warns `timeline_history`, `derived_visibility`, or unsealed pages under `contextual_retrieval_coverage`?** Preview the fix with `gbrain repair`, then apply one kind at a time with `gbrain repair <kind> --apply` on the brain host. See [repair residual damage](repair.md).
 
+<a id="extract-health-halts"></a>**Doctor warns `extract_health` with "kind(s) with halt rate > 10%" after the cause was already fixed?** The check is a rate over the last 7 days, not a list of open faults: `halt_count` and `round_completed_count` are 7-day sums from the extraction rollup (one row per kind per day), so halts recorded before a fix keep the rate up until their days leave the window. Read each kind's age before acting: `last halt today` (or `1d ago`) means the extractor is still halting, while `last halt 5d ago` on a kind that has run since means the halts are history. `gbrain doctor --only extract_health --json` gives the same per kind in `details.kinds[]`: `halt_rate`, `last_halt_age_days`, `top_halt_reason` and every reason with its count in `halt_reasons`; runs that stopped at an expected budget or deadline cap count in `expected_limit_count`, not as halts. Fix the reason that is still current, then let the window age out: expiry is how a repaired cause clears, and there is no acknowledgement or reset command. A halt with `last_halt_age_days` at 0 after the fix means the cause is not fixed. **Say to your agent:** *"Is extract_health warning about current halts or old ones?"*
+
 **`gbrain doctor` warns `timeline_orphans`?** Timeline rows from an earlier version of a page are still in the database after the dated bullet was edited or deleted. Preview with `gbrain extract timeline --prune-orphans --dry-run`, then remove them with `gbrain extract timeline --prune-orphans` (add `--source-id <id>` to limit it). Rows no page version ever produced, such as enrichment and meeting fan-out, are kept.
 
 **A doctor check says "Not verified"?** <a id="not-verified-doctor-checks"></a>The check could not read its input, so it reports `warn` instead of `ok`; `gbrain doctor --json` carries `details.code: "not_verified"` and the underlying reason in `details.reason`. Fix the cause, then re-run `gbrain doctor`:
@@ -10785,7 +10749,7 @@ Turning the `preparation_deadlines` switch off (`gbrain config set persistence.p
 
 <a id="managed-sync-blocked"></a>**A managed sync run is blocked (doctor `managed_sync_blocked`, a freshness `sync` job ended `dead`, or get_brain_health reports `sync_blocked`)?** The source's unfinished run stopped on a page request that did not commit and recorded the stop, so it resumes nothing by itself while the other sources keep syncing (#6858: one source stopped for 21 hours while every freshness job reported `completed`). Such a job now ends `dead`: its error names the stop and the run's `next` command, and `gbrain jobs get <id> --json` carries `outcome`, `drain` and `next` in its progress. Doctor warns as soon as a run is blocked and fails once it has been blocked for more than an hour; get_brain_health turns to `attention` past the same hour, with a count band and no source names. Run `gbrain sync status --source <id> --json` (read-only): it names the page, its fault class and its exit. Clear the cause it names and run the step it prints; the next freshness job resumes the run once the cause is gone. A page publication that `gbrain repair stuck-recovery --keep disk` abandoned is not a blocker: the next plain sync retries that page after the rest of its run, imports it when the kept file is committed, and holds it `worktree_dirty` otherwise.
 
-<a id="managed-sync-not-moving"></a>**The catch-up is parked (`sources status --json` says `data_moving: false`, doctor warns `managed_sync_not_moving`, `gbrain sources writer movement` exited 1), or the drain stopped `drain_stalled` with `cause: owner_wedged_here`?** Liveness is not movement: `/health` can be ok, the pid alive and `sync_running: true` while no page has committed for weeks. A managed source is *not moving* when an unfinished `managed-sync` cursor has had neither a committed `managed_sync_*` receipt nor a head step advance for longer than `persistence.preparation_ceiling_ms` (600 s) while a drain or a full consumer is live on the owner host; with nothing live it is `movement_state: parked` (a cursor left between cron runs; informational, not scored). A parked cursor whose write queue still holds admitted requests while no consumer runs and nothing has moved for longer than that ceiling is stranded: nothing will ever drain it, so doctor `managed_sync_not_moving` fails (#6552, #6712 PR 2) and its fix is the resume sync with the cursor's stored options (`gbrain sync --source <id> …`), which consumes the queue itself; `details.stranded` counts such sources. Every surface routes to the same two read-only calls, so the agent reaches the owner, the step and the next action without SQL:
+<a id="managed-sync-not-moving"></a>**The catch-up is parked (`sources status --json` says `data_moving: false`, doctor warns `managed_sync_not_moving`, `gbrain sources writer movement` exited 1), or the drain stopped `drain_stalled` with `cause: owner_wedged_here`?** Liveness is not movement: `/health` can be ok, the pid alive and `sync_running: true` while no page has committed for weeks. A managed source is *not moving* when an unfinished `managed-sync` cursor has had neither a committed `managed_sync_*` receipt nor a head step advance for longer than `persistence.preparation_ceiling_ms` (600 s) while a drain or a full consumer is live on the owner host; with nothing live it is `movement_state: parked` (a cursor left between cron runs; informational, not scored). A parked cursor whose write queue still holds admitted requests while no consumer runs and nothing has moved for longer than that ceiling is stranded: nothing will ever drain it, so doctor `managed_sync_not_moving` fails (#6552, #6712 PR 2) and its fix is the resume sync with the cursor's stored options (`gbrain sync --source <id> …`), which consumes the queue itself; `details.stranded` counts such sources. When the sync backlog itself cannot be read, every surface says `movement_state: unknown` (`unknown.reason: backlog_read_failed`) instead of `nothing_pending`: doctor warns with `details.health: unknown`, `sources status` prints a `movement UNKNOWN` line, and `gbrain sources writer movement` exits 1 with code `movement_unknown` (`--warn-only` exits 0); rerun the movement command, and run `gbrain doctor --json` if the read keeps failing. Every surface routes to the same two read-only calls, so the agent reaches the owner, the step and the next action without SQL:
 
 1. `gbrain sources status <id> --json`: `data_moving`, `not_moving_since`, `movement_state` and, beside `data_moving: false`, the exact `gbrain sources writer status --source <id> --json` to run next. Doctor's `managed_sync_not_moving` fix is that same command.
 2. `gbrain sources writer status --source <id> --json`: every running claim ends in one `claim.next` envelope (`code` `claim_running`, `claim_overdue` or `claim_lapsed`). `claim_running` carries `retry_after_ms` and a `run` of the same status command while the owner is inside its allowance (the owner's own budget will cut the write; nothing to do but rerun after the delay), `tell_user_to_run` naming the owner `kind` and pid past the ceiling or when the owner reads `restart_required` (restart that process), `run` the printed resume command for a lapsed claim. `host.consumers` lists the processes on this host holding a consumer (pid, kind, mode `full|waiter_only`, started_at, the pool gauge), so a second consumer is visible in the same call.
@@ -10854,7 +10818,7 @@ Two calls, no SQL: the doctor or `sources status` row names the command, and `wr
 <a id="terminal-write-failures"></a>**Doctor warns `persistence_terminal_failures`, or `gbrain sync status` reports terminal write failures?** Every write leaves a receipt, and a receipt that ended `failed`, `conflict` or `cancelled` stays in `persistence_requests` until compaction. gbrain reads them at query time and sorts each one into a category with a class, safe actions, whether a person decides, and a structured fix (nothing new is stored). Most rows need no action, so the check separates three things:
 
 - **Active blockers** hold work now: a receipt still holding a publication recovery record (it blocks every queued write on its root), or a receipt that blocks a managed sync's checkpoint. Doctor warns whenever one exists, whatever the trend, and its `fix.command` is the next step (for a recovery record, `gbrain sync --source <id> --no-pull`, which runs the owner pass that clears it; a `recovery_blocked` record names the file to inspect instead).
-- **Unresolved rows** are terminal receipts in the window (`persistence.terminal_failures.window_days`, default 7, never longer than `persistence.receipt_retention_days`) that no later write superseded. Doctor warns when any of them is a gbrain-defect class (`owner_exception`, `database_refusal`, `writer_guard`, `outside_fence`, `gbrain_defect`): report those with the receipt ids. The rest are ordinary refusals the caller already received (`caller_conflict`, `caller_refusal`, `operator_cancelled`) or sync faults a rerun retries.
+- **Unresolved rows** are terminal receipts in the window (`persistence.terminal_failures.window_days`, default 7, never longer than `persistence.receipt_retention_days`) that no later write superseded. Doctor warns when any of them is a gbrain-defect class (`owner_exception`, `database_refusal`, `writer_guard`, `outside_fence`, `gbrain_defect`): report those with the receipt ids. The rest are ordinary refusals the caller already received (`caller_conflict`, `caller_refusal`, `operator_cancelled`) or sync faults a rerun retries. A `schema_missing` row (#6904) is a write that met a missing table or column: when the schema is behind, its fix is `gbrain apply-migrations --yes` as the database role that owns the gbrain tables, then resubmit; at head, it asks the user and points at doctor's `schema_missing_tables` check and the `gbrain repair missing-tables` preview.
 - **Historical rows** do not block: a later write superseded them (`superseded`, `already_written`, `duplicate`), or they came from a build older than the release that fixed their cause (sync knock-on cancels before 0.60.216.0, the `Publication failed (P0001)` refusal before 0.60.40.0). Doctor counts them and never warns on them.
 
 A spike warns only on its own: when at least `persistence.terminal_failures.spike_min` (default 25) receipts ended in the last 24 h and that is more than `persistence.terminal_failures.spike_factor` (default 3) times the median of the 7 days before. When most of those receipts were written by a gbrain build older than the release that fixed their class, the warning says an older write owner is still producing them and names the build; its fix is the read-only `gbrain sources writer status --source <id> --json` that names the owner, so upgrade or restart that process. A `file_database_drift` row is the page-drift class: [file drift](repair.md#file-drift) resolves it with `gbrain repair file-drift`. A read that does not finish within its deadline (5 s per statement, 2 s to get a connection) reports `unknown`, never a clean pile; rerun it.
@@ -11273,6 +11237,7 @@ the exit code first, then reads the JSON document (`--json`) for the details:
 | 10 | the write was accepted and is still pending | write receipt | poll the receipt (`gbrain write-request -- <id>`); `--accept-pending` maps this to 0 |
 | 11 | partial, resumable budget stop | result with `remaining_*` and `resume_command` | run `resume_command` (it is safe to re-run) |
 | 13 | `pending_verify`: `gbrain bootstrap harness --token` wired a PGLite brain while no serve answered; nothing failed, nothing verified yet | the harness result with `status: "pending_verify"` and `fix` | tell the user to start `gbrain serve --http`, then run `fix.command` with the same token; `bootstrap harness --status` stays partial until it passes ([pending verify](bootstrap.md#pending-verify)) |
+| 14 | `bootstrap_cleanup_pending`: `gbrain bootstrap harness` (or `--status`) wired and verified the harness, but earlier shared-skills enrollments or carried token ids are not cleaned up yet | the harness result with `status: "cleanup_pending"`, a per-id `cleanup` list and `fix` | follow `fix.next`: `run` re-runs the same command; `tell_user_to_run` relays the owner's revoke or restore step, then re-run ([cleanup pending](bootstrap.md#cleanup-pending)) |
 | 69 | `gbrain serve` exited on its own after its persistence consumer reported `restart_required` for `GBRAIN_SERVE_RESTART_REQUIRED_EXIT_SECONDS` (`serve_unhealthy_exit`; opt-in) | `[gbrain serve] error code=serve_unhealthy_exit` line on stderr | nothing: the supervisor (the installed service restarts on failure) starts a fresh serve; if it repeats, follow [the unhealthy exit](../ENGINES.md#serve-unhealthy-exit) |
 | 75 | another runner holds the migration lock, or an engine graduation owns the brain (`graduation_in_progress`) | error envelope | wait for the other runner, then retry |
 | 124 | the command's own deadline elapsed | error envelope | inspect what is still running (the message names the status command) |
@@ -11328,7 +11293,9 @@ Reports two checks:
 - `jsonb_integrity` — counts double-encoded rows per table and points you
   at `gbrain repair-jsonb`.
 - `markdown_body_completeness` — heuristic for pages whose `compiled_truth`
-  is suspiciously short compared to `raw_data.data ->> 'content'`.
+  is suspiciously short compared to `raw_data.data ->> 'content'`. A page
+  stored in segments has no `compiled_truth` column to compare, so it is not
+  checked; the check reports how many with `skipped_segmented: N`.
 
 ## Repair
 

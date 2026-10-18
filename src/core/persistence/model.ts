@@ -8,7 +8,7 @@ export interface WriteAuthority {
   remote: boolean;
   /** Original page-visibility ceiling; current policy can only narrow it. */
   excludePrivate?: boolean;
-  databaseOnlyReason?: 'subagent_sandbox' | 'disabled_by_config' | 'no_repo_configured' | 'connector_database' | 'unbound_source';
+  databaseOnlyReason?: 'subagent_sandbox' | 'disabled_by_config' | 'no_repo_configured' | 'connector_database' | 'unbound_source' | 'overwrite_restore';
   autoLinkTrusted?: boolean;
   restrictedNamespace?: boolean;
   sourceId: string;
@@ -24,6 +24,13 @@ export interface WriteAuthority {
   /** Actual holders touched by a published take mutation; retained after intent compaction. */
   takeHoldersUsed?: string[];
 }
+/**
+ * One file's publication recovery. The prior bytes are embedded (`before`, base64), except for a prior file over the
+ * single-string ceiling (large-file.ts): `before` is null and the bytes are the staged copy `staging.before` (path,
+ * SHA-256 = `beforeHash`, length), which recovery renames back. Its `.tmp.before-<uuid>` name is not a stage name
+ * binaries that predate it accept, so they block on it (`unexpected_staging_bytes`) instead of reading `before: null`
+ * as an absent file.
+ */
 export interface FileRecoveryRecord {
   version: 1;
   path: string;

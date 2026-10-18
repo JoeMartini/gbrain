@@ -898,8 +898,15 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1243 column(s) verified against live schema",
+          "message": "1258 column(s) verified against live schema",
           "name": "schema_columns",
+          "status": "ok"
+        },
+        {
+          "category": "meta",
+          "elapsed_ms": "<volatile>",
+          "message": "All 149 table(s) the applied migrations create exist.",
+          "name": "schema_missing_tables",
           "status": "ok"
         },
         {
@@ -1359,6 +1366,18 @@
         {
           "category": "brain",
           "details": {
+            "checkouts": [],
+            "count": 0,
+            "docs": "docs/architecture/topologies.md#coordination-lock"
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "Every checkout's recorded coordination lock agrees with GBRAIN_COORDINATION_HOME, or the variable does not apply.",
+          "name": "coordination_lock_location",
+          "status": "ok"
+        },
+        {
+          "category": "brain",
+          "details": {
             "sources": [],
             "total": 0
           },
@@ -1395,6 +1414,54 @@
           "elapsed_ms": "<volatile>",
           "message": "Every writer that admitted or published a request in the last 7 days is v0.60.5.0 or newer.",
           "name": "writer_version",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "blockers": [],
+            "configured": "unset",
+            "docs": "docs/guides/memory-boundaries.md#segmented-page-storage",
+            "effective": "off",
+            "floor": "<segmented-writer-floor>",
+            "max_bytes": 25165824,
+            "truncated": false,
+            "window_days": 7
+          },
+          "elapsed_ms": "<volatile>",
+          "fix": {
+            "actor": "user",
+            "argv": [
+              "gbrain",
+              "config",
+              "set",
+              "pages.segmented_storage",
+              "on",
+              "--brain",
+              "host"
+            ],
+            "command": "gbrain config set pages.segmented_storage on --brain host",
+            "consent": [],
+            "docs": "https://github.com/garrytan/gbrain/blob/master/docs/guides/memory-boundaries.md#segmented-page-storage",
+            "next": "tell_user_to_run",
+            "requires_exclusive": false,
+            "verify": {
+              "argv": [
+                "gbrain",
+                "doctor",
+                "--only",
+                "segmented_storage",
+                "--json",
+                "--brain",
+                "host"
+              ]
+            },
+            "why": "Turns segmented storage on: pages over 1 MiB are stored in segments, up to the engine ceiling."
+          },
+          "message": "Segmented page storage is off by default in this release (pages.segmented_storage unset): pages over 1 MiB are stored inline up to 24 MiB; pages already stored in segments stay readable.",
+          "name": "segmented_storage",
+          "readiness_state": "disabled_by_choice",
+          "severity": "info",
           "status": "ok"
         },
         {
@@ -2104,12 +2171,14 @@
         {
           "category": "brain",
           "details": {
+            "conversation": null,
             "fix": "preview links: gbrain facts relink --dry-run",
             "inferred_7d": {
               "mention": 0,
               "page": 0
             },
             "new_7d": {
+              "conversation_unresolved": 0,
               "facts": 0,
               "no_subject": 0,
               "unlinked": 0
@@ -2121,6 +2190,7 @@
             "window": {
               "active": 0,
               "capped": false,
+              "conversation": 0,
               "fence_owned": 0,
               "unlinked": 0
             }
@@ -2802,6 +2872,20 @@
           "status": "ok"
         },
         {
+          "category": "brain",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/repair.md#overwritten-edits",
+            "sources": [],
+            "truncated": false,
+            "unknown": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "No page shows a database edit that a sync import overwrote.",
+          "name": "sync_overwritten_db_edits",
+          "status": "ok"
+        },
+        {
           "category": "meta",
           "details": {
             "rollback": [],
@@ -3153,7 +3237,7 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "Active pack gbrain-base-v2@1.3.0+a50a67b9 is current (no successor declared)",
+          "message": "Active pack gbrain-base-v2@1.4.0+1c5ba903 is current (no successor declared)",
           "name": "pack_upgrade_available",
           "status": "ok"
         },
