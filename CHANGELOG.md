@@ -10,6 +10,131 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.324.0] - 2026-10-20
+
+**Agents can now add to a page without rewriting it, and write pages larger than one request.** Before, adding a line to a long conversation log meant sending the whole page back with put_page, which got slower as the page grew, and a remote or thin client could not write a page bigger than its connection's request limit at all. Now `append_page` adds text to the end of a page in time proportional to the text added, upload sessions carry a page of any size up to the page ceiling in parts, and `edit_page` can edit a very large page by rewriting only the stretch it changes.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Adding to a conversation log | put_page of the whole page every time | `append_page` (or `gbrain append <slug>`): cost grows with the text added, idempotent by `request_id`; `expected_tail_sha256` refuses `tail_changed` when another writer appended first |
+| A remote or thin client writing a page over its request limit (1 MiB on legacy HTTP, 4 MiB on OAuth `/mcp` and stdio) | refused | an upload session: `begin_page_upload`, `upload_page_part`, `commit_page_upload` (`get_page_upload` resumes after a lost reply, `abort_page_upload` discards); `gbrain put --file` and `gbrain capture --file` use it on remote brains |
+| Editing a page stored in segments | the edit read the whole page back | only the segments the match touches are rewritten; `within` restricts a match to a range a window read returned |
+| A local `put --file` or `capture --file` over 24 MiB | read into memory whole | streamed in |
+
+### What to watch for after you upgrade
+
+- An upload session belongs to the connection, source and page that began it; any other caller gets `upload_not_found`. Staged bytes count against the `persistence.limits` upload quotas (`write_quota_exhausted`), and an idle session expires after an hour.
+- Appends, segmented edits and upload commits from agents go through the same write gate as put_page, so the same text gets the same content flag.
+- A remote replace upload over 24 MiB of a page that has a takes fence or timeline entries is refused with `upload_protected_content` (pass `drop_timeline` to replace a timeline deliberately).
+- `gbrain append` sends one direct call when the text fits the connection's request limit and an upload session above it; `--expect-tail`, `--region` and `--separator` apply only to the direct call and are refused above it.
+
+### Itemized changes
+
+- New operations: `append_page`, `begin_page_upload`, `upload_page_part`, `get_page_upload`, `commit_page_upload`, `abort_page_upload`; new error codes `tail_changed`, `part_too_large`, `part_splits_code_point`, `upload_protected_content`.
+- `edit_page` accepts `within`; a stale `within` refuses `revision_conflict`. On a segmented page an ambiguous match reports `match_count_at_least=2`.
+- New CLI command `gbrain append <slug> [--file f | stdin]`.
+- A `since: 'TBD'` BEHAVIOR_CHANGES row can no longer ship: `bun run check:behavior-since` (in `bun run verify`) refuses one on a stamped tree or master, `bun run release:restamp` stamps them, and the Release workflow refuses one before publishing.
+
+## [0.60.323.0] - 2026-10-20
+
+**A large Postgres brain stuck at schema 220 now upgrades: migration v221 stamps chunks without a vector in committed batches instead of one ten-minute transaction.** v221 (`chunk_embedding_pending_since`) updated every chunk missing a vector in one statement inside the runner's single migration transaction, which runs under a fixed 10-minute statement budget. On a brain with about 1.7 million such chunks that statement ran out of time on every attempt and rolled back, so the brain stayed at schema 220 and couldn't upgrade past v0.60.112.0. There was no supported way around it.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| v221 on a large brain | one UPDATE over every chunk without a vector; timed out on every attempt and rolled back | the column is added, then chunks are stamped 5,000 per committed batch before v221 runs; v221 then finds nothing left to write |
+| An upgrade interrupted during that backfill | everything rolled back | committed batches stay; `gbrain apply-migrations --yes` continues from the chunks still unstamped |
+| Other published backfills that grow with a table (v011 link sources, v028 chunk keyword vectors, v033 request-log agent names except rows with no token, v116 code-edge sources) | one statement each | batched the same way before their migration |
+| v161's partial pages index, which the migration caps at 30 seconds | could time out on a large `pages` table | built concurrently first (Postgres), under the migration statement budget |
+| A migration that still runs out of its statement budget | "terminate blockers, rerun" even when nothing was blocking, so the rerun failed the same way | apply-migrations (`migrations_pending`) and doctor `schema_version` name the migration, with the fix for the case: it timed out without batching and this release batches it (rerun), idle sessions were open (check them with `gbrain doctor --locks` and end the ones still open once you agree, then rerun), or none were open (once you agree, one run with `--statement-timeout`) |
+| Raising the migration statement budget | not possible | `gbrain apply-migrations --yes --statement-timeout <minutes>` (operator only, that run only; `0` removes it) |
+
+v221 still chooses the active embedding column the same way and still records `embedding_pending_since_backfilled_at` only when it stamped a chunk, so doctor's backlog age keeps labelling those ages as a created_at backfill. The schema end state is unchanged, and the published migration files are untouched. The migrations that can't be batched, and why, are in [migration statement timeout](docs/guides/troubleshooting.md#migration-statement-timeout).
+
+Reported by @BasedGPT (#7108), whose report included the EXPLAIN and dead-tuple numbers that ruled out bloat.
+
+## [0.60.322.0] - 2026-10-20
+
+**The full Ubicloud gate stops oversubscribing its VMs, and every gate now reports how loaded they were.** Each gate slot runs a bun process, its children and its own PostgreSQL and PgBouncer, about 2.5 runnable threads, so one slot per two vCPUs ran a 16-vCPU VM at a 1-minute load of 1.39 per vCPU at p90. Timing-sensitive files then ran up to twice their usual time, and `persistence-sync-options-parity` hit `run-e2e.sh`'s 180 s per-file cap.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| Slots per standard-16 gate VM | 8 (one per two vCPUs): load p50 1.11, p90 1.39 per vCPU, 45,565 s of test compute, the parity file killed on its PgBouncer pass | 6 (three per eight vCPUs): p50 0.79, p90 0.95, 35,393 s, passed; about the same wall time at eight VMs |
+| Seeing VM load | inferred from timing flakes and shard overruns | each item's log ends with the VM's load; the summary prints p50, p90 and max per vCPU and warns above 1.1 at p90 |
+
+## [0.60.321.0] - 2026-10-20
+
+**With Git durability on, a page edit or delete on a source whose root sits below its Git repository's top (a brain in `<repo>/brain`) is now committed and pushed.** Before, the Git effect read file lists from Git with two different bases: `git ls-files` printed paths relative to the source root, while `git status` and `git diff --cached` printed them relative to the repository top. An edit to an already-tracked page, and every page delete, therefore completed as `unchanged`, and nothing was committed or pushed. Writer status and doctor showed nothing pending. A source whose root is the repository top was not affected.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A page edit or delete on a durable source whose root is below the repository top | completed `unchanged`; nothing was committed or pushed | committed and pushed like any other change |
+| A URL-cloned source (`trackedChanges`, url-clone fence repair) whose root is below its clone's top | modified tracked files could be missed | every listing uses the source root's base (`--relative`) |
+| A durable checkout below the repository top that is ahead of its upstream | doctor `git_convergence` never matched it to its binding | warns `stranded`, as #7089 added for a root at the top |
+| Tracked files modified under a durable source root with no Git effect queued, running or parked | not reported | doctor `git_convergence` warns (`stranded`, listing them in `uncommitted_pages`); its fix asks you to commit them, then push |
+
+Edits that earlier releases left uncommitted on such a root stay in the working tree. The new doctor warning lists them so you can commit and push them. No schema migration.
+
+Reported by @mje-xyz (#7091), who also traced the mismatched path bases.
+
+## [0.60.320.0] - 2026-10-19
+
+**A managed `gbrain sync` of an ordinary (non-company) source now compares the files at HEAD with what the brain holds, instead of replaying commits, so a reset, a revert, a rewritten history or a lost run can no longer leave pages behind, and one bad file holds only itself.** Each pass reads the committed tree, the index and the database, admits only the files whose page differs, proves nothing moved underneath it, and records the checkpoint inside the last import's own transaction. An idle sync with nothing new returns in well under a second.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| History rewritten, reset or reverted, or a sync interrupted | replayed `last_commit..HEAD`; pages could be missed or resurrected | every file at HEAD is compared with its page and import record; what differs is admitted |
+| An idle sync with nothing new | about 3 s on a large Postgres brain (57 ms round trips) | about 0.75 s: no level read at all |
+| One odd file (unreadable, a NUL byte, a broken alias list, a page whose identity changed, a write that fails) | stopped the whole source | that file alone is held with its own code and fix; the rest syncs |
+| The checkpoint after an import | its own write request and transactions | carried by the round's last import publication (fewer statements and transactions per run) |
+| First sync after activating a classic brain with 100k pages on Postgres | did not finish | converges in one pass (about 45 s) |
+| A sync that would delete more than half of a source's pages | ran | refused until confirmed, as `repair ghost-pages` already does |
+
+### New for operators
+
+- `gbrain repair file-drift --held --side <side> [--state <state>]` resolves held file-drift pages one decision at a time.
+- `gbrain repair legacy-twins --source <id>` merges page pairs an older gbrain forked from one file (preview first, then `--apply --expect <hash>`).
+- `sync.admission` (`normal`, `imports_only`, `classify_only`) narrows what a managed sync admits; doctor warns while it is restricted.
+- `gbrain sync status --json` reports `convergence` for a managed source.
+
+No schema migration. Company-brain sources keep their existing sync path.
+
+## [0.60.319.0] - 2026-10-19
+
+**The native data-safety step's per-suite stall bound now fits each target, so Windows stops killing a backup suite that was passing.** v0.60.317.0 bounded every suite at 300 s, which was calibrated on darwin-x64; on Windows `backup-portability-native` legitimately runs 3.5 to 8 minutes, and one run was killed at 301 s with every test passing.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A native data-safety suite on win32-x64 or win32-arm64 | killed at 300 s even when healthy (p99 462 s and 303 s) | bounded at 540 s and 390 s |
+| The bound on every other target | one 300 s number | the slowest suite's measured p99 plus max(60 s, 15%), rounded to 30 s: 120-180 s on Linux and macOS |
+| A matrix target with no bound | n/a | the step fails before running any suite |
+| The stall message | said files take "under 60 s" | names the target's bound; the process table and macOS stack sample are unchanged |
+
+## [0.60.318.0] - 2026-10-20
+
+**On large Postgres brains, autovacuum can finish again, and a page delete's Git commit now reaches the remote.** gbrain refreshed `content_chunks` statistics after every embed drain and import. That ANALYZE waited for the table's lock, and Postgres cancels an autovacuum whenever another session waits on it for a second, so on a brain of about 10M chunks no autovacuum of the table ever finished: millions of dead rows stayed in every index, the vector index included. Separately, on a managed brain with Git durability on, a page delete whose first push failed left its removal commit local-only, while writer status and doctor reported nothing pending. Reported by @DaCal90 (#7083) and @MMichot (#7089).
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| An ANALYZE gbrain runs on Postgres (import, sync, reindex and embed refreshes, the search guard, `gbrain repair planner-stats --apply`, the ANALYZE after a migration builds an index) meets a running vacuum | waited up to 2 s, and Postgres cancelled the autovacuum after 1 s | takes the table's lock with `NOWAIT` and defers at once with a warning; the autovacuum keeps running (the repair reports the table `deferred`) |
+| An embed drain that embedded a few chunks of a large, already-sampled `content_chunks` | a 2 to 6 s ANALYZE after every drain | skipped below 50 + 10% of the table's chunks; autovacuum's own analyze covers what small drains add up to, and missing statistics still refresh |
+| A hot table of at least 100,000 rows whose autovacuum keeps being cancelled | noticed only from the server log | `gbrain doctor` `planner_stats_stale` warns when its dead rows pass the vacuum threshold and no vacuum has completed in 24 h |
+| A page delete on a managed brain whose first push failed | the retry found nothing to commit and completed without pushing; the branch stayed ahead | the retry pushes while the checkout is ahead of its upstream; a push that keeps failing stays queued and then parks, visible in writer status |
+| A managed checkout with Git durability on that is ahead of its upstream with no Git effect pending | doctor `git_convergence` warned only after 6 h | warns at once (`stranded`), with `gbrain git commit-push --push-only --keep-checkout --path <root>` as the fix |
+
 ## [0.60.317.0] - 2026-10-19
 
 **Two CI flakes are closed at their source, and a stuck native safety suite now leaves a log instead of a silent timeout.** `test-reads-source-smell` failed with `ENOENT` when `import-file.test.ts` removed its scratch directory from `test/` mid-walk; scratch now lives in the system temp directory and a lint rule keeps it there. The native data-safety suites no longer wait inside `Bun.spawnSync`, where Bun 1.4.0 to 1.4.2 can poison a process (oven-sh/bun#34069).
