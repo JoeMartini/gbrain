@@ -70,6 +70,8 @@ import { fenceFixesWire } from '../fence-repair/tier1.ts';
 import type { FenceFix } from '../fence-repair/types.ts';
 import { VERSION } from '../../version.ts';
 import { bindOrigin } from './origin-guard.ts';
+import { segmentedOutcome } from './searchable.ts';
+import { isQuarantined } from '../quarantine.ts';
 
 /** The options that select a managed sync cursor (its key), recorded so a refusal can print the exact retry. */
 export interface SyncCursorOptions { full: boolean; workingTree: boolean; srcSubpath: string | null; exclude: string[]; includeHidden: string[]; strategy: string | null }
@@ -651,6 +653,12 @@ export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: Wr
   return p?.kind === 'managed_sync_import' && p.stamp?.fold && at.root && !screening ? foldPassCheckpoint(prepared, { row, p, root: at.root }) : prepared;
 }
 
+/** #6722 and #7106: what a committed sync write left the page's embedding and search index in, for its receipt. */
+async function syncWriteState(tx: BrainEngine, row: WriteRequest, page: Parameters<typeof sizeStateField>[3],
+  segmented: Parameters<typeof segmentedOutcome>[0], frontmatter: Parameters<typeof isQuarantined>[0]): Promise<Record<string, unknown>> {
+  return { ...await sizeStateField(tx, row.source_id, row.slug, page), ...segmentedOutcome(segmented, isQuarantined(frontmatter)) };
+}
+
 async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock: ClaimPhaseClock | undefined,
   screening: { unsaved: true } | undefined, at: { root?: string }): Promise<SyncPreparedMutation> {
   const engine = boundedReads(unbounded, clock);
@@ -843,7 +851,7 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
   let prepared: PreparedContentImport | undefined;
   enterClaimStep(clock, 'import_content', undefined, 'db');
   // #6188: the import reuses this screen's fence verdict for the same bytes (one fence scan per file at prepare).
-  const importOptions = { ...source, noEmbed: true, remote: row.authority.remote, preserveGateMarkers: true, activePack, coordinated: true, fences: 'coordinated' as const, writeGate: await ownerGateInput(engine, row, parsedInput.frontmatter, p.sourcePath),
+  const importOptions = { ...source, noEmbed: true, remote: row.authority.remote, preserveGateMarkers: true, activePack, coordinated: true, fences: 'coordinated' as const, boundedChunkWrites: true as const, writeGate: await ownerGateInput(engine, row, parsedInput.frontmatter, p.sourcePath),
     ...(importContent === p.content && screen.status === 'importable' ? { fenceScreen: screen.fences ?? null } : {}),
     filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true,
     segmentedOwner: { kind: 'sync' as const, principalKind: row.principal_kind, principalId: row.principal_id, baseRevision: base?.revision ?? null } };
@@ -935,17 +943,16 @@ async function prepareSyncMutation(unbounded: BrainEngine, row: WriteRequest, _c
           if (applied.noop) return;
           if (installed?.segmented) { if (installed.segmented.complete && live) await sealSegmentedPage(tx, Number(live.page.id)); }
           else if (installed?.chunkerSeal !== undefined) await sealImportedPage(tx, row.slug, row.source_id, live, installed.chunkerSeal, installed.pageId);
-          else if (live) await sealPageTextProjection(tx, row.slug, row.source_id, live);
+          else if (live && !installed?.projectionPending) await sealPageTextProjection(tx, row.slug, row.source_id, live);
         },
         () => releaseHold(tx),
         async () => { if (final) await recordSyncImportProvenance(tx, { ...importProvenance, page_id: Number(final.page.id), revision: final.revision,
           ...syncDiskProvenance(writeback ? Buffer.from(canonicalFile) : syncDiskBytes(root, p.path!, p.content!, p.rawHash), p.target) }); },
       ]);
       preparedImport.postimage = final;
-      // #6722: a large or embed_skip page says what this write left its embedding in.
-      const sizeState = applied.noop ? {} : await sizeStateField(tx, row.source_id, row.slug, live?.page);
+      const writeState = applied.noop ? {} : await syncWriteState(tx, row, live?.page, installed?.segmented, applied.parsedPage?.frontmatter);
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
-        chunks: applied.result.chunks, noop: applied.noop && !moved, imported_file: true, ...(moved ? { renamed_from: moved.slug } : {}), ...sizeState,
+        chunks: applied.result.chunks, noop: applied.noop && !moved, imported_file: true, ...(moved ? { renamed_from: moved.slug } : {}), ...writeState,
         ...(recovery?.length ? { recovered_frontmatter: true } : {}), ...(commentValue ? { comment_value: true } : {}),
         ...(fenceFixes.length ? { fences_normalized: fenceFixesWire(fenceFixes) } : {}) };
     } };

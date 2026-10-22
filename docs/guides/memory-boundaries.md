@@ -56,7 +56,7 @@ prompt or response text).
 |---|---|
 | Trusted local `put_page` / capture | Extracts supported page references without an LLM when auto-linking is enabled. |
 | MCP `put_page` / capture / `edit_page`, including stdio | Saves body references as text; no inline graph extraction. The receipt reports `auto_links.skipped: remote`. |
-| Post-commit `links` effect of an MCP page write | Adds untyped `mentions` edges (`link_source: mcp-remote-mention`) for the body's markdown links, `[[wikilinks]]` and page-path mentions whose target already exists in the same source, is not deleted, is visible to the writer and is inside its slug grant. No typed, frontmatter, timeline or cross-source edges and no new pages. The receipt reports `auto_links.mention_links: queued`; `get_write_request` lists the effect with `added`/`removed` counts, plus `invalid_targets` (reason `invalid_slug`) for any target that is not a valid slug (`[[../x]]`, a backslash, an encoded separator): those are skipped and the page's other edges still land (#7008). `gbrain config set mcp.remote_auto_links off` (or `auto_link off`) disables it. |
+| Post-commit `links` effect of an MCP page write | Adds untyped `mentions` edges (`link_source: mcp-remote-mention`) for the body's markdown links, `[[wikilinks]]` and page-path mentions whose target already exists in the same source, is not deleted, is visible to the writer and is inside its slug grant. No typed, frontmatter, timeline or cross-source edges and no new pages. The receipt reports `auto_links.mention_links: queued`; `get_write_request` lists the effect with `added`/`removed` counts, plus `invalid_targets` (reason `invalid_slug`) for any target that is not a valid slug (`[[../x]]`, a backslash, an encoded separator): those are skipped and the page's other edges still land (#7008). A remote `append_page` to the page body queues the same effect over the appended text only: it adds edges for what that text mentions and never removes one (#7122). `gbrain config set mcp.remote_auto_links off` (or `auto_link off`) disables it. |
 | Stdio `gbrain serve` | Has bounded, best-effort startup and idle maintenance sweeps, unless disabled. This is eventual maintenance, not a guarantee that a remote write immediately has edges. |
 | `gbrain serve --http` | Does not self-sweep. The host must run maintenance explicitly. |
 
@@ -179,8 +179,12 @@ minute, no running gbrain process is building it (a brain with no resident
 writer, or a build that died): `gbrain projections drain`, the fix's fallback,
 builds it now, and doctor `text_projection_readiness` names how many such
 pages wait. A quarantined page says
-`searchable: false`. `gbrain import` waits for the build and reports
-`searchable` in its result the same way.
+`searchable: false`. A managed `gbrain import` or `gbrain sync` of such a
+page replies the same way, when the write commits: its result says
+`searchable: "pending"` and `projection: "pending"` with the `request_id` to read
+again, `searchable_retry_after_ms` and `searchable_fix`, and the build does not
+hold up the source's next write. A new page up to 4 MiB still imports
+searchable (`searchable: true`).
 
 Deleting and restoring a segmented page on a source backed by files works up
 to the page ceiling. A restore reserves room for its file twice (the staging
@@ -284,11 +288,18 @@ for up to two minutes, on the CPU, on keyless brains too, and prints a receipt;
 resumes where it stopped. It removes only gate-written markers whose reason is
 `oversized`, and the matching `content_flag: oversized`; a page above the
 operator's effective `bytes_block` keeps both and is re-chunked for keyword
-search with no vectors. The backfill never embeds.
+search with no vectors. The backfill never embeds. A page whose rewrite is
+refused (an invalid fence the canonical owner will not write, for example)
+keeps its marker and is listed under `failed`; the hold placed for it is put
+back, so it is not left waiting for an approval that cannot embed it. Until
+its content is repaired, the chunk safety net (`gbrain embed --stale`, the
+cycle's embed phase) gives it chunks for keyword search with no vectors, and
+doctor `oversized_pages` counts the marked pages with and without chunks.
 Backfilled pages over 1 MiB are held for consent; the post-upgrade notice,
 `gbrain embed --stale` (its `budget_limited` line) and doctor's
 `partial_embedding` check show how many are held and what embedding them
-would cost. Pages between 500 KB and 1 MiB cost a cent or two each and embed
+would cost; doctor also says how many holds have waited more than a day
+without a decision, and since when. Pages between 500 KB and 1 MiB cost a cent or two each and embed
 through the normal sweep under the existing caps.
 
 Nothing releases a hold automatically. `gbrain embed --held --dry-run` lists
