@@ -146,6 +146,13 @@ export interface TransactionOptions {
    * (`isPersistenceDeclaration`). Ignored by PGLite and inside a transaction.
    */
   pipelineFirst?: (statement: string) => boolean;
+  /**
+   * GBRA-156: Postgres on a pool that pipelines inside a transaction sends every statement this accepts, in order,
+   * behind BEGIN before BEGIN's answer; the first it refuses, and every later one, waits for the answer. If BEGIN fails
+   * the accepted statements run in autocommit, so pass only a test that accepts reads and transaction-local
+   * set_config (`isPipelinableSearchRead`). Ignored by PGLite and inside a transaction.
+   */
+  pipelineEarly?: (statement: string) => boolean;
 }
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -2218,8 +2225,8 @@ export interface BrainEngine {
    * self-commits, so an insert throw would permanently lose the page's
    * facts.) `slug` / `excludeSourcePrefixes` / `preserveExpiredLegacy`
    * mirror `deleteFactsForPage`; the deleted count is returned as
-   * `deleted`. Callers that omit it get the standalone insert
-   * (deleted: 0), unchanged.
+   * `deleted`. Callers that omit it get the standalone insert (deleted: 0), unchanged.
+   * `opts.deleteForPageFirst` is deprecated (GBRA-161 PR 2, test/generations-deprecated-fact-writers.test.ts).
    */
   insertFacts(
     rows: Array<NewFact & { row_num: number; source_markdown_slug: string; superseded_by_row?: number }>,
@@ -2265,8 +2272,8 @@ export interface BrainEngine {
    * this does NOT promise: it protects the record, not the forget itself —
    * if the fence still carries the same claim, fence canonicality
    * independently reinserts it as a fresh active row (legacy DB-only
-   * forgets are documented as non-durable; see extract-facts.ts). Omitted
-   * ⇒ legacy behavior.
+   * forgets are documented as non-durable; see extract-facts.ts). Omitted ⇒ legacy behavior.
+   * @deprecated GBRA-161 PR 2: retire through publishFenceGeneration / publishExtractedFacts (docs/architecture/generations.md).
    */
   deleteFactsForPage(
     slug: string,
@@ -2277,6 +2284,7 @@ export interface BrainEngine {
   /**
    * Mark a fact expired. Never DELETE. Returns true iff a row was updated.
    * Idempotent-as-false (already expired returns false without changing state).
+   * @deprecated GBRA-161 PR 2: retire through publishFenceGeneration / publishExtractedFacts (docs/architecture/generations.md).
    */
   expireFact(id: number, opts?: { supersededBy?: number; at?: Date }): Promise<boolean>;
 
