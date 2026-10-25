@@ -191,6 +191,10 @@
       },
       {
         "category": "ops",
+        "name": "cron_gbrain_home"
+      },
+      {
+        "category": "ops",
         "name": "graduation_interrupted"
       },
       {
@@ -916,6 +920,10 @@
       {
         "category": "ops",
         "name": "runtime_build_skew"
+      },
+      {
+        "category": "ops",
+        "name": "cli_socket_refusals"
       },
       {
         "category": "brain",

@@ -874,6 +874,7 @@
             "git_push_holds": [],
             "inspected": 0,
             "parked_effects": 0,
+            "parked_groups": [],
             "truncated": false
           },
           "elapsed_ms": "<volatile>",
@@ -2306,6 +2307,7 @@
                 "commits": 0,
                 "source_id": "default",
                 "unresolved_commits": 0,
+                "waiting_commits": null,
                 "window_hours": 24
               }
             ],
@@ -2920,6 +2922,17 @@
           "elapsed_ms": "<volatile>",
           "message": "No long-running gbrain process (serve, jobs supervisor, worker) is running on this host.",
           "name": "runtime_build_skew",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "docs": "docs/guides/cli-socket.md",
+            "refusals": 0
+          },
+          "elapsed_ms": "<volatile>",
+          "message": "The warm CLI socket refused no CLI call in the last 24 hours.",
+          "name": "cli_socket_refusals",
           "status": "ok"
         },
         {
