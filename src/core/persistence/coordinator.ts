@@ -42,7 +42,7 @@ import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePer
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { PENDING_IMPORT, SYNC_HELD } from './pending-import.ts';
+import { landedCommit, PENDING_IMPORT, SYNC_HELD } from './pending-import.ts';
 import { CANONICAL_FILE_MISSING, databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
 import { SYNC_CURSOR_REPLACED, SYNC_PASS_SUPERSEDED } from './sync-checkpoint-replaced.ts';
 import { fenceFailureDetail } from '../fence-repair/refusal.ts';
@@ -54,6 +54,7 @@ import { publicationBeliefOptions, withBeliefBatch } from '../belief/ledger.ts';
 import { markBeliefCommits } from '../belief/append.ts';
 import { classifyPgAccessError } from '../pg-access-classify.ts';
 import { commitThroughDoor, doorCommitLanded, doorMarker, replayAfterDoorCommit, sourceCanonicalGit, strictChanged } from './git-door.ts';
+import { assertNoPrivateCommit, declareStrictPublication } from './git-declared.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
@@ -585,6 +586,8 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       const door = recovery?.version === 1 ? recovery : null;
       // A write prepared strict rechecks its flag under the source lock; one prepared without it publishes as before (only conversion sets the flag).
       if (door?.door && !await sourceCanonicalGit(tx, row.source_id, true)) throw strictChanged(row.source_id);
+      // G7a (git-declared.ts): a strict publication never writes or commits a private page's bytes.
+      if (!skill) await assertNoPrivateCommit(tx, row, prepared, snapshot, binding);
       if (recovery) {
         const records = recoveryFiles(recovery);
         for (const record of records) if ((skill ? bundleFileHash(record) : fileHash(record.path)) !== record.beforeHash) {
@@ -616,6 +619,8 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       if (!skill) await classifyUnboundPage(tx, row);
       if (prepared.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
       const final = skill ? null : await publicationPostimage(tx, row, prepared);
+      // G7a: a strict file-less write must be declared; its class is stamped before the door commit, in this transaction.
+      if (!skill) await declareStrictPublication(tx, row, prepared, snapshot, final, binding);
       decoratePublicationOutcome(row, prepared, outcome, final, files.length, skill);
       await recordPublicationFenceTrend(tx, row, outcome);
       // G2: a strict source's file is committed before its row; its Git effect only pushes.
@@ -703,6 +708,7 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
       const [current] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [id]);
       if (!current.recovery) return current;
       const records = recoveryFiles(current.recovery);
+      let landed: string | null = null;
       if (current.recovery.version === 2) {
         const owner = await guardOwnership(tx, current, hostId);
         if (!owner) throw opError('owner_unavailable', 'Skill recovery requires its canonical owner.',
@@ -731,6 +737,7 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
           if (actual !== record.beforeHash && actual !== record.afterHash) throw unexpectedRecoveryBytes('Canonical recovery bytes changed during restoration.', current, 'changed while recovery was restoring it and');
           // G2: a strict publication whose commit landed keeps the committed file; Git holds it.
           if (current.recovery.version === 1 && await doorCommitLanded(record)) {
+            landed = await landedCommit(record.door!.root, record.door!.head, record.path);
             if (record.staging?.before) await withFilesystemPublication([record.root], async () => cleanupRecoveryStaging(record, { priorIntact: true }));
           } else if (record.staging?.before) {
             await withFilesystemPublication([record.root], async () => {
@@ -769,11 +776,13 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
       // Withdrawal is authoritative DB state and is never rolled back here.
       const failure: PublicationFailure | undefined = terminalError ?? (current.error_code ? {code:current.error_code,message:current.error_message ?? 'Publication failed before database completion.',
         ...(current.error_detail ? { detail: current.error_detail as unknown as PublicationFailureDetail } : {})} : undefined);
-      if (failure) return completeWrite(tx, current, failureState(failure.code), {}, failure);
+      // G7b: a door commit that landed before its row is named on the receipt, whatever the replay's outcome.
+      const kept = landed ? { persistence: { git_state: 'committed', git_commit: landed, landed_before_row: true } } : null;
+      if (failure) return completeWrite(tx, current, failureState(failure.code), kept ?? {}, failure);
       for (const key of ['brain', `worktree:${current.worktree_id}`]) await tx.executeRaw('UPDATE persistence_counters SET recovery_bytes=recovery_bytes-$2 WHERE key=$1', [key, Number(current.recovery_bytes)]);
       const [queued] = await tx.executeRaw<WriteRequest>(`UPDATE persistence_requests SET state='queued',execution_token=NULL,
-        claim_expires_at=NULL,recovery=NULL,recovery_bytes=0,publication_started=false,blocked_reason=NULL,updated_at=now()
-        WHERE id=$1::uuid RETURNING *`, [id]);
+        claim_expires_at=NULL,recovery=NULL,recovery_bytes=0,publication_started=false,blocked_reason=NULL,outcome=COALESCE($2::text::jsonb,outcome),updated_at=now()
+        WHERE id=$1::uuid RETURNING *`, [id, kept ? JSON.stringify(kept) : null]);
       return queued;
     });
     if (isTerminal(row) && row.blocked_reason !== 'unexpected_staging_bytes') {

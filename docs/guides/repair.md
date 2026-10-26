@@ -2061,7 +2061,8 @@ gbrain repair duplicate-facts --apply --expect <hash> --yes
 
 A group is the active facts of one source, visibility and speaker whose text
 normalizes to the same fingerprint (the rule `forget` uses: case, punctuation
-and runs of whitespace do not matter). The oldest row is kept; every other copy gets
+and runs of whitespace do not matter). The row in a page's Facts table is kept (the
+oldest one if several are), else the oldest row; every other copy gets
 `expired_at` and `superseded_by` pointing at it, so it leaves recall but is not
 deleted or withdrawn, and the claim can be saved again. Groups whose copies all
 sit on one entity are `same_entity`. Groups spread over several entities are
@@ -2885,8 +2886,8 @@ On a managed brain each file is one coordinated write (`managed_file_repair`):
 the exact approved bytes, the import, and the hold clear commit together, and
 the file is committed through the Git effect like any page write. On a legacy
 brain the apply backs each file up under `~/.gbrain/backups/frontmatter/`,
-writes it, imports it, clears its hold and prints the `git add`/`git commit`
-step. Per-file outcomes report `written`, `imported`, `hold_cleared` and
+writes it, imports it, clears its hold and prints the `gbrain git commit-push`
+step that commits and pushes only that file. Per-file outcomes report `written`, `imported`, `hold_cleared` and
 `committed`. Repair stays explicit-only: `gbrain repair --all` and
 `gbrain doctor --remediate` never run it.
 
@@ -3066,7 +3067,7 @@ to the file's before-hash and page revision, committed through the Git effect);
 a legacy (unmanaged) source by backing the file up under
 `~/.gbrain/backups/fences/<run>/`, writing it, importing it and recording an
 "uncommitted fence repair" notice that `gbrain sources status` and doctor show
-with the exact `git add`/`git commit` step until the path is committed; a
+with the exact `gbrain git commit-push` step until the path is committed; a
 stored page with no file by a revision-bound page write; a read-only mirror in
 the database only (the file is never written). Every write's receipt carries
 the actor `fence-repair`, the tier, the classes, rows and columns, the model,
