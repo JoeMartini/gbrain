@@ -5862,6 +5862,20 @@ does not own a function, v277 names it on stderr and leaves it; `gbrain doctor`
 (`function_search_path`) prints the `ALTER FUNCTION` to run as its owner
 (`test/e2e/function-search-path-postgres.test.ts`).
 
+**Writer-protocol fences.** The managed-writer guard, the persistence protocol floor, protocol
+activation and the Git-canonical source counter also run as the writing role and read their state
+under its RLS. Since migration v278 (#7636) they fail closed: a role that cannot see the
+`persistence_brain` row is refused with `writer_coordinator_required` (relationship
+`unreadable_state`) on every guarded write, managed brain or not, instead of being treated as
+unmanaged. On a managed brain the same refusal covers a hidden `git_canonical_brain` row or
+Git-canonical source row (for a writer without the git protocol) and a hidden page row behind a tag,
+timeline entry or take. Protocol activation (row-level security on `sources`, `persistence_requests`,
+`persistence_effects`, `persistence_worktrees` or `persistence_source_bindings`) and a change to
+which sources are Git-canonical (row-level security on `sources`) refuse any role it applies to,
+whatever its policies; only the table owner (without `FORCE ROW LEVEL SECURITY`) or a role that
+bypasses RLS passes them ([write refusals](guides/write-refusals.md#writer-coordinator-required);
+`test/writer-fence-fail-closed-7636.test.ts`).
+
 **In engine-sql.** A read in a migrated domain takes a `ScopedRead` when it
 runs through this helper and a `LegacyUnscopedRead` when it runs on the pool
 (`src/core/engine-sql/brands.ts`); the engine obtains the branded executor, so
@@ -7696,8 +7710,15 @@ vars — incident-time escape hatches, not everyday knobs.
    `--wait-drain <seconds>` (default 60; `sources.refresh_drain_wait_ms`,
    `GBRAIN_REFRESH_DRAIN_WAIT_MS`) and `--fetch-timeout-ms` (default 120000;
    `sources.refresh_fetch_timeout_ms`, `GBRAIN_REFRESH_FETCH_TIMEOUT_MS`).
-   A refresh interrupted by a crash is finished by the restarted owner or by
-   `gbrain sources refresh <source-id> --resume`. A cron that keeps a managed
+   A refresh whose process died (a crash, a replaced container) does not
+   wedge the checkout: the owner finishes what it can on its own, and the next
+   `gbrain sources refresh <source-id>` on the owner host finishes the rest
+   the way `gbrain sources refresh <source-id> --resume` does before its own
+   refresh. A refresh whose process is still running is never taken over, and
+   one whose HEAD cannot be verified waits for the user
+   ([`refresh_recovery_required`](write-refusals.md#refresh_recovery_required)).
+   `gbrain sources writer status <source-id>` shows who holds a refresh and
+   whether it is orphaned. A cron that keeps a managed
    brain current runs the refresh instead of `git pull`, through the same
    [wrapper](cron-schedule.md#calling-gbrain-unattended) as every other
    scheduled gbrain call (so it runs as the owner host). `refresh_diverged`
