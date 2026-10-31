@@ -262,7 +262,7 @@ test/managed-sync-pinned-reads.test.ts
 test/managed-sync-preparation-stalled-holds.test.ts
 test/managed-sync-row-parity.test.ts
 test/managed-sync-stale-group-head.test.ts
-test/mcp-unreadable-sources-notice.test.ts
+test/mcp-sources-not-readable.test.ts
 test/migration-0-53-host-move-7900.test.ts
 test/migration-persistence-foreground-committed-index.test.ts
 test/migration-persistence-request-id-index.test.ts
@@ -443,11 +443,17 @@ test/repair-frontmatter.test.ts
 test/repair-ghost-database-ahead-gbra133.test.ts
 test/repair-receipt-compaction.test.ts
 test/repair-rename-identity-6729.test.ts
+test/repair-secret-spans.test.ts
 test/retrieval-coverage-notices.test.ts
 test/schema-missing-tables.test.ts
 test/schema-replay-deadlock-6143.test.ts
 test/scripts/test-stress-postgres.test.ts
 test/search-read-keyword-bound.test.ts
+test/search-remote-page-cap.test.ts
+test/search-transcript-quote-budget.test.ts
+test/search-transcript-quote-coverage.test.ts
+test/search-transcript-quote.test.ts
+test/search-vector-scope-parity.test.ts
 test/search/page-rank-cut.test.ts
 test/search/rerank-gate-hybrid.test.ts
 test/search/rerank-gate-telemetry.test.ts
@@ -512,6 +518,7 @@ test/sync-slug-root-mode-6694.test.ts
 test/sync-staged-catchup.test.ts
 test/sync-status-failure-detail-6513.test.ts
 test/sync-status-truthful-7243.test.ts
+test/sync-storage-invalid-8007.test.ts
 test/sync-tree-reuse-gbra133.test.ts
 test/sync-unblock-repair-error-gbra130.test.ts
 test/sync-uncommitted-origin-7130.test.ts
