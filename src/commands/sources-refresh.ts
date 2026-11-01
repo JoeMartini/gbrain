@@ -66,7 +66,7 @@ function describe(result: WorktreeRefreshResult): string {
 export function printRefreshOutcome(outcome: { result: WorktreeRefreshResult } | { error: OperationError }, json: boolean): void {
   if ('result' in outcome) {
     console.log(json ? JSON.stringify(outcome.result) : describe(outcome.result));
-    if (['sync_blocked', 'syncing'].includes(outcome.result.status)) setCliExitVerdict(1);
+    if (['sync_blocked', 'sync_deferred', 'syncing'].includes(outcome.result.status)) setCliExitVerdict(1);
     return;
   }
   const error = outcome.error;
@@ -74,10 +74,10 @@ export function printRefreshOutcome(outcome: { result: WorktreeRefreshResult } |
   // #7685: a refusal that carries a structured fix (argv, actor, ask_user) emits it as the v1 `fix`; the prose stays in `suggestion`.
   const env = toAgentError(error, { transport: 'cli', command: 'sources refresh', render: cliRenderContext() });
   const refusal = { status: 'refused', code: error.code, cause: error.message, fix: error.fix && env.fix ? env.fix : error.suggestion ?? null, docs: error.docs ?? null,
-    ...(error.detail ? { detail: error.detail } : {}),
+    ...(error.detail ? { detail: error.detail } : {}), ...(error.why ? { why: error.why } : {}),
     error: env.error, message: env.message, suggestion: env.suggestion, docs_cmd: env.docs_cmd, class: env.class, retryable: env.retryable,
     contract_version: env.contract_version };
-  console.log(json ? JSON.stringify(refusal) : `Refresh refused (${error.code}): ${error.message}\nFix: ${error.suggestion ?? USAGE}${error.docs ? `\nDocs: ${error.docs}` : ''}`);
+  console.log(json ? JSON.stringify(refusal) : `Refresh refused (${error.code}): ${error.message}\nFix: ${error.suggestion ?? USAGE}${error.docs ? `\nDocs: ${error.docs}` : ''}${error.why ? `\nWhy: ${error.why}` : ''}`);
   setCliExitVerdict(1);
 }
 
