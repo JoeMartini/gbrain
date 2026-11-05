@@ -240,7 +240,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "explicit page read by slug/id; governed by page visibility, not output redaction (CEO-17 raw-read exception)"
     },
-    "description": "Read a page; `section`/`grep` reads one part. Pass at most one window selector: lines, bytes, around_chunk_id or cursor (context only with grep). Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.",
+    "description": "Read a page; `section`/`grep` reads one part. Window selector order: cursor, around_chunk_id, lines, bytes (context only with grep). Edit: include_content:true, `content` to put_page, or edit_page. >256 KB: outline+window, then `next`.",
     "params": {
       "slug": {
         "type": "string",
@@ -279,7 +279,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
           "from",
           "count"
         ],
-        "description": "Window: 1-based lines. One window selector only: not with bytes, around_chunk_id or cursor.",
+        "description": "Window: 1-based lines.",
         "properties": {
           "from": {
             "type": "number",
@@ -298,7 +298,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
           "offset",
           "length"
         ],
-        "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start). One window selector only: not with lines, around_chunk_id or cursor.",
+        "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).",
         "properties": {
           "offset": {
             "type": "number",
@@ -314,7 +314,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "around_chunk_id": {
         "type": "number",
         "minimum": 1,
-        "description": "Window around a search hit chunk_id. One window selector only: not with lines, bytes or cursor.",
+        "description": "Window around a search hit chunk_id.",
         "fullSurfaceOnly": true
       },
       "context_lines": {
@@ -324,7 +324,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "cursor": {
         "type": "string",
-        "description": "next_cursor: read on. One window selector only: not with lines, bytes or around_chunk_id.",
+        "description": "next_cursor: read on.",
         "fullSurfaceOnly": true
       },
       "max_bytes": {
@@ -848,6 +848,47 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "name": "fetch",
       "positional": [
         "id"
+      ]
+    },
+    "area": "pages"
+  },
+  {
+    "name": "find_pages",
+    "mutating": false,
+    "idempotent": true,
+    "outputRedaction": "retrieval",
+    "description": "Find pages by name or path (what ls/find would answer), sorted by slug. pattern: a glob ('people/*acme*') matched against slug or source path, a slug prefix ('companies/acme'), or a plain name ('acme', a case-insensitive substring of the title or the slug's last segment). Returns slug, source_id, type, title, source_path and updated_at per page, total matches in scope, and complete (false when limit cut the list).",
+    "params": {
+      "pattern": {
+        "type": "string",
+        "required": true,
+        "description": "Glob, slug prefix or name."
+      },
+      "type": {
+        "type": "string",
+        "description": "Page type, or several comma-separated."
+      },
+      "types": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Page types, e.g. ['person']."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Max rows (default 50; max 500, remote 100)."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "One source, or '__all__'."
+      }
+    },
+    "scope": "read",
+    "cliHints": {
+      "name": "find",
+      "positional": [
+        "pattern"
       ]
     },
     "area": "pages"
@@ -2485,8 +2526,21 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "no_stored_text",
-    "description": "Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant.",
-    "params": {},
+    "description": "Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant. Pass by (source, type or source,type), since or collapse_aliases for live page counts per group instead, with distinct-slug totals so cross-source twins are not double counted.",
+    "params": {
+      "by": {
+        "type": "string",
+        "description": "Group page counts: 'source', 'type' or 'source,type'."
+      },
+      "since": {
+        "type": "string",
+        "description": "Effective date on/after: YYYY-MM-DD or 7d/2w/1y."
+      },
+      "collapse_aliases": {
+        "type": "boolean",
+        "description": "Merge near-duplicate type names; lists each group's member types."
+      }
+    },
     "scope": "admin",
     "cliHints": {
       "name": "stats"
@@ -3681,6 +3735,50 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     },
     "scope": "admin",
     "localOnly": true,
+    "area": "files"
+  },
+  {
+    "name": "file_register",
+    "idempotent": true,
+    "outputRedaction": "no_stored_text",
+    "description": "Record the files row for an object the host already stored at the path file_upload would use (<page_slug>/<filename>, or unsorted/<first 8 hash chars>-<filename>), after reading it back and matching its size and SHA-256. Use when an embedded host writes bytes to storage itself. Runs only on an engine opened from settings; registering the same path again updates its row.",
+    "params": {
+      "storage_path": {
+        "type": "string",
+        "required": true,
+        "description": "Where the host stored the object; must be the file_upload layout for page_slug, filename and content_hash"
+      },
+      "filename": {
+        "type": "string",
+        "required": true
+      },
+      "content_hash": {
+        "type": "string",
+        "required": true,
+        "description": "SHA-256 of the bytes, 64 lowercase hex characters"
+      },
+      "size_bytes": {
+        "type": "integer",
+        "required": true
+      },
+      "page_slug": {
+        "type": "string",
+        "description": "Page the file belongs to"
+      },
+      "mime_type": {
+        "type": "string"
+      }
+    },
+    "mutating": true,
+    "scope": "admin",
+    "localOnly": true,
+    "cliOnly": {
+      "argv": [
+        "gbrain",
+        "files",
+        "verify"
+      ]
+    },
     "area": "files"
   },
   {
@@ -6818,7 +6916,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "outputRedaction": {
       "exempt": "skill catalog files are installed instructions read verbatim; redaction would corrupt approved revisions"
     },
-    "description": "Run SkillOpt against a single skill. Admin scope and remote skill allowlist required. shared_skill stages an exact catalog revision privately and requires explicit skill_editor and put_skill grants; only accepted body changes publish through the original revision CAS. Rate-limited per-skill via DB lock.",
+    "description": "Run SkillOpt against a single skill; its iterative loop (optimizer_mode \"reflect\") is deprecated. Admin scope and remote skill allowlist required. shared_skill stages an exact catalog revision privately and requires explicit skill_editor and put_skill grants; only accepted body changes publish through the original revision CAS. Rate-limited per-skill via DB lock.",
     "params": {
       "skill_name": {
         "type": "string",
@@ -6871,7 +6969,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
           "one-shot-rewrite",
           "reflect"
         ],
-        "description": "Default one-shot-rewrite: one gated rewrite. reflect opts into the iterative edit loop, which has not yet beaten one-shot on gbrain benchmarks."
+        "description": "Default one-shot-rewrite: one gated rewrite. reflect runs the iterative edit loop, which is deprecated (removed on or after 2026-12-03) and emits the skillopt_loop_deprecated notice."
       },
       "shared_skill": {
         "type": "boolean",
