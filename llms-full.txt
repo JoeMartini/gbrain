@@ -1296,9 +1296,9 @@ Ship via the `/ship` skill, not by hand. Pass its test lanes the exact commands 
 (CHANGELOG voice, version-locations sync, PR conventions, community-PR-wave) lives in
 [`./docs/RELEASING.md`](./docs/RELEASING.md); read it before shipping.
 
-**Always use PATCH without asking**, including the initial release choice;
-override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
-version stamps and the PR title, then report the number. This changes numbering
+**PRs carry no version** ([releases per batch](docs/RELEASING.md#releases-per-batch)):
+/ship writes a `changelog.d` fragment, and the release PR picks the next PATCH
+(never MINOR or MAJOR) and syncs every stamp. This changes numbering
 only: scope, merge, deployment, paid-work and validation approvals still apply.
 
 ## Privacy
@@ -1621,10 +1621,9 @@ checkpoint resume, or DB-contention-aware pace mode.
 
 ## Version locations (single source of truth: `VERSION` file)
 
-Every release updates the required version stamps in the table below.
-`bun run release:restamp` rewrites all of them, renumbers the branch's own
-schema migrations after master's and runs the auto-derived regenerations;
-run it when the PR is next to merge ([how](docs/RELEASING.md#release-restamp)).
+Every release updates the required version stamps in the table below. PRs do
+not: a PR carries a `changelog.d` fragment, and the release PR rewrites every
+row ([releases per batch](docs/RELEASING.md#releases-per-batch)).
 Update TODOS only when filing new work. `/ship`'s Step 12 idempotency check
 catches VERSION vs package.json drift; the canonical list lives here.
 
@@ -1686,9 +1685,9 @@ four numeric segments are required first. Historical 3-segment versions
   (e.g. "v0.21.0 Code Cathedral"); update only when the README's marketing
   copy is intentionally being refreshed, NOT on every micro/patch bump.
 
-**Always use PATCH without asking**, including the initial release choice;
-override `/ship`'s MINOR/MAJOR prompts. Auto-allocate past collisions, sync all
-version stamps and the PR title, then report the number. This changes numbering
+**PRs carry no version** ([releases per batch](docs/RELEASING.md#releases-per-batch)):
+/ship writes a `changelog.d` fragment, and the release PR picks the next PATCH
+(never MINOR or MAJOR) and syncs every stamp. This changes numbering
 only: scope, merge, deployment, paid-work and validation approvals still apply.
 CI rejects mismatched `VERSION`/`package.json` or versions not newer than master.
 
@@ -1789,8 +1788,8 @@ This applies to README, CHANGELOG, docs, PRs, commits, issues, and release pages
 
 ## PR title format — version FIRST (IRON RULE)
 
-PR titles and version-bump commit subjects start with the version, followed by
-the conventional-commit subject:
+A PR without a version is titled in plain words. Release PR titles and version-bump commit subjects start with the
+version, followed by the conventional-commit subject:
 
 ```
 vMAJOR.MINOR.PATCH.MICRO <type>(<scope>): <summary> (#issue or wave ref)
@@ -7855,7 +7854,12 @@ Save ONE fact with mandatory attribution.
   consent line. An omitted `visibility` saves `private` when the target page is
   private (by `visibility` or a privacy alias such as `access: private`) or the
   operator set `facts.default_visibility` to private; a save never lands wider
-  than the page it is written into.
+  than the page it is written into. In gbrain, a remote credential bound to
+  one member saves `private` on its own member page unless it passes
+  `share: true`, and its `visibility: "world"` is refused; the brain owner's
+  own credential saves as above (shared by default, `private` on its member
+  page when it asks or the page or default keeps facts private). The response
+  names the `page` and `visibility` the fact got.
 
 Response: `{ id, status, status_text, entity_slug, valid_until,
 protocol_version }` (+ `degraded_dedup: true` when no embedding provider —
@@ -7876,7 +7880,10 @@ and a claim forgotten without an entity is withdrawn for every entity. To link
 a fact saved without an entity, do not forget it; remember it with `entity`
 and `replaces` set to its id. In gbrain, a fact saved without an entity is a
 row of the `memory/unattributed` page's `## Facts` table, created on first
-use; linking it strikes that row in the same write.
+use; linking it strikes that row in the same write. A remote save onto a
+member's own page is refused only when that member could read what was
+forgotten (a fact on its own page, or for the brain owner a fact it reads);
+a claim it never read saves as its own fact, with the reply a new claim gets.
 
 #### remember withdrawn refusal detail (additive)
 
@@ -7961,6 +7968,38 @@ Optional response fields; clients must ignore any they do not know.
   caller is never told about an entity it cannot read: that case is `NO_ENTITY`.
 - `hint: string` — present with `warnings`; names the `entity` input.
 
+#### remember: where the fact landed (additive)
+
+Optional response fields; clients must ignore any they do not know.
+
+- `page: string`: the page whose `## Facts` table now holds the fact. It is
+  absent when the fact is on no page: an `entity` slug that has no page, or a
+  fact with no entity on a source that cannot hold `memory/unattributed`.
+  `remember` never creates an entity page.
+- `visibility`: `world` or `private`, as saved.
+- `persistence: { mode }`: `filesystem` when the write changed a page file,
+  `database` when it changed the database alone.
+- `write_through: { written, skipped? }`: `skipped` says why no file was
+  written. `entity_page_missing`: the source has a checkout, but the entity
+  has no page to take the fact. `no_repo_configured`: the source has no
+  checkout, so the database is its record. `disabled_by_config` and
+  `subagent_sandbox`: write-through is off for the brain or for this caller.
+  `held_for: string`: on a source whose pages are canonical in Git, the
+  entity a fact was saved for while it has no page; the fact is a row of
+  `memory/unattributed` (`page`) whose `entity` column names it, until
+  maintenance moves it into the entity's page.
+
+A fact saved for an entity with no page is stored and recalled like any
+other. Where the source's pages are in Git, the reply also carries one
+`entity_page_missing` notice per entity per session. While the fact is in the
+database only, the notice's step is `next: ask_user`: its `user_message` says
+the fact is saved in the database only and asks whether to create a page for
+the entity, and its fix is the `put_page` call to make once the user agrees.
+When the fact is held in Git (`write_through.held_for`), the notice only says
+where it is and that it moves once the page exists; it has no fix. Once the
+page exists, the next maintenance cycle can move the entity's facts into its
+Facts table and file. A brain with no Git repository gets no such notice.
+
 #### remember items: several facts in one call (additive)
 
 `items` (1 to 20) replaces `fact` for a batch, typically right before
@@ -7979,7 +8018,7 @@ writes nothing twice.
 
 Response: `{ protocol_version, request_id, client_request_id?, items[], saved, failed, partial,
 hints?, next? }`. Each `items[]` entry is a compact receipt `{ index,
-request_id, status, id?, entity_slug?, superseded_fact_id?, warnings?, valid_until?, state? }`
+request_id, status, id?, entity_slug?, page?, visibility?, persistence?, write_through?, superseded_fact_id?, warnings?, valid_until?, state? }`
 (`state` and `retry_after_ms` only when the write is not yet committed), or
 `{ index, request_id, status: "failed", error: { code, message, suggestion? } }`. Per-item hints
 appear once in `hints`. `partial: true`: some saved; resend
@@ -8295,6 +8334,11 @@ forgetting the unlinked fact is refused with `invalid_params`, message prefix
 says to keep them, or to forget them first to withdraw the claim everywhere.
 A forget never withdraws an active fact the caller cannot read; when one
 would be reached, the refusal keeps the `claim_linked:` prefix and names no fact.
+In gbrain, a credential bound to one member withdraws only facts on its own
+member page (another fact it reads is refused naming the brain host); the
+brain owner's own credential also withdraws a shared fact it reads, and any
+other fact it reads on a page that credential can write, such as a page whose
+`readable_by` names the owner.
 
 #### forget publishes like a page write (additive note)
 
@@ -9270,6 +9314,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | Doctor `links_extraction_lag` or sync says "N page(s) have un-extracted edges" | `gbrain extract --stale --dry-run --json`, then on the host `gbrain extract --stale --catch-up [--source-id <id>]` | user above 120 s, else agent | none | dry run: `actionable: 0` |
 | Doctor `links_extraction_lag` says "N page(s) failed link extraction 3 runs in a row and are held", or `extract --stale` lists failed pages | Read each page's code (`unknown_source`: the page's source row is gone; restore the source or delete the page), fix the cause, then `gbrain extract --stale [--source-id <id>] --retry-held` | agent | none | `gbrain extract --stale --dry-run --json`: `held: 0` |
 | `gbrain apply-migrations --yes` or `gbrain upgrade` stops with `Migration <N> … exhausted retries` / SQLSTATE 57014 and the schema stays behind (`migrations_pending`, reason `still_behind`) | upgrade first (#7108: long backfills run in committed batches), then follow the error's or doctor `schema_version`'s `fix` ([migration statement timeout](#migration-statement-timeout)) | agent; a longer `--statement-timeout` or ending a session only after the user agrees | none for a rerun | `gbrain doctor --only schema_version --json` |
+| `gbrain apply-migrations`, `gbrain upgrade` or `gbrain init` stops with `foreign_table` ("`<schema>.<table>.<column>` is `<type>`, but gbrain's `<table>` needs `<type>`"), or an older release stopped at v210 with `operator does not exist: timestamp with time zone > bigint` | a table another application created under one of gbrain's names (`oauth_tokens`, `oauth_clients`, `oauth_codes`) is in the same schema; nothing was changed. Ask the user, then move that table or give gbrain its own database ([foreign table](#foreign-table)) and run `gbrain apply-migrations --force-schema --yes` | user (the other application's table); agent for the rerun | none for the rerun | `gbrain doctor --only schema_version --json` |
 | A gbrain call failed with a code you don't recognize | follow `fix.next` ([protocol](../protocol/AGENT_OPERATOR_v1.md)); `gbrain errors <code>` | agent | as the fix's `consent` | the fix's `verify` |
 | A graph read omits a relationship you know existed, or says someone still works somewhere they left | the default read returns relationships true today: repeat with `status: "all"` or `as_of`; to record an end, add a dated timeline line (`Ended works_at [[companies/x]]`) or `add_link ... valid_until` ([temporal edges](temporal-edges.md)) | agent | none | `gbrain doctor --only edge_validity --json` |
 | A command exited 3 (`confirmation_required`) | relay `user_message`; run `fix.command` only after the user agrees | agent, after the user agrees | the payload's `effects` | the fix's `verify` |
@@ -9656,7 +9701,7 @@ records completion and leaves every page as it was.
 
 <a id="ghost-pages"></a>**A write refuses `source_changed` with "The canonical file was removed outside coordinated publication." (`canonical_file_missing`), or doctor `ghost_pages` warns?** The page is a ghost: its canonical file is gone on the owner host but the database page is live, so every write refuses and no sync can import a file that is not there. On the owner host, list them with `gbrain pages ghosts --source <id>` (read-only). For each, the user decides: to keep the page, restore its file at the recorded path (from Git or a backup; gbrain has no automated file restore) and run `gbrain sync --source <id>`; to remove it, preview `gbrain repair ghost-pages --source <id>`, show the user the list, and after they agree run the printed `--apply --expect <hash> --yes`. Removed pages are purged after 72 h; `gbrain restore <slug> --force` undoes one until then. Off the owner host it refuses `not_owner_host`; on an unreadable checkout `ghost_storage_unknown`; when ghosts are more than half of the source's file-backed pages `ghost_mass_delete_refused` (check the checkout first). See [ghost pages](repair.md#ghost-pages). **Say to your agent:** *"Which pages lost their files? Show me the list before you remove anything."*
 
-<a id="maintenance-write-drift"></a>**Writes to the same pages keep refusing `source_changed` with `file_database_drift`, or doctor `maintenance_write_drift` warns?** Each of those pages has a canonical file that differs from its database copy, usually from an edit outside a coordinated write, so every coordinated write to it refuses and leaves a conflict receipt. Maintenance now checks the file first: `synthesize_concepts` skips a drifted concept before any model call (the phase warns and names the commands below) and other maintenance writes refuse before admission, so the pile stops growing. To list the pages, run `gbrain sources reconcile <id> --brain host --audit --conflicts` (read-only; receipts per slug, whether the file still differs, its drift class and producer; MCP `list_write_conflicts` gives remote readers the database-derived part). Then preview `gbrain repair file-drift --source <id> --all-drifted --prefer file` (add `--class <name>` when the preview reports mixed classes, narrow it with `--only '<path glob>'` / `--skip '<path glob>'` over the canonical file paths, or pick pages with `--slug`), show the user the per-page `exceptions`, and after they agree run the printed `--apply --expect <hash>` command exactly as printed. For derived pages under one directory, such as regenerated concepts: (6) preview `gbrain repair file-drift --source default --all-drifted --only 'concepts/**' --prefer database`, show the user the count and the exceptions, and after they agree run the apply command it prints, which applies exactly the previewed pages. To keep resolving such a directory with the database copy from now on, the user can declare it under `storage:` `keep_db:` in the source's gbrain.yml; the owner host's serve, jobs or autopilot consumer then reconciles drifted pages there at most 10 every 10 minutes, and doctor echoes the policy with its matched count and receipt cost ([keep_db](repair.md#file-drift-keep-db)). `--keep` is refused here: use `--prefer database` or `--prefer file`. See [file drift](repair.md#file-drift). **Say to your agent:** *"Which pages keep refusing source_changed? Preview resolving them and show me before you apply."*
+<a id="maintenance-write-drift"></a>**Writes to the same pages keep refusing `source_changed` with `file_database_drift`, or doctor `maintenance_write_drift` warns?** Each of those pages has a canonical file that differs from its database copy, usually from an edit outside a coordinated write, so every coordinated write to it refuses and leaves a conflict receipt. Maintenance now checks the file first: `synthesize_concepts` skips a drifted concept before any model call (the phase warns and names the commands below) and other maintenance writes refuse before admission, so the pile stops growing. To list the pages, run `gbrain sources reconcile <id> --brain host --audit --conflicts` (read-only; receipts per slug, whether the file still differs, its drift class and producer; MCP `list_write_conflicts` gives remote readers the database-derived part). Then preview `gbrain repair file-drift --source <id> --all-drifted --prefer file` (add `--class <name>` when the preview reports mixed classes, narrow it with `--only '<path glob>'` / `--skip '<path glob>'` over the canonical file paths, or pick pages with `--slug`), show the user the per-page `exceptions` (and, for `--prefer database`, any `kept_newer_file` page: a file edit sync never imported, which bulk keeps), and after they agree run the printed `--apply --expect <hash> --yes` command exactly as printed; without `--yes` it exits 3 with the consent message ([newer file changes](repair.md#file-drift-newer)). For derived pages under one directory, such as regenerated concepts: (6) preview `gbrain repair file-drift --source default --all-drifted --only 'concepts/**' --prefer database`, show the user the count, the exceptions and any `kept_newer_file` page, and after they agree run the apply command it prints (it ends in `--yes`), which applies exactly the previewed pages. To keep resolving such a directory with the database copy from now on, the user can declare it under `storage:` `keep_db:` in the source's gbrain.yml; the owner host's serve, jobs or autopilot consumer then reconciles drifted pages there at most 10 every 10 minutes, and doctor echoes the policy with its matched count and receipt cost ([keep_db](repair.md#file-drift-keep-db)). `--keep` is refused here: use `--prefer database` or `--prefer file`. See [file drift](repair.md#file-drift). **Say to your agent:** *"Which pages keep refusing source_changed? Preview resolving them and show me before you apply."*
 
 <a id="embedding-plane-disagreement"></a>**Doctor warns `embedding_plane_disagreement`, or a brain that had semantic search went keyword-only after a re-setup?** The config file says `embedding_disabled: true`, but the database does not disable embeddings and already holds vectors. A re-init from a new `GBRAIN_HOME` or a restarted container with no provider key in reach used to write that flag. Init now keeps the database's model and width when it holds vectors and prints the key to set; a fresh keyless install, a keyless brain with no vectors and an explicit `--no-embedding` still write the flag. The check prints the model and width the vectors use and the enable command for exactly that model (`gbrain init --force --embedding-model <model> --embedding-dimensions <N>`, with `--path` on PGLite; effects `credentials` and `paid`). Set the provider key, run it after the user agrees, then `gbrain embed --stale` embeds pages written meanwhile. Pages and vectors are kept. When the stored model is unrecorded, the check points at `gbrain migrate embeddings --status` first. Verify with `gbrain doctor --only embedding_plane_disagreement --json`.
 
@@ -9891,6 +9936,43 @@ and doctor then name it and give the fix for the case:
 the budget for migration SQL and for the batches above. It doesn't lift the
 30-second caps that v160, v200 and v234 set on themselves, or the timeouts of
 migration handlers.
+
+## A table gbrain did not create is in the way
+
+<a id="foreign-table"></a>
+
+gbrain creates its tables with `CREATE TABLE IF NOT EXISTS` in the brain's schema
+(usually `public`). When another application shares the database and already has a
+table with one of gbrain's generic names (`oauth_tokens`, `oauth_clients`,
+`oauth_codes`), older releases adopted it, added their own columns to it and then
+stopped partway through an upgrade on the first statement that compared the wrong
+type, for example v210 with `operator does not exist: timestamp with time zone > bigint`
+(#9190). Schema setup now checks those tables before the schema replay and before any
+migration, and stops with `foreign_table`, naming the table, the column, the type it
+found and the type gbrain needs. Nothing was changed.
+
+The table holds the other application's data, so ask the user before touching it:
+
+1. Give gbrain a database of its own, or move the other table to a schema of its own.
+   Moving takes its indexes and constraints along:
+   ```sql
+   CREATE SCHEMA other_app_example;
+   ALTER TABLE public.oauth_tokens SET SCHEMA other_app_example;
+   ```
+   Then point that application at the new schema (for example
+   `ALTER ROLE other_app_role SET search_path = other_app_example, public`).
+2. Run `gbrain apply-migrations --force-schema --yes`. It replays the schema, which
+   creates gbrain's own table, and then applies the pending migrations. Since #9191
+   this works on a rerun too: the rerun used to skip the replay, so a table the replay
+   creates stayed missing (`relation "oauth_tokens" does not exist`).
+   `gbrain init --migrate-only --non-interactive` does the same.
+3. Verify with `gbrain doctor --only schema_version --json`.
+
+A brain an older release stopped at v210 recovers with the same steps after
+`gbrain upgrade`. That release had already added gbrain's columns (`token_type`,
+`scopes`, `resource`) to the other table and may have turned on row-level security
+for it. Tell the user, so the other application's owner can check: a role that does
+not own the table sees no rows while row-level security is on and no policy admits it.
 
 ## Global maintenance timeouts
 

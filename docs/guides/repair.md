@@ -80,6 +80,9 @@ gbrain repair visibility --class facts        # one class: facts, events, aliase
 gbrain repair visibility --class facts --apply --expect <hash>   # exactly that window
 gbrain repair visibility --slug notes/a-example                  # make named pages private (repeatable)
 gbrain repair visibility --slug notes/a-example --apply --expect <hash>
+gbrain repair visibility --slug notes/a-example --readers alice-example,group:team-a   # set who reads it
+gbrain repair visibility --slugs-file pages.txt --readers alice-example --apply --expect <hash>
+gbrain repair visibility --slug notes/a-example --readers none   # remove readable_by
 ```
 
 Every visibility write is label-only: the page keeps its trust tier, files no
@@ -95,6 +98,36 @@ written (run `gbrain sync` first). A file the repair cannot write
 (`sync.write_through` is off, a clone gbrain pulls, a write error) is held
 `file_backed` with nothing written, because the next sync would put the old
 label back from the file; make that edit in the file by hand.
+
+`--readers <list>` sets the named pages' `readable_by` (members by id, groups as
+`group:<id>`, `none` removes it) through the same label-only write: the page
+keeps its trust tier and provenance, files no `lower_page` proposal, and its
+file changes only on the `readable_by` line (written `readable_by: [a, b]`).
+Name the pages with `--slug` (repeatable) or `--slugs-file <file>` (one slug per
+line; blank lines and `#` comments are skipped; up to 10,000 pages, all in one
+preview). An unknown or disabled member, or an unknown group, refuses
+`access_member_invalid` with nothing written. A list that leaves out the brain
+owner (`gbrain access owner`) refuses too, because `readable_by` binds the owner
+and its own keys would stop reading the page; a group the owner belongs to does
+not count. Pass `--allow-without-owner` when that is what you want. A page whose
+readers changed after the preview is skipped.
+
+No lock or transaction spans the run, so a long list does not hold up other
+writers. On a managed brain the apply admits a source's pages together, one
+admission window at a time; on Postgres the owner publishes them in groups of
+up to 8 pages (PGLite publishes one at a time). The Git effect then commits the
+files that are ready together, up to 100 per commit, and waits briefly while
+more of the run's writes are still publishing, so a long list lands in a few
+large commits rather than one per page. Each page still succeeds or fails on
+its own. `--json` reports
+`details.git`, the run's files by effect state (`committed`, `pending`,
+`failed`, and `skipped` for a `storage.db_only` page, which has no file). A
+managed page with no file, outside any declared `storage.db_only` path, is held
+`canonical_file_missing` with nothing written, because the write would put the
+database ahead of Git: declare its folder under `storage.db_only` in `gbrain.yml`
+and preview again, or restore the file (`gbrain repair ghost-pages` lists pages
+whose file is gone). On a repo-less brain the database is the record, and every
+page is written there.
 
 A fenced fact row the apply could not make private is counted in the outcomes
 (`--json`: `outcomes`, each row in `outcome_items`), and the text output says
@@ -839,7 +872,7 @@ file holds the restored edit:
 
 ```bash
 gbrain repair file-drift --source <id> --slug <slug> --prefer database                          # preview
-gbrain repair file-drift --source <id> --slug <slug> --prefer database --apply --expect <preview-hash>
+gbrain repair file-drift --source <id> --slug <slug> --prefer database --apply --expect <preview-hash> --yes   # after the user agrees
 ```
 
 A restored page is not listed again.
@@ -2751,6 +2784,49 @@ gained a page, lost its target or whose facts changed since the preview reports
 the target is merged rather than copied. It writes the database only; no page is
 rewritten.
 
+<a id="facts-home"></a>
+### Facts of a strict source with no Git home
+
+On a source whose pages are canonical in Git (`canonical: git`), every fact
+should be a row in some page's Facts table, so that a database rebuilt from Git
+keeps it. Facts saved before the source became strict, or by an older gbrain,
+can still live in the database only: a fact for an entity that has no page, or a
+fact with no entity. The doctor check `strict_facts_outside_git` counts them.
+`gbrain repair facts-home` gives them a home in Git. It is explicit-only and
+preview-bound, and it never runs on upgrade.
+
+**Say to your agent:** *"Doctor says some facts of my strict source are not in
+Git. Preview giving them a home, then apply after I agree."* The agent runs
+`gbrain repair facts-home --source <id>` and, after you agree, the printed
+apply command.
+
+```bash
+gbrain repair facts-home --source <id>                          # preview: one line per fact, by group
+gbrain repair facts-home --source <id> --apply --expect <hash>  # writes at most 500 facts per run
+```
+
+The preview puts each fact in one group:
+
+| Group | What the apply does |
+|---|---|
+| `entity_page_missing` | Writes the fact to `memory/unattributed` as a held row that names its entity, in one commit. Once the entity has a page, the next maintenance cycle moves it there. |
+| `no_entity` | Writes the fact to `memory/unattributed`. |
+| `entity_page_exists` | Nothing: the entity has a page, and the next maintenance cycle (`gbrain dream`) moves the fact into it. |
+| `cannot_render` | Nothing: the Facts table cannot show the fact as it stands (the class says why). It stays in the database, active and searchable. |
+| `folder_restricted` | Nothing: the entity is under a folder access rule, so the fact is never named on the world-readable holding page. It stays in the database only. |
+| `entity_page_deleted` | Nothing: the entity's page is deleted (it may have been private, and purging it would not reach a row on the holding page). Restore the page or purge it; the fact stays in the database only. |
+| `held_fact_unmovable` | Nothing: a held row whose page cannot take it, with the reason. `entity_ambiguous` names the pages a bare name could mean; save the fact again with the page slug and forget the held one. |
+| `held_over_30_days` | Nothing: a held row whose entity still has no page after 30 days, with the nearest existing page gbrain finds. |
+| `fenced_page_missing` | Nothing: a row of a page that was deleted. Restore the page or purge it. |
+| `ontology_observation` | Nothing: an ontology observation belongs to its entity's ontology and has no Facts row. |
+
+The apply writes exactly the facts the preview listed. A hash that no longer
+matches refuses with `preview_changed` and prints the preview to run again; a
+fact that changed since the preview is kept and reported. Facts keep their ids,
+provenance and embeddings. On a source that is not strict the preview lists
+nothing and says why, because its database keeps such facts by design.
+`gbrain sources git-gap <id>` shows how far it is from its commit.
+
 <a id="consolidate-ties"></a>
 ### Facts consolidation closed at their own effective time
 
@@ -3231,6 +3307,61 @@ and `gbrain agent logs --since`.
 equivalent: `--prefer database` keeps the database copy, `--prefer file`
 keeps the file.
 
+<a id="file-drift-newer"></a>**A database-wins repair never silently discards a newer file change** (GST-2579).
+Before this release, `--prefer database` (by `--held`, `--all-drifted` or
+`--slug`) and a `gbrain sources reconcile` apply that took the database copy
+wrote the page over its file even when the file held another writer's commit
+that sync had not imported yet, and the preview said "exactly the preferred
+side". Now a database-wins write goes ahead only when the database itself held
+the version the file's bytes record: the bytes the page's last import read or left
+on disk (sync's import record, including a blob a sync adopted into it), or bytes a Git effect of one of the page's own
+writes put in the file for a revision the page has held (its live revision or one
+in its version history). So a database edit made after the file's last commit
+still wins, shorter or not. Anything else is a change the database never held,
+whoever committed it: another writer's commit, an uncommitted edit, gbrain's own
+writer commit of a revision whose database row never landed, or a page with no
+import record and no write of its own.
+
+| Selection | A newer file edit | A commit that deleted the file (`file_gone`) |
+|---|---|---|
+| `--held`, `--all-drifted`, `--request` | listed `kept_newer_file`, nothing written, the hold stays | listed `kept_newer_delete`, nothing written, the hold stays |
+| `--slug <slug>` | approved; the listing, `details.pages[].discards`, the warnings and the consent name the commit (sha, author, date), or say the edit is uncommitted | approved; the same places name the deleting commit |
+
+Every `gbrain repair file-drift` apply now needs the user's consent: run the
+printed apply without `--yes` and it exits 3 with the consent message, which
+lists each newer change the database copy overwrites and each file a
+`tombstone_edited` or `purged_differs` `--prefer database` apply removes; add
+`--yes` only after the user agrees. `gbrain sources reconcile` (and MCP
+`writer_reconcile_preview` / `writer_reconcile_apply`) refuses
+`source_changed` (detail `unimported_file_edit`) when a decision takes the
+database copy over what such a file says (`take_database`, `delete` or
+`set_value`); decide `take_file` for those paths, or preview the page alone with
+`--slug` as above. A `never_committed` `file_gone` page resolved
+`--prefer database` writes no file, so it is unaffected. The keep_db policy is
+unchanged.
+
+<a id="file-drift-past-losses"></a>**Finding earlier overwrites (read-only).** Every reconcile apply, a
+file-drift page included, first keeps a private backup of both sides at
+`~/.gbrain/reconciliation-previews/<request_id>.<digest>.json`
+(`$GBRAIN_HOME/.gbrain/…` when `GBRAIN_HOME` is set), mode 0600, with
+`retention: pre_admission_or_terminal`. Nothing prunes it: it stays until
+`gbrain sources reconcile <source> <slug> --remove-backup <ref>` removes it once
+its request has finished (`--backups` lists a page's). `preview.preimages.file_base64`
+holds the file bytes the apply replaced. To list database-wins applies and check
+whether the replaced bytes came from a commit gbrain never imported:
+
+```bash
+dir="${GBRAIN_HOME:-$HOME}/.gbrain/reconciliation-previews"
+jq -r 'select(any(.preview.decisions[]; .action != "take_file"))
+  | [.request_id, .preview.preconditions.source_id, .preview.preconditions.slug, .preview.preconditions.relative_path, .preview.preconditions.assessment_at] | @tsv' "$dir"/*.json
+# For one listed backup: the blob of the bytes it replaced, and the commit that introduced that blob.
+jq -r .preview.preimages.file_base64 "$dir/<backup>.json" | base64 -d | git -C <checkout> hash-object --no-filters --stdin
+git -C <checkout> log --all --find-object=<blob> --format='%H %an %aI %s'
+```
+
+A commit there that gbrain did not write is an edit the repair overwrote;
+`git -C <checkout> show <commit>:<path>` (or the decoded backup) recovers it.
+
 <a id="deleted-canonical-files"></a>**A page whose canonical file is gone** (#6712). A page selected with
 `--slug` or `--request` whose recorded canonical file is missing is resolved
 by where the deletion stands in Git:
@@ -3324,7 +3455,7 @@ preview command with `--cursor <next_cursor>` (JSON: `details.window`):
 
 ```bash
 gbrain repair file-drift --source <id> --held --side deleted --state file_gone --prefer database             # window 1
-gbrain repair file-drift --source <id> --held --side deleted --state file_gone --prefer database --apply --expect <hash>
+gbrain repair file-drift --source <id> --held --side deleted --state file_gone --prefer database --apply --expect <hash> --yes   # after the user agrees
 gbrain repair file-drift --source <id> --held --side deleted --state file_gone --cursor <next_cursor> --prefer database  # window 2
 ```
 

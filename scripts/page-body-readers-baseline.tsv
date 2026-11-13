@@ -268,7 +268,7 @@ src/core/facts/subject-infer-write.ts	linkAllowed	field	STREAM
 src/core/facts/unfenced-facts.ts	auditUnadoptableFacts	call:serializePageToMarkdown	SEGW	
 src/core/facts/unfenced-facts.ts	fenceDatabaseOnlyPage	call:serializePageToMarkdown	SEGW	
 src/core/facts/unfenced-facts.ts	planFence	field	NONE	reads compiled_truth from the object withHeldFactsFence returns for the body string its caller passed; no stored page body is read here
-src/core/facts/unfenced-facts.ts	planManagedPage	call:serializePageToMarkdown	SEGW	
+src/core/facts/unfenced-facts.ts	planPageFence	call:serializePageToMarkdown	SEGW	
 src/core/facts/unfenced-facts.ts	withHeldFactsFence	field	NONE	the body object its caller passes (file text or an inline snapshot); no stored page body is read here
 src/core/facts/withdrawal-discovery.ts	discoverWithdrawalTargets	field	STREAM	inline rows only
 src/core/facts/withdrawal-discovery.ts	discoverWithdrawalTargets	sql	STREAM	page scan reads inline bodies (NULL never matches); segmented pages are found by the chunk scan and their mirror writers refuse or skip (per-segment discovery, PR 2)
@@ -497,6 +497,7 @@ src/core/persistence/page-prepare.ts	fileMatchesSnapshot	field	SEGW	lane 1d file
 src/core/persistence/page-prepare.ts	frontmatterDriftWrite	field	SEGW	#8109: called only for an inline page (bodyUnread excluded at the call site); compares the file's parsed body with the snapshot body
 src/core/persistence/page-prepare.ts	prepareInlineOrSegmentedMutation	call:serializePageToMarkdown	SEGW	lane 1d file
 src/core/persistence/page-prepare.ts	prepareInlineOrSegmentedMutation	field	SEGW	lane 1d file: preserveProtectedTakes reads the snapshot body; segmented page: getter throws page_body_segmented
+src/core/persistence/page-prepare.ts	remoteCoreMarkingKept	call:serializePageToMarkdown	SEGW	lane 1d file: the remote core-marking carry moved out of prepareInlineOrSegmentedMutation (GST-2518, function size); same read as before
 src/core/persistence/page-prepare.ts	segmentedFileMatches	field	NONE	the body fields hold region digests (body-digests.ts) for the canonical comparison; no page body is read
 src/core/persistence/page-prepare.ts	unreadPageFile	call:serializePageToMarkdown	NONE	serializes the frontmatter head with an empty body; the body streams from the segments through segmentedExportMarkdown
 src/core/persistence/page-purge.ts	purgePageInTransaction	field	STREAM	
@@ -582,6 +583,7 @@ src/core/repair/overwritten-edits.ts	versionMarkdown	call:serializePageToMarkdow
 src/core/repair/overwritten-edits.ts	versionMarkdown	field	SEGW	inline versions only: overwriteContent returns null for a segmented version, which answers version_changed
 src/core/repair/overwritten-edits.ts	versionMarkdown	sql	SEGW	selects body_storage; a segmented version answers version_changed
 src/core/repair/private-labels.ts	prepareWrite	call:serializePageToMarkdown	SEGW	a segmented page returns segmented_page before the read and keeps its label
+src/core/repair/readers.ts	readersWrite	call:serializePageToMarkdown	SEGW	a segmented page returns segmented_page before the read and keeps its readers
 src/core/repair/redacted-facts.ts	pageTexts	field	INLINE	inline branch only (a segmented page's body is read through readBodyRange in segmentedText)
 src/core/repair/redacted-facts.ts	pageTexts	sql	INLINE	page_versions rows that hold a body copy (compiled_truth IS NOT NULL); a segmented version has none and is not read
 src/core/repair/redacted-facts.ts	restoreFencedRows	call:serializePageToMarkdown	INLINE	inline pages only: a segmented page returns before the read, and its fenced rows preview as class segmented

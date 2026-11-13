@@ -72,6 +72,22 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 
 More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-connect.md#troubleshooting)
 
+### access_labelled_only_owner
+
+<a id="access_labelled_only_owner"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A labelled-only grant was asked for on the brain owner (gbrain access member labelled-only <owner> on), or a labelled-only member was named the owner (gbrain access owner set), so nothing was changed. | The owner reads the whole brain. A labelled-only grant hides every page that does not name its member, so on the owner it would silently hide the owner's own brain from every credential bound to it. | Ask the user which member the group or audience credential should read as; give it its own member and mark that one labelled-only, or clear the grant before naming the owner. | user | `repeat the read that failed` | 3 | no |
+
+### access_labelled_only_unnamed
+
+<a id="access_labelled_only_unnamed"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A credential whose member is labelled-only tried to create a page that would not name it: the page has no readable_by holding the member or one of its groups, and no folder or page rule over its slug lists them, so nothing was written. | A labelled-only member reads only pages labelled for it, so a page it creates must name it; otherwise it would write a page it could never read back, readable by every other caller its source admits. | Add readable_by naming the member or one of its groups to the frontmatter (readable_by: [alice-example, group:team-a]), or ask the brain operator to add a folder rule over the path that lists it, then submit again with a new request_id. | agent | `repeat the read that failed` | 1 | no |
+
 ### access_member_disabled
 
 <a id="access_member_disabled"></a>
@@ -1852,7 +1868,7 @@ More: [docs/guides/write-refusals.md#file_database_drift](../../docs/guides/writ
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A managed sync import would have overwritten a database version of the page that sync never saw (the page changed since its file was last imported), so the file is held and the page keeps the database version. | Sync imports a file only when the page is still at the revision its last recorded import wrote, or when the import changes nothing. Here the page moved (a database-only write, or no import record to compare on an upgraded brain) and the file's content differs, so importing would silently replace the newer database copy. Pages under storage.keep_db prefixes are never held: the keep_db worker reconciles them from the database. | Preview with gbrain repair file-drift --source <source> --slug <slug> --prefer database (keep the database copy and rewrite the file) or --prefer file (import the file), decide with the user, then apply it with the plan hash; the next gbrain sync --source <source> --no-pull re-screens the hold. | agent | `repeat the read that failed` | 1 | no |
+| A managed sync import would have overwritten a database version of the page that sync never saw (the page changed since its file was last imported), so the file is held and the page keeps the database version. | Sync imports a file only when the page is still at the revision its last recorded import wrote, or when the import changes nothing. Here the page moved (a database-only write, or no import record to compare on an upgraded brain) and the file's content differs, so importing would silently replace the newer database copy. Pages under storage.keep_db prefixes are never held: the keep_db worker reconciles them from the database. | Preview with gbrain repair file-drift --source <source> --slug <slug> --prefer database (keep the database copy and rewrite the file) or --prefer file (import the file); the preview writes nothing and names any file edit or deletion sync never imported that the database copy would overwrite. Decide with the user: the apply needs their consent (run it without --yes to get the consent message, exit 3, and add --yes only after they agree). The next gbrain sync --source <source> --no-pull re-screens the hold. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/write-refusals.md#file_drift](../../docs/guides/write-refusals.md#file_drift)
 
@@ -1937,6 +1953,16 @@ More: [docs/guides/repair.md#fix-not-writable](../../docs/guides/repair.md#fix-n
 | Following a brain's shared skills needs the user's explicit follow approval. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/shared-brain-skills.md#approve-publication-following-and-editing-separately](../../docs/guides/shared-brain-skills.md#approve-publication-following-and-editing-separately)
+
+### foreign_table
+
+<a id="foreign_table"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A table gbrain owns by name (an OAuth table) already exists in the brain's schema without a column gbrain always gives it, or with a type gbrain never gives it, so schema setup stopped before the schema replay or any migration changed anything; the message names the table, the column, the type found and the type gbrain needs. | gbrain creates its tables with CREATE TABLE IF NOT EXISTS, so without this check it adopted a same-named table another application created in the shared database, added its own columns to it and failed partway through an upgrade on the first statement that compared the wrong type (#9190). The table holds that application's data, so gbrain never moves, renames or drops it. | Ask the user: give gbrain its own database, or move the other table to a schema of its own (ALTER TABLE <table> SET SCHEMA <other_schema> takes its indexes and constraints along) and point that application there; then run gbrain apply-migrations --force-schema --yes. | user | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#foreign-table](../../docs/guides/troubleshooting.md#foreign-table)
 
 ### forget_requires_owner
 
@@ -5551,6 +5577,16 @@ More: [docs/guides/system-one.md#unpriced_model](../../docs/guides/system-one.md
 Reasons: `not_utf8`, `control_character`.
 
 More: [docs/guides/write-refusals.md#unsupported_path](../../docs/guides/write-refusals.md#unsupported_path)
+
+### untrack_not_db_only
+
+<a id="untrack_not_db_only"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain git commit-push --untrack in a managed canonical worktree was refused before the index changed: a file to untrack is not under a storage.db_only dir that gbrain.yml at HEAD declares, or .gitignore does not ignore it. | The next sync deletes the page of a file that leaves Git outside a declared storage.db_only dir, and a file .gitignore does not ignore can be committed again by any later commit. | Declare the folder under storage.db_only in gbrain.yml and add its <dir>/ line to .gitignore, commit both with gbrain git commit-push -m <msg> -- gbrain.yml .gitignore, then rerun the untrack. | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/shared-checkout-git.md#untrack](../../docs/guides/shared-checkout-git.md#untrack)
 
 ### upload_expired
 

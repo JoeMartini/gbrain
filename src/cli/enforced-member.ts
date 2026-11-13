@@ -321,17 +321,23 @@ function withoutCoverageCounts(value: unknown, depth = 0): unknown {
 
 type PageView = 'readable' | 'hidden' | 'missing';
 
-/** Whether the member reads a page: an existing row under the member's full read policy, a new slug under the folder rules it would sit under. */
+/**
+ * Whether the member reads a page: an existing row under the member's full read policy, a new slug under the folder rules it
+ * would sit under. GBRA-108 design 1: a labelled-only member reads an existing row only when it names the member, and a
+ * new slug only under a rule that lists it (the mode refuses label changes, so a rule is the only way a create names it).
+ */
 export async function memberPageView(engine: BrainEngine, ea: EnforcedAccess, sourceId: string, slug: string): Promise<PageView> {
   if (ea.hiddenSources.has(sourceId)) return 'hidden';
-  const { withCallerAccess, readPolicyFragment, folderRulesAllowedSql } = await import('../core/search/private-visibility.ts');
+  const { withCallerAccess, readPolicyFragment, folderRulesAllowedSql, labelledOnlyForSql } = await import('../core/search/private-visibility.ts');
   const { access } = ea;
+  const labelled = access.labelledOnly ? ' AND ' + labelledOnlyForSql('p', [access.identity], access.satisfiedRuleIds) : '';
   let view: PageView = 'missing';
   for (const candidate of [...new Set([slug, slug.toLowerCase()])]) {
-    const policy = withCallerAccess(access, () => readPolicyFragment('p', access.identity, true, access.satisfiedRuleIds));
+    const policy = withCallerAccess(access, () => readPolicyFragment('p', access.identity, true, access.satisfiedRuleIds)) + labelled;
     const [row] = await engine.executeRaw<{ ok: boolean }>('SELECT (' + policy + ') AS ok FROM pages p WHERE p.source_id = $1 AND p.slug = $2 LIMIT 1', [sourceId, candidate]);
     if (row) { if (!row.ok) return 'hidden'; view = 'readable'; continue; }
-    const folder = withCallerAccess(access, () => folderRulesAllowedSql('p', access.satisfiedRuleIds));
+    const folder = withCallerAccess(access, () => folderRulesAllowedSql('p', access.satisfiedRuleIds))
+      + (access.labelledOnly ? ' AND ' + labelledOnlyForSql('p', [access.identity], access.satisfiedRuleIds, false) : '');
     const [rule] = await engine.executeRaw<{ ok: boolean }>('SELECT (' + folder + ') AS ok FROM (SELECT $1::text AS source_id, $2::text AS slug, gbrain_access_folder_rules($1, $2) AS folder_rule_ids) p', [sourceId, candidate]);
     if (!rule?.ok) return 'hidden';
   }
@@ -480,7 +486,9 @@ async function ownEnforcedReceipt(id: unknown): Promise<boolean> {
 
 /**
  * Output guard (defense in depth): true when any whole string in result is the slug of a page the member cannot read
- * and no page it reads carries the same slug. The caller then withholds the whole output.
+ * and no page it reads carries the same slug. The caller then withholds the whole output. Pages are judged under the
+ * record the read ran under (a read-only operation with the enforced overrides), so a derived page the member reads
+ * through access.members_read_lineage is not withheld; when that record cannot be built, the output is withheld.
  */
 export async function namesHiddenPage(engine: BrainEngine, command: string, result: unknown): Promise<boolean> {
   const strings = new Set<string>();
@@ -493,8 +501,11 @@ export async function namesHiddenPage(engine: BrainEngine, command: string, resu
   walk(result, 0);
   if (!strings.size) return false;
   const ea = await enforcedAccess(engine, command);
-  const { withCallerAccess, readPolicyFragment } = await import('../core/search/private-visibility.ts');
-  const policy = withCallerAccess(ea.access, () => readPolicyFragment('p', ea.access.identity, true, ea.access.satisfiedRuleIds));
+  const [{ withCallerAccess, callerAccessAllowedSql, privacyPartSql }, { remoteCallerAccess }] = await Promise.all([
+    import('../core/search/private-visibility.ts'), import('../core/access/caller.ts')]);
+  const read = await remoteCallerAccess(engine, undefined, [], 'stdio', null, ea.member, true).catch(() => null);
+  if (!read) return true;
+  const policy = withCallerAccess({ ...read, hidePrivate: true, owner: false, privateReadableSources: [] }, () => '(' + callerAccessAllowedSql('p') + ' AND ' + privacyPartSql('p') + ')');
   const hidden = ea.hiddenSources.size ? '(NOT (' + policy + ') OR p.source_id = ANY($2::text[]))' : 'NOT (' + policy + ')';
   const rows = await engine.executeRaw<{ slug: string; hidden: boolean }>('SELECT p.slug, ' + hidden + ' AS hidden FROM pages p WHERE p.slug = ANY($1::text[])',
     ea.hiddenSources.size ? [[...strings], [...ea.hiddenSources]] : [[...strings]]);
