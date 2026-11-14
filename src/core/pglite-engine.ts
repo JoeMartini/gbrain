@@ -171,6 +171,7 @@ import { searchKeywordCJK } from './engine-sql/cjk-search.ts';
 import * as titlesImpl from './engine-sql/titles.ts';
 import * as keywordPagesImpl from './engine-sql/keyword-pages.ts';
 import { applyForwardReferenceBootstrap, pgliteBootstrapTarget } from './engine-sql/bootstrap.ts';
+import { assertSchemaNotAhead } from './schema-client-behind.ts';
 import { wellFormedJson } from './text-safe.ts';
 import { ENGINE_ROOT } from './engine-root.ts';
 import { insertEvalCandidate } from './feedback/store.ts';
@@ -775,6 +776,11 @@ export class PGLiteEngine implements BrainEngine {
    */
   walRepairReceipt: WalRepairReceipt | null = null;
 
+  /** #9227: whether this engine has its datastore open under the lock that admits one process (always true for an open in-memory store). */
+  holdsDatastoreLock(): boolean {
+    return this._db !== null && this._lock?.acquired === true;
+  }
+
   get db(): PGLiteDB {
     if (!this._db) throw new Error('PGLite not connected. Call connect() first.');
     return this._db;
@@ -1165,8 +1171,9 @@ export class PGLiteEngine implements BrainEngine {
       dims = storedIdentity.dimensions;
       model = storedIdentity.model;
     }
-    const { runMigrations, withSchemaMigrationLock } = await import('./migrate.ts'); // engine-dynamic-import-ok: initSchema only, keeps the ~220 migration modules off every connect
+    const { runMigrations, withSchemaMigrationLock, registeredLatestVersion } = await import('./migrate.ts'); // engine-dynamic-import-ok: initSchema only, keeps the ~220 migration modules off every connect
     await withSchemaMigrationLock(this, async () => {
+      await assertSchemaNotAhead(async (q) => (await this.db.query<Record<string, unknown>>(q)).rows, registeredLatestVersion()); // #7776
       await this.applyForwardReferenceBootstrap();
       await this.db.exec(getPGLiteSchema(dims, model));
 
@@ -1315,7 +1322,7 @@ export class PGLiteEngine implements BrainEngine {
   async purgeDeletedPages(
     olderThanHours: number,
     opts?: { dryRun?: boolean; excludeIds?: number[] },
-  ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; deleted_at: Date }[] }> {
+  ): Promise<{ slugs: string[]; count: number; pages?: { slug: string; source_id: string; deleted_at: Date }[] }> {
     return pagesImpl.purgeDeletedPages(this.engineSql, olderThanHours, opts);
   }
 
@@ -1898,7 +1905,7 @@ export class PGLiteEngine implements BrainEngine {
     return chunksImpl.deleteChunks(this.engineSql, slug, opts);
   }
 
-  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only' }): Promise<number> {
+  async countStalePagesForExtraction(opts?: { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only'; wantedProducers?: readonly string[] }): Promise<number> {
     return pagesImpl.countStalePagesForExtraction(scopedRead(this.engineSql), opts);
   }
 
@@ -1908,6 +1915,7 @@ export class PGLiteEngine implements BrainEngine {
     sourceId?: string;
     versionTs?: string;
     held?: 'exclude';
+    wantedProducers?: readonly string[];
   }): Promise<StalePageRow[]> {
     return pagesImpl.listStalePagesForExtraction(scopedRead(this.engineSql), opts);
   }

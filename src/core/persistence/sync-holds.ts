@@ -33,9 +33,10 @@
  * for a recommended merge or an undecidable pair, a paragraph for a person.
  */
 import type { BrainEngine } from '../engine.ts';
-import type { Action } from '../agent-output.ts';
+import { shellQuote, type Action } from '../agent-output.ts';
 import type { ContentRefusal } from '../import-screen.ts';
 import { RECOVERY_VERSION, type InvalidFrontmatterReason } from '../markdown.ts';
+import { TAG_MAX_BYTES } from '../tag-limit.ts';
 import { ORIGIN_TWINS_AUTO_RESOLVE_KEY, originTwinsPreviewArgv, type OriginConflictReason } from './origin-twins.ts';
 import { FENCE_REASONS, type FenceMessageLocation } from '../fence-repair/reasons.ts';
 import type { FenceReason, FenceTier, GateLetter } from '../fence-repair/types.ts';
@@ -189,6 +190,8 @@ export interface GitHoldMeta {
   deleted?: true;
   /** GBRA-133 `file_drift` `file_gone`: `sync.apply_held_deletions` refused this deletion (sync-held-deletions.ts) while the page was at `page_revision`. */
   held_deletion?: { refused: string; page_revision: string };
+  /** GST-2584 `file_drift` `file_gone`: the page has no import record of its revision, so sync cannot tell whether it changed in the database. */
+  no_import_record?: true;
   /**
    * #6712 dependency edge: the path of an earlier entry of the same sync, sharing this entry's slug or page id, that was
    * held in that sync; this entry waits on it with the same code, and discovery re-screens it once that hold is gone.
@@ -473,6 +476,19 @@ export async function settledDeletionHolds(tx: Exec, sourceId: string, candidate
   return candidates.filter(c => (c.page_id === null || !ids.has(String(c.page_id))) && (c.slug === null || !slugs.has(c.slug))).map(c => c.path);
 }
 
+/** GST-2568: the fingerprints of a source's holds; a managed pass reads them before it runs to count the holds it released (`releasedHoldCount`). */
+export async function sourceHoldFingerprints(engine: Exec, sourceId: string): Promise<Set<string>> {
+  const rows = await engine.executeRaw<{ fingerprint: string }>("SELECT fingerprint FROM op_checkpoints WHERE op=$1 AND completed_keys->0->>'source_id'=$2", [GIT_HOLD_OP, sourceId]);
+  return new Set(rows.map(row => row.fingerprint));
+}
+
+/** GST-2568: how many of the holds read before a pass (`sourceHoldFingerprints`) are gone after it. */
+export async function releasedHoldCount(engine: Exec, sourceId: string, before: Set<string> | null): Promise<number> {
+  if (!before?.size) return 0;
+  const after = await sourceHoldFingerprints(engine, sourceId);
+  return [...before].filter(fingerprint => !after.has(fingerprint)).length;
+}
+
 /** #5984: which of these paths have a hold row (one indexed read), so a batched waiver run clears only those. */
 export async function heldGitPaths(tx: Exec, sourceId: string, incarnation: string, paths: readonly string[]): Promise<Set<string>> {
   if (!paths.length) return new Set();
@@ -612,8 +628,9 @@ export async function holdBasisMoved(engine: Pick<BrainEngine, 'executeRaw'>, so
 /**
  * GBRA-133: the `file_drift` screen version; 1 is #7340's rule (a page with no import record compares its file at the baseline commit),
  * 2 adds the path's earlier committed versions (`driftHistory`), which landed after version 1 without re-screening its holds.
+ * GST-2568: 3 reads a schema-pack retype's database-only stamp as the file's own type (align-stored.ts `keepRetypeStamp`).
  */
-export const FILE_DRIFT_VERSION = 2;
+export const FILE_DRIFT_VERSION = 3;
 
 export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, retried: boolean): boolean {
   return retried || (record.code === 'file_too_large' && record.meta.streamed?.gbrain_version !== VERSION) || ['frontmatter_slug_conflict', 'rename_held', 'parser_regression', 'content_rejected', 'write_gate_rejected', 'purged_content', 'legacy_slug_conflict', 'origin_conflict', 'page_identity_changed', 'git_object_missing'].includes(record.code)
@@ -626,6 +643,8 @@ export function holdRescreenDue(record: Pick<GitHoldRecord, 'code' | 'meta'>, re
     // GBRA-133: an unknown-side drift held before #7340's baseline rule (a Git edit to a page with no import record) imports
     // now when the page still holds its file at the baseline commit, so it is screened once more.
     || (record.code === 'file_drift' && fileDriftSide(record.meta) === 'unknown' && (record.meta.drift_version ?? 0) < FILE_DRIFT_VERSION)
+    // GST-2568: a live page's drift held before version 3 may differ from its file only by a schema-pack retype's stamp, so it is screened once more.
+    || (record.code === 'file_drift' && fileDriftSide(record.meta) !== 'deleted' && (record.meta.drift_version ?? 0) < 3)
     // #8007: a deletion held while gbrain.yml's storage section was invalid is decided again by every sync, so a fixed file settles it.
     || (record.code === 'file_drift' && record.meta.reason === 'storage_invalid')
     || (outOfAttemptsHold(record.code) && record.meta.stall?.gbrain_version !== VERSION)
@@ -724,6 +743,11 @@ export function heldDriftPreviewArgv(sourceId: string, side: FileDriftSide, stat
     ...(path ? ['--only', path] : []), '--prefer', prefer];
 }
 
+/** GST-2584: the read-only preview of `gbrain repair moved-pages`, which folds a page whose file moved into the moved page. */
+export function movedPagesPreviewArgv(sourceId: string, slug?: string | null): string[] {
+  return ['gbrain', 'repair', 'moved-pages', '--source', sourceId, ...(slug ? ['--slug', slug] : [])];
+}
+
 /** #6712 PR 4b: the Decision for a `file_drift` hold whose one side is a deletion; each option names its action verb. */
 function deletedDriftFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'meta'> & Partial<Pick<GitHoldRecord, 'slug'>>, state: FileDriftDeletedState): Action {
   const source = record.source_id;
@@ -743,8 +767,11 @@ function deletedDriftFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'met
     : uncommitted ? `${record.path} is gone, but Git never committed it${record.meta.reason === 'ignored' ? ' (.gitignore excludes it)' : ''}, so its absence is no evidence of a deletion and sync kept page ${slug} instead of deleting it (#7130). Put the file back and commit it (un-ignore it first) to keep the page file-backed. `
     : state === 'tombstone_edited' ? `Page ${slug} was deleted${revision} and ${record.path} then changed, so sync held the file instead of restoring the page or dropping the edit. `
     : state === 'purged_differs' ? `The page of ${record.path} was purged and the file differs from what the brain held, so sync held the file instead of importing it as a new page. `
+    : record.meta.no_import_record ? `${record.path} is gone from the last commit, and page ${slug}${revision} has no import record that says whether it changed in the database since the file was imported, so sync held the deletion instead of removing it. `
     : `${record.path} is gone from the last commit but page ${slug} changed${revision}, so sync held the deletion instead of removing a page that changed. `;
-  const options = `This preview (writes nothing) shows --prefer database: ${fileDriftActionVerb('deleted', state, 'database')}; ${preview('file').join(' ')} previews --prefer file: `
+  // GST-2584: a file that moved left its page behind; the --held preview lists it moved_to and names the fold.
+  const moved = state === 'file_gone' ? `If the file moved, the preview lists the page moved_to <slug> and names ${shellQuote(movedPagesPreviewArgv(source, record.slug))}, which folds it into the moved page. ` : '';
+  const options = `${moved}This preview (writes nothing) shows --prefer database: ${fileDriftActionVerb('deleted', state, 'database')}; ${preview('file').join(' ')} previews --prefer file: `
     + `${fileDriftActionVerb('deleted', state, 'file')}. `;
   return { argv: preview('database'), consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/guides/repair.md#deleted-canonical-files',
     why: `${what}${options}Decide with the user. ${FILE_DRIFT_APPLY_STEP} Then sync again. The rest of the source is not blocked.`,
@@ -910,6 +937,11 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
       return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),
         user_message: `${record.path} nests YAML aliases in its frontmatter that expand past gbrain's size limit, so sync holds it and the rest of source ${source} keeps syncing. An older gbrain imported these bytes; this version refuses them on purpose. Reduce the alias nesting in its frontmatter (or write the values out), or remove the file, then commit and run gbrain sync --source ${source} --no-pull.`,
         why: 'The alias bound (#7018) stops a few hundred bytes of nested anchors from expanding into gigabytes; it is intended, so the page keeps its last imported version until the file changes.',
+        verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
+    case 'tag_too_long':
+      return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),
+        user_message: `${record.path} has a frontmatter tag longer than the ${TAG_MAX_BYTES} bytes a tag can be, so sync holds it and the rest of source ${source} keeps syncing. Shorten that tag or split it into shorter tags, commit, then run gbrain sync --source ${source} --no-pull.`,
+        why: 'Tags are stored in an index whose entries have a fixed size limit; no frontmatter repair shortens a tag, and the hold re-screens when the file changes.',
         verify: { argv: ['gbrain', 'sources', 'status', source, '--json'] } };
     case 'visibility_noncanonical':
       return { argv: ['gbrain', 'sources', 'status', source, '--json'], consent: [], actor: 'user', requires_exclusive: false, docs: gitHoldDocs(record.code),
@@ -1395,7 +1427,7 @@ export async function buildHoldReport(engine: Exec, input: { sourceId: string; i
 /** The hold fields as the sync JSON envelopes carry them (snake_case already). */
 export function syncHoldJsonFields(result: object): Record<string, unknown> {
   const fields = result as Record<string, unknown>;
-  return Object.fromEntries(['held', 'held_count', 'held_needs_human', 'holds_outstanding', 'holds_escalated', 'holds_truncated', 'holds_pending_screen', 'holds_fix',
+  return Object.fromEntries(['held', 'held_count', 'held_needs_human', 'holds_outstanding', 'holds_released', 'holds_escalated', 'holds_truncated', 'holds_pending_screen', 'holds_fix',
     'converted_from_failed', 'recovered_frontmatter', 'fences_normalized', 'fence_issues', 'dry_run', 'would_hold', 'would_hold_count', 'would_normalize', 'would_normalize_count', 'screen_skipped', 'breaker', 'slug_lines_removed']
     .filter(key => fields[key] !== undefined).map(key => [key, fields[key]]));
 }

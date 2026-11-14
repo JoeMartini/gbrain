@@ -2322,12 +2322,12 @@ deferred M-effort issues above are NOT repeated here.
   synthesized answers, graph annotations) contains them — catching join/
   snippet/synthesis leak classes a source_id check can't see. **Where:**
   `evals/brainbench/`. **Effort:** M. **Priority:** P3.
-- [ ] **P3 — OpenClaw native remote-MCP register block, when upstream ships
-  remote support.** **What:** `gbrain agent register` renders the honest
-  thin-client CLI block for openclaw today (`openclawThinClientBlock` in
-  `src/core/mcp-registration.ts`) because OpenClaw has no native remote-MCP
-  client; when upstream ships one, add a native client-credentials wiring
-  block and demote the CLI block to the fallback. Blocked upstream. **Where:**
+- [ ] **P3 — OpenClaw native remote-MCP register block.** **What:**
+  `gbrain agent register` renders the honest thin-client CLI block for
+  openclaw today (`openclawThinClientBlock` in
+  `src/core/mcp-registration.ts`). OpenClaw now ships a native remote-MCP
+  client (streamable HTTP, `openclaw mcp login`; docs/mcp/OPENCLAW.md), so
+  add a native wiring block and demote the CLI block to the fallback. **Where:**
   `src/core/mcp-registration.ts`, `src/commands/agent-register.ts`.
   **Effort:** S. **Priority:** P3.
 - [ ] **P3 — E2: `gbrain agent list` / `gbrain agent revoke` conveniences.**
@@ -3041,7 +3041,7 @@ OUT deliberately — see the plan's "NOT in scope" list).
   (absent) config defaults to warn") and `test/mcp-tool-defs.test.ts` pins
   both emission states. **Effort:** small (1-line default + test updates).
   **Priority:** P1.
-- [ ] **P2 — mcp_request_log retention/pruning.** **What:** a retention policy
+- [x] **P2 — mcp_request_log retention/pruning.** **Done (#6770 rewrite):** opt-in `cycle.purge.mcp_request_log_retention_days` (30-3650) prunes in the cycle purge phase and, on PGLite, hourly inside a live serve; `surface_change` and `memory_setting_change` rows are never pruned, pruned rows are tallied per token in `mcp_request_log_rollup`, and usage windows that reach past pruned history report it (docs/mcp/ADMIN.md#request-log-retention). **What (as filed):** a retention policy
   (age- or row-capped prune, `gbrain maintain` hook or cron). **Why:** the
   table now carries MORE than request telemetry — `surface_change` audit rows
   (ENG-8) and `denied_after_list` metric rows ride it — and it grows unbounded

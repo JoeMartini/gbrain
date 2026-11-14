@@ -500,7 +500,11 @@ brain rather than making another bundled copy. Follow the
 and preserve edited files.
 
 If you're running an agent platform (OpenClaw, Hermes, or any repo with a workspace),
-scaffold the bundled skills into it. On OpenClaw, install the brain-first core:
+scaffold the bundled skills into it. On OpenClaw the primary route is the
+per-turn rule that `gbrain setup openclaw` installs
+([OpenClaw guide](docs/mcp/OPENCLAW.md#brain-first-instructions)): in
+harness-evals a rule beside each turn was followed on 97-100% of turns and a
+listed skill on 1-3%. Skills are the fallback. Install the brain-first core:
 
 ```bash
 gbrain skillpack scaffold --harness openclaw --workspace /path/to/agent/workspace
@@ -626,6 +630,21 @@ only in the due-job list, which runs only when a session starts.
 
 If skipped, minimal defaults are installed automatically.
 
+## Opt-ins
+
+The default install (keyless PGLite, no repo) adds nothing: no daemon, service
+unit, cron entry, connector or dream schedule, and self-upgrade stays `notify`
+(it reports releases and installs none). An upgrade never installs autopilot on
+a brain without one. Turn each on only when the user asks:
+
+- **Keys and embeddings:** the key (Step 2), then
+  `gbrain init --force --embedding-model voyage:voyage-4 --embedding-dimensions 1024`.
+- **Autopilot** (Postgres): `gbrain autopilot --install --repo <path>`; PGLite uses `gbrain serve`.
+- **Dream schedule:** cron `0 2 * * * <wrapper> dream` ([wrapper](docs/guides/cron-schedule.md#calling-gbrain-unattended)).
+- **Connectors:** `gbrain connectors auth <provider>` ([guide](docs/guides/chat-connectors.md)).
+- **Auto-upgrade:** `gbrain config set self_upgrade.mode auto`.
+- **Release channel:** `gbrain config set self_upgrade.channel alpha` (every release) or `stable`.
+
 ## Step 7: Recurring Jobs
 
 Optional: skip this entire step for memory-only installs. Ask before scheduling
@@ -669,11 +688,8 @@ timeout of at least 10 s. The wrapper and its rules:
   paused), 2 the daemon took itself out of rotation. Filesystem-only, so it
   works during DB outages.
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install).
-- **Dream cycle** (nightly): `gbrain dream` runs the 8-phase overnight maintenance cycle.
-  Entity sweep, citation fixes, memory consolidation, plus overnight conversation
-  synthesis and cross-session pattern detection. One cron-friendly command. This is what
-  is an opt-in maintenance capability. See `docs/guides/cron-schedule.md` for the
-  full protocol.
+- **Dream cycle** (nightly): `gbrain dream`, the opt-in maintenance cycle
+  ([Opt-ins](#opt-ins), [protocol](docs/guides/cron-schedule.md)).
 - **Weekly**: `gbrain doctor --json && gbrain embed --stale`
 
 ## Step 8: Integrations

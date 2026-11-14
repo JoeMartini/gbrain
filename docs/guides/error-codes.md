@@ -72,6 +72,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 
 More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-connect.md#troubleshooting)
 
+### access_identity_unavailable
+
+<a id="access_identity_unavailable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The member a credential (access token, OAuth client or stdio binding) is bound to could not be looked up, so the request was refused and nothing was read or written. | Reading the binding failed with a database error, or with a lock or statement timeout or a dropped connection while the request was submitted. Reading the credential as unbound instead would open every unlabelled page to a labelled-only member, so the request stops, and the same request succeeds once the database answers. | Retry the same request in a few seconds (a write with the same request_id); if it keeps failing, ask the brain operator to run gbrain doctor --json on the brain host. Run: gbrain whoami --json | provider | `gbrain whoami --json` | 1 | yes |
+
+More: [docs/guides/write-refusals.md#access_identity_unavailable](../../docs/guides/write-refusals.md#access_identity_unavailable)
+
 ### access_labelled_only_owner
 
 <a id="access_labelled_only_owner"></a>
@@ -363,6 +373,22 @@ Override: reason `transient`: retryable, exit 11, retryable.
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The autopilot job is bound to a different brain. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### autopilot_no_repo
+
+<a id="autopilot_no_repo"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain autopilot --install found no absolute repo directory (sync.repo_path and the default source's local_path are unset or relative), so it installed nothing. | The autopilot daemon syncs a git checkout. A repo-less brain needs no daemon: free upkeep (gbrain maintain --unattended) keeps it maintained. | Pass --repo <absolute-directory> for a brain kept in git, or check free upkeep with gbrain maintain --status. | agent | `repeat the read that failed` | 1 | no |
+
+### autopilot_pglite_daemon
+
+<a id="autopilot_pglite_daemon"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain autopilot --install refused on a PGLite brain: a daemon would hold the single-writer lock all day and block every other gbrain process. | PGLite has one writer. gbrain serve owns the lock and runs the resident sweep; free upkeep runs through gbrain maintain --unattended. | Run gbrain serve. Check upkeep with gbrain maintain --status. For a dedicated-brain daemon, re-run gbrain autopilot --install --force. | agent | `repeat the read that failed` | 1 | no |
 
 ### backup_dump_failed
 
@@ -729,6 +755,14 @@ More: [docs/guides/troubleshooting.md#embedding-state](../../docs/guides/trouble
 | Google connect credential error: claim already used. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-connect.md#troubleshooting)
+
+### client_behind
+
+<a id="client_behind"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Schema setup (initSchema, which gbrain init, init --migrate-only and upgrade run, and apply-migrations before its orchestrators) refused because the brain's schema version is newer than this gbrain binary's newest migration; nothing in its schema ran and nothing changed. | initSchema replays the binary's whole schema, CREATE OR REPLACE FUNCTION included, before it runs migrations. An older binary sharing the database with a newer one (another host, a lagging cron running apply-migrations or upgrade) used to reinstall its own superseded function bodies, the writer-fence guards among them, over the newer ones and then apply nothing (#7776). Reads do not run schema setup and keep working on the older binary; doctor schema_function_bodies names bodies an older replay already reverted. | Upgrade gbrain on this host (gbrain upgrade) to the release that migrated the database or newer, then rerun the command. Run: gbrain doctor --only schema_version --json | host_admin | `gbrain doctor --json` | 1 | no |
 
 ### client_json_unreadable
 
@@ -1264,6 +1298,16 @@ Reasons: `not_covered`, `restore`.
 
 More: [docs/guides/repair.md#coverage-gap](../../docs/guides/repair.md#coverage-gap)
 
+### credential_scope_required
+
+<a id="credential_scope_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain auth create or gbrain auth register-client was asked for a credential bound to no member on a brain that serves several people, so nothing was created. | A credential bound to nobody on such a brain is refused on every read (requester_scope_required); creating one would hand out a key that cannot work, or one that reads everyone's unmarked notes. | Bind it to the person it serves: gbrain auth create <name> --member <id> (gbrain access member list names the members). A shared agent passes --may-act-for <members> instead; --reads-unscoped --yes creates one that reads every page no rule restricts for any asker, on purpose. Run: gbrain access member list --json | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#credential_scope_required](../../docs/guides/write-refusals.md#credential_scope_required)
+
 ### cursor_incarnation_retired
 
 <a id="cursor_incarnation_retired"></a>
@@ -1273,6 +1317,14 @@ More: [docs/guides/repair.md#coverage-gap](../../docs/guides/repair.md#coverage-
 | An unfinished managed sync cursor of this source was recorded under a source incarnation the source no longer has (it was re-pointed at a new checkout, or removed and added again), so no current sync selects or resumes it. | The cursor key digests the incarnation; every incarnation-joined reader drops the old rows while the local ledger mirror and the source-id-only cursor read still showed them. Retiring the bookkeeping says nothing about whether the current source's files are imported. | Preview gbrain repair managed-sync-orphans --source <id> and apply it with the hash it prints; then gbrain sync status --source <id> --json shows the current cursor, if any. Run: gbrain repair managed-sync-orphans --source '{source_id}' | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/repair.md#managed-sync-orphans](../../docs/guides/repair.md#managed-sync-orphans)
+
+### cycle_already_running
+
+<a id="cycle_already_running"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Another maintenance cycle holds the brain cycle lock, so this run skipped instead of waiting. | Cycles serialize on the gbrain-cycle lease; the holder releases it when it finishes (or its TTL lapses after a crash). | Wait for the other cycle; unattended upkeep retries on its next turn (gbrain maintain --status shows the last skip). | agent | `repeat the read that failed` | 1 | yes |
 
 ### cycle_failed
 
@@ -1316,7 +1368,7 @@ More: [docs/ENGINES.md#serve-deep-health](../../docs/ENGINES.md#serve-deep-healt
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Chunks of pages soft-deleted longer than the purge window (72h) are still stored. | Search never reads them; the purge lifecycle (`gbrain pages purge-deleted`, the autopilot purge phase) hard-deletes such pages and their chunks. The purge is brain-wide and irreversible, so it needs the user. | Preview with `gbrain pages purge-deleted --dry-run --json`, then run `gbrain pages purge-deleted --yes` once the user agrees. Run: gbrain pages purge-deleted --dry-run --json | agent | `gbrain doctor --only embedding_state --json` | 1 | no |
+| Chunks of pages soft-deleted longer than the purge window (72h), which the purge would remove, are still stored. | Search never reads them; the purge lifecycle (`gbrain pages purge-deleted`, the autopilot purge phase) hard-deletes such pages and their chunks. Pages its holds keep (a derived retirement inside generations.restore_days, a restorable atom, an open rename-identity pair, an archived source) are not counted. The purge is brain-wide and irreversible, so it needs the user. | Preview with `gbrain pages purge-deleted --dry-run --json`, then run `gbrain pages purge-deleted --yes` once the user agrees. Run: gbrain pages purge-deleted --dry-run --json | agent | `gbrain doctor --only embedding_state --json` | 1 | no |
 
 More: [docs/guides/troubleshooting.md#embedding-state](../../docs/guides/troubleshooting.md#embedding-state)
 
@@ -1377,6 +1429,28 @@ More: [docs/guides/ambient-recall.md#replay-after-a-degraded-wake](../../docs/gu
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Commit or stash canonical skill edits before optimization. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### doctor_alert_act
+
+<a id="doctor_alert_act"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `gbrain doctor --alert` found a page-class check that needs someone now (database unreachable, writes failing or stalled, migrations pending or wedged, more than one build running, sync or maintenance stalled, corrupt rows, a public schema exposed, or a tripped paid-loop breaker). | Only page-class checks page; skill, advisory and coaching checks never do, so health_score warnings alone exit 0. Each item in --json alert.items keeps that check's own fix, consent, actor and verify. | Read alert.items in the --json document and follow each fix.next; page the operator for items whose fix needs them. Run: gbrain doctor --alert --json | agent | `gbrain doctor --json` | 17 | no |
+
+More: [docs/guides/troubleshooting.md#doctor-alert-act](../../docs/guides/troubleshooting.md#doctor-alert-act)
+
+### doctor_alert_unknown
+
+<a id="doctor_alert_unknown"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| `gbrain doctor --alert` found nothing to act on, but at least one page-class check did not run fresh in this run, so the brain's health is unknown, not clear. | A check that timed out, errored, was reported from its last known result or was skipped by the tier proves nothing; reading it as healthy would hide an outage. alert.consecutive_unknown counts the alert runs in a row that ended unknown, and agent crons page on the second. | Run each alert.unknown item fix (it measures that check alone); if a check keeps running out of time, raise --budget-ms or run gbrain doctor --alert --tier standard --json. Run: gbrain doctor --alert --budget-ms 0 --json | agent | `repeat the read that failed` | 18 | yes |
+
+Reasons: `budget`, `bound`, `errored`, `last_known`, `not_run`.
+
+More: [docs/guides/troubleshooting.md#doctor-alert-unknown](../../docs/guides/troubleshooting.md#doctor-alert-unknown)
 
 ### doctor_tier_unavailable
 
@@ -1599,6 +1673,14 @@ More: [docs/guides/enforced-member.md#refused](../../docs/guides/enforced-member
 | An engine opened from settings was disconnected, which closes it for good, so connect() and reconnect() refuse and nothing was reopened. | The request itself was wrong or no longer matches the brain; nothing was changed. | Call openEngine again with the settings to open a new engine. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/ENGINES.md#opening-an-engine-from-settings-experimental](../../docs/ENGINES.md#opening-an-engine-from-settings-experimental)
+
+### engine_degraded
+
+<a id="engine_degraded"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The brain database was unreachable (the engine is in degraded mode), so background work such as unattended upkeep skipped this run. | A degraded engine answers from its last state and reconnects on its own; writing maintenance results then would be lost or refused. | Run gbrain doctor --json and report the connection problem it names. | agent | `gbrain doctor --json` | 1 | no |
 
 ### engine_embedding_mismatch
 
@@ -1918,7 +2000,7 @@ More: [docs/guides/write-refusals.md#file_too_large](../../docs/guides/write-ref
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| Sync held one file because it is not a readable regular file inside the source root (a symlink, a non-regular file or a permission error); the rest of the source synced. | Sync reads only regular files inside the source root and never follows a symlink, which can point anywhere on the host. The file waits in the hold store instead of failing the run, so it never blocks the source, and classic sync re-screens it on every run. | Replace the symlink with the regular file (or delete it), make the file readable to the account gbrain runs as, or leave it out with sync.exclude; the next gbrain sync --source <source> --no-pull re-screens it. | agent | `repeat the read that failed` | 1 | no |
+| Sync held one file because it is not a readable regular file inside the source root (a symlink, a non-regular file or a permission error); the rest of the source synced. | Sync reads only regular files inside the source root and never follows a symlink, which can point anywhere on the host. The file waits in the hold store instead of failing the run, so it never blocks the source, and classic sync re-screens it on every run. | Replace the symlink with the regular file (or delete it), make the file readable to the account that runs gbrain, or leave it out with sync.exclude; the next gbrain sync --source <source> --no-pull re-screens it. | agent | `repeat the read that failed` | 1 | no |
 
 Reasons: `symlink_in_repo`, `symlink_outside_root`, `symlink_dangling`, `symlink_loop`, `permission_denied`, `not_regular_file`.
 
@@ -2104,7 +2186,7 @@ More: [docs/guides/git-canonical.md#approval-across-time](../../docs/guides/git-
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A git-canonical conversion stopped because its strict pass did not finish, or finished with work left after the flag was set. | The conversion runs a full strict-equivalent pass before it sets canonical: git, and one genuine strict pass after, then up to three closing strict passes while only door commits a live writer landed meanwhile are left (Git ahead of the database). A pass that ends partial, blocked or deferred stops the conversion where it is: before the flag the source stays as it was, after it the source stays strict (Git wins) and the plan lists what is left. | Wait until gbrain sync status --source <id> --json shows the source idle, then preview again with gbrain sources canonical <id> --to git --dry-run and apply the new hash. | agent | `repeat the read that failed` | 1 | yes |
+| A git-canonical conversion stopped because its strict pass did not finish, finished with work left after the flag was set, or found the flag removed (a --to mixed apply) while it ran. | The conversion runs a full strict-equivalent pass before it sets canonical: git, and one genuine strict pass after, then up to three closing strict passes while only door commits a live writer landed meanwhile are left (Git ahead of the database). A pass that ends partial, blocked or deferred stops the conversion where it is: before the flag the source stays as it was, after it the source stays strict (Git wins) and the plan lists what is left. | Wait until gbrain sync status --source <id> --json shows the source idle, then preview again with gbrain sources canonical <id> --to git --dry-run and apply the new hash. | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/designs/GIT_CANONICAL_MEMORY.md#conversion](../../docs/designs/GIT_CANONICAL_MEMORY.md#conversion)
 
@@ -2132,7 +2214,7 @@ More: [docs/guides/concurrent-writes.md#git-durability-at-activation](../../docs
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A git-canonical source would store content in the database without a file in Git; nothing was written. | On a source with canonical: git, page content reaches the database only after Git commits its file. The declared database-only classes (private, alias-private and lineage-private pages, storage.db_only directories, never-filed derive-phase pages, paths Git ignores, detached pages and origin twins) are the only exceptions. no_file_form: the write has no file and is in no declared class; declared_target: a publication would commit a file for a declared page; facts_lane: a writer with no file form yet. | Ask the user which git home to configure (a path Git tracks, or a storage.db_only directory in gbrain.yml), then submit the write again with a new request_id. | agent | `repeat the read that failed` | 1 | no |
+| A git-canonical source would store content in the database without a file in Git; nothing was written. | On a source with canonical: git, page content reaches the database only after Git commits its file. The declared database-only classes (private, alias-private and lineage-private pages, storage.db_only directories, never-filed derive-phase pages, paths Git ignores, detached pages and origin twins) are the only exceptions. no_file_form: the write has no file and is in no declared class; declared_target: a publication would commit a file for a declared page; facts_lane: a writer with no file form yet, or a fact for a page-less entity under an exact page rule, which no holding page can carry (create the page with put_page, then remember again). | Ask the user which git home to configure (a path Git tracks, or a storage.db_only directory in gbrain.yml), then submit the write again with a new request_id. | agent | `repeat the read that failed` | 1 | no |
 
 Reasons: `no_file_form`, `declared_target`, `facts_lane`.
 
@@ -2230,7 +2312,7 @@ More: [docs/guides/write-refusals.md#git_protocol_required](../../docs/guides/wr
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A strict (canonical: git) write's file changed on disk while it was being committed, so nothing was committed and the write was not published. | The door commits exactly the bytes the write published, and checks the file's hash against them before and after Git stores it. An edit landing in between would otherwise be committed while the database records other content; recovery leaves the changed file as it is. | When the file holds neither the write's bytes nor the version before it, the write is held in recovery (blocked reason unexpected_file_bytes) and the source's later writes wait behind it; when it holds the version before the write, nothing is held and the write failed, so read the page before resubmitting it with a new request_id. To resolve a held write, preview with gbrain repair stuck-recovery --source <id> --json, ask the user which version to keep, then run gbrain repair stuck-recovery --source <id> --keep disk\|prior --apply --expect <preview_hash> --yes (disk keeps the edit). Run: gbrain sources writer status --json | user | `repeat the read that failed` | 1 | no |
+| A strict (canonical: git) write's file changed on disk while it was being committed, so nothing was committed and the write was not published. | The door commits exactly the bytes the write published, and checks the file's hash against them before and after Git stores it. An edit landing in between would otherwise be committed while the database records other content; recovery leaves the changed file as it is. | When the file holds neither the write's bytes nor the version before it, the write is held in recovery (blocked reason unexpected_file_bytes) and the source's later writes wait behind it; when it holds the version before the write, nothing is held and the write failed; when it holds the write's own bytes again by the time recovery runs, recovery restores the version before the write and the write failed, with nothing held. After a failure, read the page before resubmitting it with a new request_id. To resolve a held write, preview with gbrain repair stuck-recovery --source <id> --json, ask the user which version to keep, then run gbrain repair stuck-recovery --source <id> --keep disk\|prior --apply --expect <preview_hash> --yes (disk keeps the edit). Run: gbrain sources writer status --json | user | `repeat the read that failed` | 1 | no |
 
 ### git_target_ignored
 
@@ -2842,6 +2924,18 @@ More: [docs/guides/sync-unblock-runbook.md#decision-table](../../docs/guides/syn
 
 More: [docs/guides/repair.md#known-as-of-unproven](../../docs/guides/repair.md#known-as-of-unproven)
 
+### label_edit_refused
+
+<a id="label_edit_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A label-only repair left a page unchanged because its file holds the page but cannot take the label edit line by line. | Operator label repairs (gbrain repair visibility, gbrain repair private-labels) change only the label lines of a page's file and never re-render it, so a person's formatting, key order and comments survive. A label line with a block or multi-line value or a duplicate key, a file with no frontmatter block, or a file that still differs from the page once its label lines are edited (a frontmatter key, the title, the type, the tags or the body; never a stamp gbrain keeps only in the database) cannot be edited that way. The repair counts the page as declined, writes nothing, and the next preview lists it as held with what blocks it. | Make the field the refusal names in the page's file match the page, or write the label line as one plain line, commit it, run gbrain sync for the source, then preview the repair again. | agent | `repeat the read that failed` | 1 | no |
+
+Reasons: `file_differs`, `label_line`.
+
+More: [docs/guides/write-refusals.md#label_edit_refused](../../docs/guides/write-refusals.md#label_edit_refused)
+
 ### legacy_job_selection_invalid
 
 <a id="legacy_job_selection_invalid"></a>
@@ -2952,6 +3046,14 @@ More: [docs/guides/open-loops.md#two-detectors](../../docs/guides/open-loops.md#
 
 More: [docs/guides/write-refusals.md#maintenance_backpressure](../../docs/guides/write-refusals.md#maintenance_backpressure)
 
+### maintenance_disabled
+
+<a id="maintenance_disabled"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Free unattended upkeep is off on this brain (maintenance.auto is false), so nothing ran. | The person turned upkeep off; doctor reads it as off, not stale. | Turn it back on with gbrain config set maintenance.auto true. | agent | `repeat the read that failed` | 0 | no |
+
 ### maintenance_lock_busy
 
 <a id="maintenance_lock_busy"></a>
@@ -2961,6 +3063,14 @@ More: [docs/guides/write-refusals.md#maintenance_backpressure](../../docs/guides
 | A source-scoped dream cycle skipped its brain-wide phases because another cycle (usually autopilot maintenance) holds the shared gbrain-cycle lease; its source phases still ran. | Brain-wide phases (synthesize, patterns, embed, purge and the other mixed or global phases) must not run twice at once, so a cycle that cannot take gbrain-cycle runs only the phases its own source lease covers. | Nothing is lost: the holder runs those phases itself. To run one now, wait until the lease is released, then re-run `gbrain dream --phase <phase>` (LLM-backed phases spend; ask the user first). Run: gbrain status --section locks --json | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/guides/cron-schedule.md#dream-beside-autopilot](../../docs/guides/cron-schedule.md#dream-beside-autopilot)
+
+### maintenance_owned_by_autopilot
+
+<a id="maintenance_owned_by_autopilot"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| An autopilot keeps this brain maintained (its brain-wide pass stamped autopilot.last_global_at within 48 hours), so free upkeep did nothing. | One owner per brain: the autopilot already runs the free phases and more, on any host sharing the database. | Nothing to do; gbrain autopilot --status shows the daemon. | agent | `repeat the read that failed` | 0 | no |
 
 ### managed_failure_unsettled
 
@@ -3145,6 +3255,16 @@ Reasons: `not_applied`, `still_behind`, `schema_unreadable`, `wedged`, `schema_b
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | A configured model is not allowed under models strict mode. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### moved_pages_mass_fold_refused
+
+<a id="moved_pages_mass_fold_refused"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| gbrain repair moved-pages refused to fold moved pages amounting to more than half of a source's file-backed pages; nothing was changed. | The sync mass-delete valve (#2828) applied to moved pages (GST-2584): that many moved pages at once almost always means a re-import under other paths or the wrong checkout, not a backlog. | Check the source and its checkout first. If folding these pages is genuinely intended, ask the user, then rerun the same apply command with GBRAIN_ALLOW_MASS_RECONCILE=1. | user | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/repair.md#moved-pages](../../docs/guides/repair.md#moved-pages)
 
 ### movement_unknown
 
@@ -4058,7 +4178,7 @@ More: [docs/guides/repair.md#recovery-prior-stage-unavailable](../../docs/guides
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| An earlier write left state that must be inspected and recovered before new writes. | Details name the exit when there is one: physical_root_device_changed (the checkout's filesystem device number changed; re-stamped by itself when ownership verifies) and physical_root_directory_changed (the directory at the recorded path was recreated, or its birth time drifted beyond 1 µs; the relocated-root self-transfer, `transfer prepare/accept <source> --self-transfer --confirm-relocated-root`, re-stamps it). Both are explained in docs/guides/write-refusals.md. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
+| An earlier write left state that must be inspected and recovered before new writes. | Details name the exit when there is one: physical_root_device_changed (the checkout's filesystem device number changed; re-stamped by itself when ownership verifies) and physical_root_directory_changed (the directory at the recorded path was recreated, or its birth time drifted beyond 1 µs; the relocated-root self-transfer, `transfer prepare/accept <source> --self-transfer --confirm-relocated-root`, re-stamps it) and physical_root_moved (the checkout was moved to a new path or its parent folder renamed; `sources add`, `set-path` and `writer claim`, dry runs included, name the recorded path and the symlink-then-set-path or move-back exit, and a remote caller sees no path). All three are explained in docs/guides/write-refusals.md. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
 
 ### recovery_version_unsupported
 
@@ -4281,6 +4401,28 @@ More: [docs/guides/troubleshooting.md#repair-preview-timeout](../../docs/guides/
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The request exceeds a configured capacity; narrow it. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### requester_scope_required
+
+<a id="requester_scope_required"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A remote read came from a connection bound to no member (an access token, an OAuth client or a local stdio server) on a brain that serves several people (two or more enabled members, or config access.serves = several), so it was refused before any work and nothing was read. | On a brain that serves several people a connection bound to nobody reads every page no rule restricts, for whoever is asking; gbrain refuses rather than guess whose notes a read is for. A connection that existed when the brain started serving several people gets 14 days of in-band notices first (reason grace_ended); one created after that is refused at once (created_after). | On the brain host, bind the connection to the person it serves: gbrain auth rescope --token <name>\|--client <id> --member <id> (preview with gbrain access check --token <name>); for a stdio server, when only one person uses that harness, gbrain setup claude-code --stdio-member <id> (gbrain setup codex --stdio-member <id> on Codex), which binds that one harness entry on that machine (refused where OpenClaw or Hermes is installed); for a harness several people talk to, give each person a key over HTTP instead (gbrain serve --http with gbrain auth create <name> --member <id> keys). A shared agent lists whom it may act for (--may-act-for) and names the person on each call. Last resort: --reads-unscoped --yes lets that one credential read every page no rule restricts for any asker. | user | `gbrain doctor --json` | 1 | no |
+
+Reasons: `grace_ended`, `created_after`, `since_unknown`.
+
+More: [docs/guides/write-refusals.md#requester_scope_required](../../docs/guides/write-refusals.md#requester_scope_required)
+
+### requester_scope_unknown
+
+<a id="requester_scope_unknown"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A remote read came from a connection bound to no member, and the brain's settings (whether it serves one person or several) could not be read: the config read failed, and so did one re-read. The call was not answered and nothing was read; this is not an access decision, and the same call can succeed once the database answers. | A statement timeout, a lock wait or a dropped pooled connection can fail one config read while the next read succeeds. Reading that as a one-person brain would let a connection bound to nobody read every page no rule restricts on a brain that may serve several people, so gbrain refuses until it can tell. | Retry the same call in a few seconds. If it keeps failing, the brain host's operator checks the database with gbrain doctor --json. A connection bound to a member is never refused this way. | provider | `repeat the read that failed` | 1 | yes |
+
+More: [docs/guides/write-refusals.md#requester_scope_unknown](../../docs/guides/write-refusals.md#requester_scope_unknown)
 
 ### requirements_changed
 
@@ -4802,7 +4944,7 @@ More: [docs/guides/skill-resolver.md#skill_resolver_config_unreadable](../../doc
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| OpenClaw lists fewer skills than the agent's skill directories hold, so some suggestions name skills OpenClaw dropped at load (skills.limits.maxCandidatesPerRoot) and skills_read cannot open them. | The request itself was wrong or no longer matches the brain; nothing was changed. | Raise skills.limits.maxCandidatesPerRoot in openclaw.json, or split the skill root. | agent | `repeat the read that failed` | 1 | no |
+| OpenClaw does not list some skills in the agent's skill directories (dropped at load by skills.limits.maxCandidatesPerRoot), so setup leaves them out of the agent's suggestions. | The request itself was wrong or no longer matches the brain; nothing was changed. | Raise skills.limits.maxCandidatesPerRoot in openclaw.json, or split the skill root, then run setup again. | agent | `repeat the read that failed` | 1 | no |
 
 More: [docs/guides/skill-resolver.md#skill_resolver_host_load_cut](../../docs/guides/skill-resolver.md#skill_resolver_host_load_cut)
 
@@ -4974,6 +5116,66 @@ More: [docs/guides/skill-resolver.md#skill_source_unreadable](../../docs/guides/
 
 More: [docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover](../../docs/guides/shared-brain-skills.md#troubleshoot-leave-and-recover)
 
+### skillpack_backup_corrupt
+
+<a id="skillpack_backup_corrupt"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A skillpack update backup does not hash to the journal's pre-update hash, so restore will not write it. | Restore only writes bytes it can prove are the file's pre-update content. Side effects: files restored before this one stay restored; this file and the rest are untouched. | Leave the file as it is, or compare it with gbrain skillpack reference <skill> and edit it by hand. Run: gbrain skillpack restore --list --json | agent | `gbrain doctor --json` | 2 | no |
+
+More: [docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills](../../docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills)
+
+### skillpack_journal_not_found
+
+<a id="skillpack_journal_not_found"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| No skillpack update backup has that id. | Backups live under ~/.gbrain/skillpack-backups/<id>/ and are kept 30 days or the newest 10. Side effects: none. | List the backups with gbrain skillpack restore --list. Run: gbrain skillpack restore --list --json | agent | `repeat the read that failed` | 2 | no |
+
+More: [docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills](../../docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills)
+
+### skillpack_restore_conflict
+
+<a id="skillpack_restore_conflict"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A file changed after the skillpack update it would restore, so restore refused. | Restore never overwrites an edit made after the update. Side effects: nothing was restored (a file that changes mid-restore stops the run; files already restored stay restored and a rerun is a no-op for them). | Keep the later edit and restore the rest: gbrain skillpack restore <id> --skip <file>. Run: gbrain skillpack restore --list --json | agent | `repeat the read that failed` | 2 | no |
+
+More: [docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills](../../docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills)
+
+### skillpack_state_locked
+
+<a id="skillpack_state_locked"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Another gbrain skillpack command holds the lock on ~/.gbrain/skillpack-state.json. | Scaffold, update, pin and restore read-modify-write the state file one at a time. Side effects: nothing was written by this command. A lock left by a crash is reclaimed after 10 minutes. | Wait for the other command to finish and run this one again. Run: gbrain skillpack restore --list --json | agent | `repeat the read that failed` | 2 | yes |
+
+More: [docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills](../../docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills)
+
+### skillpack_update_incomplete
+
+<a id="skillpack_update_incomplete"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| An earlier skillpack update of this skills root did not finish (a crash left its journal pending), so no new update runs. | Some files of the interrupted skill may hold the new version and others the old. Side effects: nothing was changed by this run; --dry-run still previews. | Run gbrain skillpack restore <id> (named in the message), then update again. Run: gbrain doctor --only skillpack_update_incomplete --json | agent | `repeat the read that failed` | 2 | no |
+
+More: [docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills](../../docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills)
+
+### skillpack_workspace_locked
+
+<a id="skillpack_workspace_locked"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Another gbrain skillpack command holds this workspace's writer lock (.gbrain-skillpack.lock). | One writer per skills root keeps an update and a restore from interleaving. Side effects: nothing was written. A lock left by a crash is reclaimed after 10 minutes. | Wait for the other command to finish and run this one again. Run: gbrain skillpack restore --list --json | agent | `repeat the read that failed` | 2 | yes |
+
+More: [docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills](../../docs/guides/skillpacks-as-scaffolding.md#updating-installed-skills)
+
 ### slug_page_mismatch
 
 <a id="slug_page_mismatch"></a>
@@ -5032,6 +5234,14 @@ More: [docs/guides/write-refusals.md#slug_page_mismatch](../../docs/guides/write
 |---|---|---|---|---|---|---|
 | A committed source and approved schema are required. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### source_pages_remain
+
+<a id="source_pages_remain"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A source delete did not cascade to the source's pages, so it was rolled back and the source and its pages are unchanged. | Every source delete relies on the pages -> sources ON DELETE CASCADE foreign key; without it the pages would stay live with no sources row, where no write, export or per-source audit can reach them (#7072). | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
+
 ### source_profile_no_backfill
 
 <a id="source_profile_no_backfill"></a>
@@ -5064,6 +5274,16 @@ More: [docs/guides/write-refusals.md#slug_page_mismatch](../../docs/guides/write
 |---|---|---|---|---|---|---|
 | Multiple active sources alias this canonical skill root; resolve ownership before publishing. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### source_root_unreadable
+
+<a id="source_root_unreadable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The source's registered root on its owner host cannot be read as a directory (gone, unmounted, not a directory, no permission or a symlink loop), so `gbrain sources canonical` planned and wrote nothing. | Converting a source reads its whole checkout; a root that cannot be listed would otherwise surface as a raw filesystem or Git error, or as a missing-checkout refusal whose fix creates an empty repository there. | Restore or remount the directory on the brain host (or make it readable to the account that runs gbrain), compare it with the root gbrain sources writer status --source <source> --json names, then preview again. | host_admin | `gbrain doctor --json` | 1 | no |
+
+Reasons: `missing`, `not_directory`, `permission_denied`, `symlink_loop`, `unreadable`.
+
 ### source_writeback_required
 
 <a id="source_writeback_required"></a>
@@ -5078,7 +5298,7 @@ More: [docs/guides/write-refusals.md#slug_page_mismatch](../../docs/guides/write
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| An unscoped search, query, recall or list_pages came back empty and was refused: every source this connection can read (the default source and federated sources) holds no page (for recall and query, no world fact either), while other sources on the brain hold pages it cannot read (not federated, and no source grant). | Answering would return an empty result that reads like a clean miss. The refusal names the host command that federates a source or grants this connection the sources it should read; it never names a hidden source and never widens access. A scope that holds pages but matched nothing, a granted token, an OAuth client, a bound connection and a read that names a source are never refused. | Ask the user which source these connections should read; the brain host runs `gbrain sources federate <source>`, or grants the token its sources with `gbrain auth rescope --token <name> --sources <ids>`. | host_admin | `gbrain doctor --json` | 1 | no |
+| An unscoped search, query, recall or list_pages came back empty and was refused: every source this connection can read (the default source and federated sources) holds no page search returns (for recall and query, no active world fact either), while other sources on the brain hold such pages it cannot read (not federated, and no source grant). | Answering would return an empty result that reads like a clean miss. The check is one yes/no about the whole brain, independent of the query: whether another source holds pages; it never says another source matches the question. Quarantined pages count on neither side, nor private pages when remote reads exclude them. The refusal names the host command that federates a source or grants this connection the sources it should read; it never names a hidden source and never widens access. A scope that holds pages but matched nothing, a granted token, an OAuth client, a bound connection and a read that names a source are never refused. | Ask the user which source these connections should read; the brain host runs `gbrain sources federate <source>`, or grants the token its sources with `gbrain auth rescope --token <name> --sources <ids>`. | host_admin | `gbrain doctor --json` | 1 | no |
 
 More: [docs/guides/multi-source-brains.md#an-unscoped-connection-whose-sources-hold-no-pages](../../docs/guides/multi-source-brains.md#an-unscoped-connection-whose-sources-hold-no-pages)
 
@@ -5295,6 +5515,16 @@ Reasons: `checkout_missing`, `content_directory`, `plain_directory`.
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | A sync pass's checkpoint did not publish because the pass that admitted it no longer holds the source (it ended, or another pass started); the next pass stamps its own checkpoint. | A pass's checkpoint is bound to its drain lease and pass row, so it can never publish after that pass ends. Its receipt is a conflict that records no managed-sync failure and reads superseded in gbrain sources writer failures; a pass that stops with the checkpoint still pending reports disposition superseded instead of a request to resume. | Nothing to repair or resubmit: the pages the pass committed stand. Let the next sync pass run (gbrain sync --source <id> --no-pull), and read gbrain sync status --source <id> --json to confirm the source converges. | agent | `repeat the read that failed` | 1 | no |
+
+### tag_too_long
+
+<a id="tag_too_long"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A page's tag is longer than the 2688 bytes a tag can be, so nothing was written (sync holds the file). | Tags are stored in a btree index whose entries are at most 2704 bytes; a longer tag would fail the database insert (error 54000) and report a storage failure instead of naming the tag (#7052). The message names the tag's position and size, never its text. | Shorten that tag or split it into shorter tags, then write the page again (for a file: edit it, commit and sync). | agent | `repeat the read that failed` | 1 | no |
+
+More: [docs/guides/write-refusals.md#tag_too_long](../../docs/guides/write-refusals.md#tag_too_long)
 
 ### tail_changed
 

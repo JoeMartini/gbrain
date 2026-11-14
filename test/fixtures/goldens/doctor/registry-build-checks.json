@@ -38,6 +38,18 @@
         "name": "skill_preconditions"
       },
       {
+        "category": "skill",
+        "name": "skill_health"
+      },
+      {
+        "category": "skill",
+        "name": "skillpack_update_incomplete"
+      },
+      {
+        "category": "skill",
+        "name": "skillpack_backups"
+      },
+      {
         "category": "ops",
         "name": "plugin_lane_collision"
       },
@@ -395,6 +407,14 @@
       },
       {
         "category": "brain",
+        "name": "unscoped_shared_reads"
+      },
+      {
+        "category": "brain",
+        "name": "shared_stdio_binding"
+      },
+      {
+        "category": "brain",
         "name": "access_may_act_for_wildcard"
       },
       {
@@ -448,6 +468,10 @@
       {
         "category": "meta",
         "name": "schema_missing_tables"
+      },
+      {
+        "category": "meta",
+        "name": "schema_function_bodies"
       },
       {
         "category": "ops",
@@ -600,6 +624,14 @@
       {
         "category": "brain",
         "name": "unbound_source"
+      },
+      {
+        "category": "ops",
+        "name": "dream_write_deferred"
+      },
+      {
+        "category": "ops",
+        "name": "embedding_restamp_stalled"
       },
       {
         "category": "ops",
@@ -823,6 +855,10 @@
       },
       {
         "category": "ops",
+        "name": "unattended_maintenance"
+      },
+      {
+        "category": "ops",
         "name": "embed_backfill_stalled"
       },
       {
@@ -852,6 +888,10 @@
       {
         "category": "ops",
         "name": "grant_new_ops_available"
+      },
+      {
+        "category": "ops",
+        "name": "unscoped_multi_user_token"
       },
       {
         "category": "ops",
@@ -1047,6 +1087,10 @@
       },
       {
         "category": "ops",
+        "name": "session_lane_budget"
+      },
+      {
+        "category": "ops",
         "name": "runtime_build_skew"
       },
       {
@@ -1154,12 +1198,20 @@
         "name": "embedding_plane_disagreement"
       },
       {
+        "category": "ops",
+        "name": "mcp_request_log_retention"
+      },
+      {
         "category": "brain",
         "name": "fence_integrity"
       },
       {
         "category": "ops",
         "name": "search_mode"
+      },
+      {
+        "category": "brain",
+        "name": "synopsis_tier_coverage"
       },
       {
         "category": "brain",

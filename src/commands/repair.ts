@@ -87,7 +87,7 @@ export const REPAIR_HELP = `Usage: gbrain repair [<kind>] [--apply] [--source <i
        gbrain repair file-drift --source <id> (--slug <slug>... | --request <id>... | --all-drifted [--class <name>] [--since <ISO-8601|7d>]
                                 | --held [--side both|unknown|deleted [--state tombstone_edited|purged_differs|file_gone
                                          [--provenance never_committed|deleted_by_commit|deletion_uncommitted]]] [--cursor <next_cursor>])
-                                [--only <glob>]... [--skip <glob>]... --prefer file|database [--apply --expect <preview-hash>] [--json]
+                                [--only <glob>]... [--skip <glob>]... [--prefer file|database [--apply --expect <preview-hash>]] [--json]
        gbrain repair stuck-recovery [--source <id>] [--request-id <uuid>]
                                     [--keep prior|disk|withdrawn --apply --expect <preview-hash> --yes] [--json]
        gbrain repair ghost-pages --source <id> [--apply --expect <preview-hash> --yes] [--json]
@@ -158,7 +158,8 @@ Options:
   --prefer file|database, --request <id>, --all-drifted, --class <name>
                  file-drift: the side that wins; select conflict receipts by request id (repeatable), or every page
                  still drifted (refused across mixed drift classes unless --class keeps one). --keep is refused here:
-                 --prefer database keeps the database copy, --prefer file keeps the file.
+                 --prefer database keeps the database copy, --prefer file keeps the file. A selection without --prefer
+                 compares each page with its file, names the newer side and the next step, and writes nothing.
   --held [--side both|unknown|deleted] [--state tombstone_edited|purged_differs|file_gone]
                  file-drift: select the source's held file_drift pages of one Decision. --side deleted needs --state,
                  because --prefer file and --prefer database do opposite things in each state (tombstone_edited: restore
@@ -226,7 +227,7 @@ const VALUE_FLAGS = new Set(['--readers', '--slugs-file', '--rules', '--source',
 const KIND_FLAGS: Record<string, readonly string[]> = {
   '--only': ['frontmatter', 'fences', 'slug-conflicts', 'file-drift', CONTENT_LANE], '--skip': ['frontmatter', 'fences', 'slug-conflicts', 'file-drift', CONTENT_LANE], '--diff': ['frontmatter', 'fences', 'slug-conflicts', CONTENT_LANE], '--yes': ['frontmatter', 'conversation-labels', 'stuck-recovery', 'ghost-pages', 'legacy-twins', 'rename-identity', 'url-clone-fences'],
   '--include-cross-entity': ['duplicate-facts'],
-  '--slug': ['fences', 'file-drift', 'rename-identity', 'overwritten-edits', 'origin-twins', 'timeline-order', 'contact-rows', 'provenance', 'secret-spans', 'segmented-tiling', 'visibility'], '--from': ['rename-identity'], '--close': ['rename-identity'], '--prefer': ['file-drift'], '--request': ['file-drift'], '--all-drifted': ['file-drift'], '--class': ['file-drift', 'visibility', 'private-labels'], '--since': ['file-drift', 'generations'],
+  '--slug': ['fences', 'file-drift', 'rename-identity', 'overwritten-edits', 'origin-twins', 'moved-pages', 'timeline-order', 'contact-rows', 'provenance', 'secret-spans', 'segmented-tiling', 'visibility'], '--from': ['rename-identity'], '--close': ['rename-identity'], '--prefer': ['file-drift'], '--request': ['file-drift'], '--all-drifted': ['file-drift'], '--class': ['file-drift', 'visibility', 'private-labels'], '--since': ['file-drift', 'generations'],
   '--held': ['file-drift', 'generations'], '--side': ['file-drift'], '--state': ['file-drift'], '--cursor': ['file-drift'], '--provenance': ['file-drift'],
   '--keep': ['stuck-recovery'], '--request-id': ['stuck-recovery'],
   '--older-than': ['receipt-compaction'], '--include-failures': ['receipt-compaction'], '--force': ['receipt-compaction'],
@@ -545,7 +546,7 @@ export async function runRepairCommand(engine: BrainEngine, args: string[]): Pro
       ...(olderThan ? ['--older-than', olderThan] : []), ...(includeFailures ? ['--include-failures'] : []), ...(force ? ['--force'] : []),
       ...(afterPage !== undefined ? ['--after', String(afterPage)] : []), ...(day ? ['--day', day] : []),
       ...(kind === 'rename-identity' ? [...slugs.flatMap(slug => ['--slug', slug]), ...(from ? ['--from', from] : []), ...(close ? ['--close'] : [])] : []),
-      ...(kind === 'origin-twins' || kind === 'timeline-order' || kind === 'contact-rows' || kind === 'provenance' ? slugs.flatMap(slug => ['--slug', slug]) : []),
+      ...(kind === 'origin-twins' || kind === 'moved-pages' || kind === 'timeline-order' || kind === 'contact-rows' || kind === 'provenance' ? slugs.flatMap(slug => ['--slug', slug]) : []),
       ...(generations ? generationsSelectionArgv(generations) : []),
       ...(kind === 'agent-session-facts' ? agentSessionFlagArgs({ cwdPrefixes, sessions, principal }) : []),
       ...(kind === 'file-drift' ? [...slugs.flatMap(slug => ['--slug', slug]), ...requests.flatMap(id => ['--request', id]), ...(allDrifted ? ['--all-drifted'] : []),
