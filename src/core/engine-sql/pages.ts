@@ -28,6 +28,7 @@ import { quarantineFilterFragment } from '../quarantine.ts';
 import { rederiveHiddenSql } from '../eligibility/sql.ts';
 import { validateSlug, contentHash, isBlankBody, rowToPage, rowToStalePage, isMissingSchemaObject, warnOncePerProcess } from '../utils.ts';
 import { DELETE_BATCH_SIZE } from '../engine-constants.ts';
+import { derivedOriginPurgeHold } from '../persistence/derived-origin-hold.ts';
 import { jsonbParam, type SqlExecutor } from './executor.ts';
 import type { LegacyUnscopedRead, ScopedRead } from './brands.ts';
 import type { ScopedReadRunner } from './cjk-search.ts';
@@ -42,7 +43,9 @@ import { quoteIdentifier, resolveWriteColumnFromConfigRows } from '../search/emb
 import { pickCanonicalOrigin } from '../persistence/origin-guard.ts';
 import { scrubPurgedSlugs } from '../feedback/store.ts';
 import { scrubPurgedNameStores } from '../persistence/purge-name-stores.ts';
+import { scrubPurgedSlugHolds, scrubPurgedSlugStores } from '../persistence/purge-slug-stores.ts';
 import { expireGonePageFacts } from '../facts/gone-page-facts.ts';
+import { guestSourceExclusionSql } from '../guests/derived.ts';
 
 /**
  * PGLite can return zero rows from `INSERT ... ON CONFLICT DO UPDATE ...
@@ -211,7 +214,8 @@ export async function deletePage(exec: SqlExecutor, slug: string, opts?: { sourc
  * RETURNING slug projects the actually-deleted set so the caller can filter
  * pagesAffected. #9068: the rows that name a deleted page outside any foreign
  * key (retrieval logs and ratings, the volunteer log, the gazetteer, captured
- * eval slugs) go in the same transaction, after the page row: a feedback write
+ * eval slugs; #9146: the slug-keyed stores and the slug's write-gate holds) go
+ * in the same transaction, after the page row: a feedback write
  * holding the row commits first and is scrubbed, and a later one finds no page.
  */
 export async function deletePages(exec: SqlExecutor, slugs: string[], opts: { sourceId: string }): Promise<string[]> {
@@ -230,6 +234,8 @@ export async function deletePages(exec: SqlExecutor, slugs: string[], opts: { so
       const deleted = rows.map(r => r.slug);
       await scrubPurgedSlugs(tx, opts.sourceId, deleted);
       await scrubPurgedNameStores(tx, opts.sourceId, deleted);
+      await scrubPurgedSlugStores(tx, opts.sourceId, deleted);
+      await scrubPurgedSlugHolds(tx, opts.sourceId, deleted.map(slug => ({ slug })));
       return deleted;
     });
   }
@@ -337,7 +343,8 @@ export async function purgeDeletedPages(
           AND NOT EXISTS (SELECT 1 FROM op_checkpoints dg WHERE dg.op = 'sync-identity-downgrade' AND dg.fingerprint = pages.id::text
             AND dg.completed_keys->0->>'disposition' IS NULL AND pages.deleted_at = (dg.completed_keys->0->>'old_deleted_at')::timestamptz)
           AND ${trustedSql(atomRetirementPurgeHold('pages'))}
-          AND ${trustedSql(derivedRetirementPurgeHold('pages'))}${excluded}
+          AND ${trustedSql(derivedRetirementPurgeHold('pages'))}
+          AND ${trustedSql(derivedOriginPurgeHold('pages'))}${excluded}
         ORDER BY deleted_at ASC, slug ASC
       `);
       const pages = rows.map((r) => ({
@@ -352,7 +359,7 @@ export async function purgeDeletedPages(
       const { rows: texts } = await tx.run<{ source_id: string; sha: string }>(sqlFragment`
         SELECT DISTINCT m.source_id, encode(m.sha256, 'hex') AS sha FROM page_body_manifest m JOIN pages p ON p.id = m.page_id
         WHERE p.deleted_at IS NOT NULL AND p.deleted_at < now() - (${hours} || ' hours')::interval${excludedManifest}`);
-      const { rows } = await tx.run<{ slug: string; source_id: string }>(sqlFragment`
+      const { rows } = await tx.run<{ slug: string; source_id: string; deleted_at: string }>(sqlFragment`
         DELETE FROM pages
         WHERE deleted_at IS NOT NULL
           AND deleted_at < now() - (${hours} || ' hours')::interval
@@ -362,8 +369,10 @@ export async function purgeDeletedPages(
           -- #7013: a restorable re-extraction retirement waits out its hold (atomRetirementPurgeHold).
           AND ${trustedSql(atomRetirementPurgeHold('pages'))}
           -- GBRA-161: every derived retirement waits out its hold (derivedRetirementPurgeHold).
-          AND ${trustedSql(derivedRetirementPurgeHold('pages'))}${excluded}
-        RETURNING slug, source_id
+          AND ${trustedSql(derivedRetirementPurgeHold('pages'))}
+          -- GST-2689: an origin whose derived pages could not be labelled private stays parked (derivedOriginPurgeHold).
+          AND ${trustedSql(derivedOriginPurgeHold('pages'))}${excluded}
+        RETURNING slug, source_id, deleted_at::text AS deleted_at
       `);
       await expireGonePageFacts(tx, rows);
       if (rows.length) await tx.run(sqlFragment`DELETE FROM page_body_stagings s USING unnest(${rows.map(r => r.source_id)}::text[], ${rows.map(r => r.slug)}::text[]) AS d(source_id, slug)
@@ -373,11 +382,14 @@ export async function purgeDeletedPages(
         WHERE t.source_id = d.source_id AND t.sha256 = decode(d.sha, 'hex')
           AND NOT EXISTS (SELECT 1 FROM page_body_manifest m WHERE m.source_id = t.source_id AND m.sha256 = t.sha256)
           AND NOT ${trustedSql(stagingNeedsTextSql('t'))}`);
-      const bySource = new Map<string, string[]>();
-      for (const r of rows) bySource.set(r.source_id, [...bySource.get(r.source_id) ?? [], r.slug]);
+      const bySource = new Map<string, Array<{ slug: string; deletedAt: string }>>();
+      for (const r of rows) bySource.set(r.source_id, [...bySource.get(r.source_id) ?? [], { slug: r.slug, deletedAt: r.deleted_at }]);
       for (const [sourceId, purged] of bySource) {
-        await scrubPurgedSlugs(tx, sourceId, purged);
-        await scrubPurgedNameStores(tx, sourceId, purged);
+        const slugs = purged.map(p => p.slug);
+        await scrubPurgedSlugs(tx, sourceId, slugs);
+        await scrubPurgedNameStores(tx, sourceId, slugs);
+        await scrubPurgedSlugStores(tx, sourceId, slugs);
+        await scrubPurgedSlugHolds(tx, sourceId, purged);
       }
       const slugs = rows.map((r) => r.slug);
       return { slugs, count: slugs.length };
@@ -797,7 +809,7 @@ function linkExtractionHeld(versionTs?: string) {
   return sqlFragment`COALESCE(links_extract_failure->>'state' = 'held' AND links_extract_failure->>'revision' = knowledge_revision::text${generation}, false)`;
 }
 
-type StaleOpts = { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only'; wantedProducers?: readonly string[] };
+type StaleOpts = { sourceId?: string; versionTs?: string; attendance?: 'exclude' | 'blocked'; held?: 'exclude' | 'only'; wantedProducers?: readonly string[]; guests?: boolean };
 
 /**
  * Shared stale-for-extraction predicate. `attendance` narrows it by the #5761
@@ -817,8 +829,10 @@ function stalePagesWhere(opts?: StaleOpts) {
     : opts?.attendance === 'blocked' ? sqlFragment` AND links_attendance_blocked_revision = knowledge_revision` : sqlFragment``;
   const held = opts?.held === 'exclude' ? sqlFragment` AND NOT ${linkExtractionHeld(opts.versionTs)}`
     : opts?.held === 'only' ? sqlFragment` AND ${linkExtractionHeld(opts.versionTs)}` : sqlFragment``;
+  // GBRA-504: a guest page is never extracted (guests/derived.ts), so it is never stale; `guests: false` is the shape before the guest-notes migration.
+  const guests = opts?.guests === false ? sqlFragment`` : sqlFragment` AND ${trustedSql(guestSourceExclusionSql('extract', 'pages'))}`;
   // A quarantined page is hidden from search; it is neither re-extracted nor counted as stale.
-  return sqlFragment`deleted_at IS NULL AND ${trustedSql(quarantineFilterFragment('pages'))} AND ${version}${source}${attendance}${held}`;
+  return sqlFragment`deleted_at IS NULL AND ${trustedSql(quarantineFilterFragment('pages'))} AND ${version}${source}${attendance}${held}${guests}`;
 }
 
 /** The pages (unaliased `pages` rows) link extraction still owes work: stale, not attendance-blocked, not held (rank_entities' remote coverage). */
@@ -832,9 +846,9 @@ export function staleForExtractionSql(versionTs: string): SqlFragment {
  * `attendance: false` is the pre-v180 shape (no marker column: nothing is attendance-blocked). `held` (GBRA-130 A-1) also
  * excludes held pages from the stale count and counts them (`held: false` is the pre-v258 shape: nothing is held).
  */
-export function extractionLagStatement(opts: { sourceId?: string; versionTs: string; attendance: boolean; held?: boolean; wantedProducers?: readonly string[] }): { text: string; params: unknown[] } {
+export function extractionLagStatement(opts: { sourceId?: string; versionTs: string; attendance: boolean; held?: boolean; guests?: boolean; wantedProducers?: readonly string[] }): { text: string; params: unknown[] } {
   const source = opts.sourceId ? sqlFragment` AND source_id = ${opts.sourceId}` : sqlFragment``;
-  const base = { versionTs: opts.versionTs, wantedProducers: opts.wantedProducers };
+  const base = { versionTs: opts.versionTs, wantedProducers: opts.wantedProducers, guests: opts.guests };
   const stale = stalePagesWhere({ ...base, ...(opts.attendance ? { attendance: 'exclude' as const } : {}), ...(opts.held ? { held: 'exclude' as const } : {}) });
   const blocked = opts.attendance ? sqlFragment`count(*) FILTER (WHERE ${stalePagesWhere({ ...base, attendance: 'blocked' })})::int` : sqlFragment`0`;
   const held = opts.held ? sqlFragment`count(*) FILTER (WHERE ${stalePagesWhere({ ...base, held: 'only' })})::int` : sqlFragment`0`;
@@ -845,7 +859,7 @@ export function extractionLagStatement(opts: { sourceId?: string; versionTs: str
 /** GBRA-130 A-1: up to `limit` held pages with their failure code, oldest page first, for doctor's message. */
 export function heldLinkExtractionStatement(opts: { sourceId?: string; versionTs: string; limit: number }): { text: string; params: unknown[] } {
   return renderFragment(sqlFragment`SELECT slug, source_id, links_extract_failure->>'code' AS code FROM pages
-    WHERE ${stalePagesWhere({ sourceId: opts.sourceId, versionTs: opts.versionTs, held: 'only' })} ORDER BY id LIMIT ${opts.limit}`);
+    WHERE ${stalePagesWhere({ sourceId: opts.sourceId, versionTs: opts.versionTs, held: 'only', guests: false })} ORDER BY id LIMIT ${opts.limit}`);
 }
 
 export async function countStalePagesForExtraction(exec: ScopedRead, opts?: StaleOpts): Promise<number> {

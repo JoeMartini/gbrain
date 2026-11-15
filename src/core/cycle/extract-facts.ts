@@ -801,24 +801,17 @@ async function pendingLegacyRows(engine: BrainEngine, sourceId: string): Promise
   return new Map(legacy.map(row => [row.entity_slug, parseInt(row.n ?? '0', 10)]));
 }
 
+/** Pages between macrotask yields in the reconcile walk (about 10 ms of work on PGLite). */
+const FACTS_WALK_YIELD_EVERY = 50;
+
 /**
  * Run the extract_facts phase against the current brain state. Returns
  * an ExtractFactsResult envelope; status mapping (ok / warn / fail)
  * happens in the cycle.ts caller.
  */
-export async function runExtractFacts(
-  engine: BrainEngine,
-  opts: ExtractFactsOpts = {},
-): Promise<ExtractFactsResult> {
-  const sourceId = opts.sourceId ?? 'default';
-  // Managed brains reconcile the same way, but each page's writes publish as
-  // a receipted database-only maintenance request. The authority is
-  // preflighted on the first page that needs a write, so a run with nothing
-  // to change never needs one; an unacceptable caller still refuses first.
-  const managed = await maintenanceCallerPreflight(engine, sourceId);
-  let authority: Promise<MaintenanceAuthority | null> | undefined;
-  const managedAuthority = () => managed ? authority ??= maintenancePreflight(engine, sourceId) : Promise.resolve(null);
-  const result: ExtractFactsResult = {
+/** A run's counters before it scans anything; a guest source's run returns them unchanged. */
+function emptyExtractFactsResult(): ExtractFactsResult {
+  return {
     pagesScanned: 0,
     pagesWithFacts: 0,
     factsInserted: 0,
@@ -839,6 +832,22 @@ export async function runExtractFacts(
     phantomsLockBusy: false,
     phantomsMorePending: false,
   };
+}
+
+export async function runExtractFacts(
+  engine: BrainEngine,
+  opts: ExtractFactsOpts = {},
+): Promise<ExtractFactsResult> {
+  const sourceId = opts.sourceId ?? 'default';
+  // Managed brains reconcile the same way, but each page's writes publish as
+  // a receipted database-only maintenance request. The authority is
+  // preflighted on the first page that needs a write, so a run with nothing
+  // to change never needs one; an unacceptable caller still refuses first.
+  const managed = await maintenanceCallerPreflight(engine, sourceId);
+  let authority: Promise<MaintenanceAuthority | null> | undefined;
+  const managedAuthority = () => managed ? authority ??= maintenancePreflight(engine, sourceId) : Promise.resolve(null);
+  const result = emptyExtractFactsResult();
+  if (await (await import('../guests/derived.ts')).skipsGuestSource(engine, 'extract_facts', sourceId)) return result;
 
   // ── Fence unfenced rows (#5299) ─────────────────────────────────
   // The inline writer's DB-only fallback keeps producing `row_num IS NULL`
@@ -1123,6 +1132,9 @@ export async function runExtractFacts(
   };
 
   for (const slug of slugs) {
+    // GBRA-438: PGLite resolves queries on a microtask chain, so a macrotask yield every FACTS_WALK_YIELD_EVERY pages lets a
+    // timer, a budget or a request (stdin) trip the abort mid-walk instead of after it.
+    if (result.pagesScanned > 0 && result.pagesScanned % FACTS_WALK_YIELD_EVERY === 0) await new Promise(r => setTimeout(r, 0));
     // #1972: bail at the top of the per-page loop on abort. Each page is an
     // independent delete-then-insert commit, so breaking leaves a consistent
     // partial state; the receipt/rollup below still runs with partial counts.

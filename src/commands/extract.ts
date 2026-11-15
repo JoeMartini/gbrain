@@ -109,6 +109,7 @@ import { isSegmentedPage, withoutBody } from '../core/page-body/page-shape.ts';
 import { extractSegmentedPageLinks } from '../core/page-body/segment-links.ts';
 import { STALE_TIME_BUDGET_MS, formatStaleCounts, staleExtractionCounts } from '../core/extraction-lag.ts';
 import { assertStaleSourceModeUnambiguous } from './extract-stale-options.ts';
+import { withoutGuestSources } from '../core/guests/derived.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -1896,12 +1897,9 @@ async function extractLinksFromDB(
   // resolve — the filter is on WHICH pages we extract FROM, not what
   // we can resolve TO.
   const readAt = await wantedReadAt(engine);
-  const allRefs = sourceIdFilter
-    ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
-    : await engine.listAllPageRefs();
-  const fullRefsForResolver = sourceIdFilter
-    ? await engine.listAllPageRefs()
-    : allRefs;
+  const listedRefs = await engine.listAllPageRefs();
+  const allRefs = await withoutGuestSources(engine, 'extract', sourceIdFilter ? listedRefs.filter(r => r.source_id === sourceIdFilter) : listedRefs, ref => ref.source_id);
+  const fullRefsForResolver = listedRefs;
   // For backward-compat checks (`allSlugs.has(...)` calls below), we still
   // need a flat slug set. ALSO a per-slug → [sources] map for F10 resolution.
   //
@@ -2141,6 +2139,7 @@ export async function extractStaleFromDB(
      */
     timeBudgetMs?: number;
     /** GBRA-130 A-1 (managed brains): clear held link-extraction failures first. */ retryHeld?: boolean;
+    /** GBRA-438: an abort (idle upkeep's budget, or a tool call) stops the sweep between batches, like timeBudgetMs. */ signal?: AbortSignal;
   },
 ): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number; skippedMissingTarget?: number; skippedCrossSource?: number; skippedAttendanceIncomplete?: number; skippedChanged?: number; skippedConcurrentWrite?: number; skippedUnknownSource?: number; mentions?: MentionPassResult;
   linkFailed?: number; linkFailures?: LinkExtractionFailure[]; linkSystemic?: LinkExtractionSystemic[] }> {
@@ -2168,7 +2167,7 @@ export async function extractStaleFromDB(
   // (the mention pass runs inside it).
   if (managed) {
     const { runManagedStaleExtraction, formatManagedStaleExtraction } = await import('../core/persistence/links-maintenance.ts');
-    const r = await runManagedStaleExtraction(engine, { sourceId: sourceIdFilter, catchUp, timeBudgetMs, counts: !opts.quiet, retryHeld: opts.retryHeld });
+    const r = await runManagedStaleExtraction(engine, { sourceId: sourceIdFilter, catchUp, timeBudgetMs, counts: !opts.quiet, retryHeld: opts.retryHeld, signal: opts.signal });
     if (!jsonMode) log(formatManagedStaleExtraction(r, false, false));
     else if (!opts.quiet) process.stdout.write(formatManagedStaleExtraction(r, false, true) + '\n');
     return { linksCreated: r.created, timelineCreated: r.timeline, pagesProcessed: r.pages, staleRemaining: r.remaining + (r.mentions?.remaining ?? 0),
@@ -2364,12 +2363,12 @@ export async function extractStaleFromDB(
     progress.tick(processedRefs.length);
     afterPageId = rows[rows.length - 1]!.id;
 
-    if (Date.now() > linkDeadline) { budgetHit = true; break; }
+    if (Date.now() > linkDeadline || opts.signal?.aborted) { budgetHit = true; break; }
   }
 
   progress.finish();
   if (packUnavailable) throw new Error('Cannot extract links: active schema pack is unavailable.');
-  const mentions = await runMentionPass(engine, { sourceId: sourceIdFilter, ...(catchUp ? {} : { deadline: startMs + timeBudgetMs }) });
+  const mentions = await runMentionPass(engine, { sourceId: sourceIdFilter, ...(catchUp ? {} : { deadline: opts.signal?.aborted ? 0 : startMs + timeBudgetMs }) });
   const staleRemaining = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs, wantedProducers }) + mentions.remaining;
   const counts = opts.quiet ? null : await staleExtractionCounts(engine, sourceIdFilter);
 

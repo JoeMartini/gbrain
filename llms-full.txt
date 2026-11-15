@@ -1007,6 +1007,7 @@ instead of the CLI (one connection, no per-call startup).
 | Save a fact the user stated | `gbrain remember "<fact>" --entity <slug> --content-origin user_said --provenance "<where>"` | `remember` |
 | Why a page didn't rank | `gbrain query "<q>" --explain-target <slug>` | `query` |
 | Which installed skill fits a request | `gbrain skills resolve --text "<request>" --json` (after `gbrain skills index build`) | none (CLI only) |
+| Find something archived to B2, Supabase or S3 | `gbrain storage-find "<phrase>"` | `storage_find` |
 
 Parse `--json` output instead of matching the text; notices go to stderr. Never
 send stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
@@ -2250,6 +2251,7 @@ instead of the CLI (one connection, no per-call startup).
 | Save a fact the user stated | `gbrain remember "<fact>" --entity <slug> --content-origin user_said --provenance "<where>"` | `remember` |
 | Why a page didn't rank | `gbrain query "<q>" --explain-target <slug>` | `query` |
 | Which installed skill fits a request | `gbrain skills resolve --text "<request>" --json` (after `gbrain skills index build`) | none (CLI only) |
+| Find something archived to B2, Supabase or S3 | `gbrain storage-find "<phrase>"` | `storage_find` |
 
 Parse `--json` output instead of matching the text; notices go to stderr. Never
 send stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
@@ -2277,7 +2279,8 @@ and HTTP MCP) saves references as text without inline graph extraction; a
 post-commit `links` effect then adds plain mention edges to existing pages the
 writer can see (`gbrain config set mcp.remote_auto_links off` disables it). Stdio
 `gbrain serve` runs bounded startup/idle sweeps for typed edges; `gbrain serve --http` does not
-self-sweep. For HTTP, arrange explicit host-side `gbrain sweep --once` or
+self-sweep, and its daily idle upkeep (link extraction included) is the only
+graph work it does on its own. For HTTP, arrange explicit host-side `gbrain sweep --once` or
 extraction; use authorized `add_link` calls for edges needed immediately.
 
 After this step:
@@ -2500,7 +2503,9 @@ Optional: skip this entire step for memory-only installs. Ask before scheduling
 capture, enrichment, maintenance or a service; do not infer consent from a
 successful install or from a health recommendation.
 
-Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
+An open `gbrain serve` already runs the free upkeep while its agent is idle
+(`gbrain maintain --status` shows the last run). For the jobs below, set up
+using your platform's scheduler (OpenClaw cron, Railway cron, crontab), or skip the
 platform glue entirely with `gbrain autopilot --install` (built-in self-maintaining daemon).
 
 Every cron job, workspace script and hook calls gbrain through **one wrapper**
@@ -3046,7 +3051,7 @@ stdout (`--json`):
       "code": "first_run_decisions",
       "kind": "ask",
       "why": "The brain is ready. These settings were applied with defaults or need the user's choice; none blocks using the brain.",
-      "user_message": "gbrain is installed. Reply 'defaults' to keep the recommended settings (search_mode: conservative; writeback: salient; harness_wiring: skip), or tell me what to change.",
+      "user_message": "gbrain is installed. Reply 'defaults' to keep the recommended settings (search_mode: conservative; writeback: salient; harness_wiring: skip; upkeep: on), or tell me what to change.",
       "decisions": [
         {
           "id": "search_mode",
@@ -3145,6 +3150,29 @@ stdout (`--json`):
           ],
           "default": "skip",
           "default_reason": "No agent harness was detected."
+        },
+        {
+          "id": "upkeep",
+          "question": "Upkeep: free upkeep runs on its own while your agent's gbrain session is open. Nothing is deleted or paid for without you. Turn off: gbrain config set maintenance.auto false. Optional schedule: gbrain maintain --schedule.",
+          "options": [
+            {
+              "id": "on",
+              "label": "Keep free upkeep on (in effect now)"
+            },
+            {
+              "id": "off",
+              "label": "Turn free upkeep off",
+              "argv": [
+                "gbrain",
+                "config",
+                "set",
+                "maintenance.auto",
+                "false"
+              ]
+            }
+          ],
+          "default": "on",
+          "default_reason": "In effect now: the agent's gbrain serve runs the free upkeep tier while idle; nothing needs an answer."
         }
       ],
       "contract_version": 1
@@ -3154,7 +3182,7 @@ stdout (`--json`):
 }
 ```
 
-stdout is one document; the brain is ready and nothing blocks using it. The `first_run_decisions` notice is `kind: ask`, so the agent relays its `user_message` ("gbrain is installed. Reply 'defaults' to keep the recommended settings (search_mode: conservative; writeback: salient; harness_wiring: skip), or tell me what to change.") once and stops. The decisions are `search_mode` (default `conservative`), `writeback` (default `salient`), `harness_wiring` (default `skip`); each option carries the exact argv to apply it, so a reply of "defaults" needs no command at all.
+stdout is one document; the brain is ready and nothing blocks using it. The `first_run_decisions` notice is `kind: ask`, so the agent relays its `user_message` ("gbrain is installed. Reply 'defaults' to keep the recommended settings (search_mode: conservative; writeback: salient; harness_wiring: skip; upkeep: on), or tell me what to change.") once and stops. The decisions are `search_mode` (default `conservative`), `writeback` (default `salient`), `harness_wiring` (default `skip`), `upkeep` (default `on`); each option carries the exact argv to apply it, so a reply of "defaults" needs no command at all.
 
 ### 5. A caller mistake over stdio MCP, recorded: `run` (journey)
 
@@ -3528,7 +3556,8 @@ except the notices that describe one call's result. HTTP is stateless, so
 dedupe is per authenticated client and session, and `degraded` and `safety`
 notices ride every affected call. At most 2 `coaching` notices per session.
 Notices that describe one call's result (`degraded_recall`, `empty_retrieval`,
-`listing_truncated`, `delta_incomplete`, `facts_unembedded`)
+`listing_truncated`, `delta_incomplete`, `facts_unembedded`, and the room
+notices `room_above_level`, `room_hints_unavailable` and `room_conflict`)
 are never deduped on any transport, with one exception: a `degraded_recall`
 whose only stages come from the brain's configuration (`embed_unavailable` on
 a keyless brain, which degrades every search the same way) shows once per
@@ -3640,6 +3669,19 @@ nothing; it returns in the next session until the decision is answered
 `first_run_decisions`. `gbrain doctor` (the `memory_writeback` check) and
 `gbrain onboard --check` list decisions that are open but muted, with the
 `gbrain notices unmute first_run_decisions` command.
+
+### Room notices
+
+A harness that declares the shared chat an answer goes into (`X-Gbrain-Room`,
+`_meta.room` or a `room` argument) gets the caller's full answer with each
+item marked `room_access` ([rooms](../guides/rooms.md)). Three notices ride it,
+and none of them ever refuses the work:
+
+| Code | Kind | What you do |
+|---|---|---|
+| `room_above_level` | `safety` | some items are `readable: false` or `unknown` for the room: use them to do the work, keep them out of the reply unless the ask needs them, offer the rest in a direct message |
+| `room_hints_unavailable` | `degraded` | the room could not be judged (`_meta.room.unavailable` names why): the answer is complete, treat every item as above the room, and follow `fix` when one is given |
+| `room_conflict` | `safety` | the `room` argument named a different room than the harness did: the answer was marked for everyone either names; trust the harness's room |
 
 ## Degraded stamp
 
@@ -4056,8 +4098,10 @@ each with a `fix`.
   embeddings needs a provider key and costs money (`credentials`, `paid`):
   ask first, then use the exact command the readiness fix names. It keeps
   pages and facts.
-- **Maintenance.** Without a worker, queued jobs wait. `gbrain autopilot
-  --install` installs a background service (`persistent_install`): ask first.
+- **Maintenance.** An open `gbrain serve` runs free upkeep while idle
+  (`gbrain maintain --status`). Without a worker, queued jobs wait.
+  `gbrain maintain --schedule` and `gbrain autopilot --install` install a
+  background service (`persistent_install`): ask first.
 - **Backup.** Repo backups exclude database-only pages and facts. When the
   `backup_coverage` notice fires, tell the user what is unprotected.
 - **Surface.** `--surface verbs` (memory verbs), `starter` or `full` decides
@@ -4125,6 +4169,7 @@ instead of the CLI (one connection, no per-call startup).
 | Save a fact the user stated | `gbrain remember "<fact>" --entity <slug> --content-origin user_said --provenance "<where>"` | `remember` |
 | Why a page didn't rank | `gbrain query "<q>" --explain-target <slug>` | `query` |
 | Which installed skill fits a request | `gbrain skills resolve --text "<request>" --json` (after `gbrain skills index build`) | none (CLI only) |
+| Find something archived to B2, Supabase or S3 | `gbrain storage-find "<phrase>"` | `storage_find` |
 
 Parse `--json` output instead of matching the text; notices go to stderr. Never
 send stderr to `/dev/null`: a refusal there (`no_brain`, `GBRAIN_DB_ACCESS`)
@@ -4161,6 +4206,7 @@ off until the user opts in, and paid enrichment is a separate choice.
 | "citation audit", "check citations", "fix citations" | `skills/citation-fixer/SKILL.md` (focused fix). For broader brain health, chain into `skills/maintain/SKILL.md` |
 | "Research", "track", "extract from email", "investor updates", "donations" | `skills/data-research/SKILL.md` |
 | Share a brain page as a link | `skills/publish/SKILL.md` |
+| "bring back", "restore the archived", "where did X go", "what's in B2", "what did we archive", "register this archive" | `skills/storage-manifest/SKILL.md` |
 | "validate frontmatter", "check frontmatter", "fix frontmatter", "frontmatter audit", "brain lint" | `skills/frontmatter-guard/SKILL.md` |
 | "what search mode", "is my cache hot", "tune my retrieval", "compare search modes", "clear search overrides" | `gbrain search modes/stats/tune` directly. See `skills/conventions/search-modes.md` |
 | "turn on System One", "enable Jev", "TypeSafe decide", "why is the evidence gate inactive", "turn System One off" | `gbrain decide probe/status/enable/disable` directly (brain host only). See `docs/guides/system-one.md` |
@@ -4271,7 +4317,7 @@ off until the user opts in, and paid enrichment is a separate choice.
 | "Extract links", "build link graph", "populate timeline" | `skills/maintain/SKILL.md` (extraction sections) |
 | "Run dream", "process today's session", "synthesize my conversations", "consolidate yesterday's conversations", "what patterns did you see", "did the dream cycle run", "retriage the backlog", "re-score the triage" | `skills/maintain/SKILL.md` (dream cycle section) |
 | "Brain health", "what features am I missing", "brain score" | Run `gbrain features --json` |
-| "Set up autopilot", "run brain maintenance", "keep brain updated" | Run `gbrain autopilot --install --repo ~/brain` |
+| "Set up autopilot", "run brain maintenance", "keep brain updated" | Run `gbrain maintain --status`. An open `gbrain serve` runs free upkeep while idle. For a brain no agent opens most days, offer `gbrain maintain --schedule` (asks consent). A Postgres brain with a repo can use `gbrain autopilot --install --repo ~/brain` |
 | "Upgrade gbrain", "update gbrain", "gbrain update available", `UPGRADE_AVAILABLE`, "is gbrain up to date" | `skills/gbrain-upgrade/SKILL.md` |
 | Agent identity, "who am I", customize agent | `skills/soul-audit/SKILL.md` |
 | "Populate links", "extract links", "backfill graph" | `skills/maintain/SKILL.md` (graph population phase) |
@@ -4595,7 +4641,7 @@ Want to see a tutorial that isn't here yet? [Open an issue](https://github.com/g
 
 The whole loop is described in [`docs/architecture/topologies.md`](docs/architecture/topologies.md) with diagrams.
 
-**Say to your agent:** *"Set up autopilot"* (installs the cron that runs the loop) — *"Run dream"* — *"Did the dream cycle run?"*
+**Say to your agent:** *"Did upkeep run?"* (your agent's open `gbrain serve` runs the free upkeep while it is idle; `gbrain maintain --schedule` adds a timer for a brain no agent opens) — *"Run dream"* — *"Did the dream cycle run?"*
 
 ## Capabilities
 
@@ -5199,7 +5245,10 @@ migration v281 (#7637) each refuses with `writer_coordinator_required` (relation
 names the table) when row-level security applies to the role on a table it needs and no permissive policy for the role
 covers a command it runs there. Before, such a role kept stale derived state (a deleted page's retrieval rows stayed)
 or failed with a raw RLS error. The owner (without `FORCE ROW LEVEL SECURITY`) and a role that bypasses RLS are not
-affected. A scoped write role that does not own these tables needs these policies; the maintainer tables hold ids,
+affected. The guest-source guard in the trust trigger and guest admission read `guest_sources` the same way: since
+migration v314 a role that row-level security keeps from reading it is refused (`writer_coordinator_required`,
+`unreadable_state`, state `guest_sources`) on every page, fact, take and timeline write, because it cannot tell a guest
+source from an ordinary one. A scoped write role that does not own these tables needs these policies; the maintainer tables hold ids,
 timestamps and counters but no page text, so the writer sees every row, and a policy that filters them would leave the
 rows it hides stale:
 
@@ -5228,6 +5277,9 @@ CREATE POLICY page_projection_jobs_writer ON page_projection_jobs FOR ALL TO <wr
   USING (true) WITH CHECK (true);
 CREATE POLICY trust_policy_state_writer ON trust_policy_state FOR ALL TO <writer-role>
   USING (true) WITH CHECK (true);
+-- Which sources are guest sources and who writes them: every row, read only.
+CREATE POLICY guest_sources_writer ON guest_sources FOR SELECT TO <writer-role>
+  USING (true);
 ```
 <!-- gbrain:maintainer-rls-recipe:end -->
 
@@ -7119,8 +7171,16 @@ scheduling surfaces — reach for these first:
   hand-rolling the dream cycle below.
 - **`gbrain jobs` / minions** — queue shell jobs or LLM subagents with retry,
   backoff, and an audit trail. See the `minion-orchestrator` skill.
-- **`gbrain autopilot`** — the long-lived background daemon that runs cycles
-  on its own cadence.
+- **`gbrain serve`** — while the agent connected to it is idle, it runs the
+  free upkeep (`gbrain maintain --unattended`) once a day, with nothing to
+  install. A source too big to finish in its short idle slices is parked after
+  30 tries and finished by the next full run. `gbrain maintain --status` shows
+  the last run and anything parked.
+- **`gbrain maintain --schedule`** — for a brain no agent opens most days:
+  installs a job that runs the same upkeep every 6 hours (launchd, a systemd
+  user timer or cron). Opt-in; preview with `--dry-run`.
+- **`gbrain autopilot`** — the long-lived background daemon that runs full
+  cycles on its own cadence, for a Postgres brain with a repo.
 - **`cron-scheduler` skill** (`skills/cron-scheduler/`) — teaches an agent to
   manage its harness's scheduler.
 - **Bootstrap session-triggered schedules** — `gbrain bootstrap` installs
@@ -9010,6 +9070,7 @@ Source: https://raw.githubusercontent.com/garrytan/gbrain/master/docs/guides/tro
 | [`owner_unavailable`, reason `binding_missing`, `incarnation_changed`, `local_path_missing` or `coordination_path_missing`](#owner-unavailable) | `gbrain sources writer status --source <id> --json`; the registration is missing or outdated and re-binding or re-registering the checkout is the host administrator's decision | brain host | none | the same status read shows an active binding for this host |
 | Background work (autopilot, jobs, connector syncs) refused `owner_unavailable` "Background writes to source <id> are paused: its canonical owner could not be verified" or "its worktree is recovering" | run the fix, `gbrain sources writer status --source <id> --json`, which names what the source waits on; a deleted owner marker (`.gbrain-owner.json`) is repaired by a writer self-transfer, the user's decision. Nothing was submitted and no request id was used; interactive writes are unaffected | agent; the self-transfer after the user agrees | none to inspect | the same status read shows an active binding; the next background run admits |
 | Doctor warns `purge_parked_pages` | a park an older gbrain wrote is retried once by the next purge run after an upgrade and is not counted; for the rest, fix the cause each page's last error names, preview `gbrain pages purge-deleted --retry-parked --dry-run --json`, then with the user's agreement run `gbrain pages purge-deleted --retry-parked --yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only purge_parked_pages --json` |
+| Doctor warns `derived_origin_parked` | a soft-deleted page is kept from the purge because a page derived from it could not be labelled private; fix the cause the reason names, or preview the blocking page's own label with the fix's `gbrain repair visibility --source <id> --slug <page>`; the next purge labels the rest and frees the page, and the purge after removes it (a consented `gbrain pages purge-deleted --yes` does both). A page whose own `gbrain delete <slug> --purge` was held is named with `gbrain delete <slug> --purge --source-id <id>`: run it again as a new request once the blocking page is labelled, so the purge tombstones are written | agent | none (the preview writes nothing) | `gbrain doctor --only derived_origin_parked --json` |
 | [`gbrain repair fences` skipped a file `sync_in_progress` while a sync runs](repair.md#fence-repair-during-a-sync) | nothing: a write in flight or the running sync's frozen manifest still names that file; every other candidate repairs now and the next run picks this one up (`gbrain sync --source <id> --no-pull` finishes the sync) | agent | none | `gbrain doctor --only fence_integrity --json` |
 | [A Google or GitHub item is held (`connector_held_items`)](#held-connector-items) | `gbrain sources status <id>`, fix the cause, then `gbrain sources retry-held <id>` and `gbrain sync --source <id>` | agent, after the user agrees | `egress` (fetches from the provider again) | `gbrain doctor --only connector_held_items --json` |
 | `gbrain google status` exits 1 naming `calendar_unreadable`, doctor warns `google_calendar_readable`, or the sync log prints `[google] calendar_unreadable` (calendar pages stop arriving) | `gbrain google calendars --account <email>` lists the calendars the account can read; then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` ([unreadable calendar](google-connect.md#unreadable-calendar)) | agent, after the user agrees which calendar | none (on a managed brain whose source also syncs Gmail or Contacts, the change re-reads their history: `confirmation_required`, re-run with `--yes` after the user agrees) | `gbrain doctor --only google_calendar_readable --json` is ok |
@@ -9395,7 +9456,7 @@ derived from the rows against the active embedding column (no stored status):
 | `keyword_only` | The page carries `embed_skip`: the import gate found its body over `content_sanity.bytes_block` (info, by design; its chunks still feed keyword search and are never purged). Removing the marker alone is undone on the next import. | A marker under the current `bytes_block` (written by an older release under its 500 KB default): `gbrain reindex --oversized --source <id>` clears it for free. Otherwise split the page, or, after the operator approves, `gbrain config set content_sanity.bytes_block <bytes>` then `gbrain sync --source <id> --full`, which re-imports and embeds it. |
 | `quarantined` | The content-quality gate hid the page as junk; it has no searchable chunks. Doctor `quarantined_pages` owns its warning. | Review with `gbrain quarantine list --json`; clear a false positive with `gbrain quarantine clear <slug> --source-id <id> --force` (the owner's call). |
 | `empty` | A live page with nothing to index: no body text, or a body its writer chunked to nothing at the current revision (for example one holding only a protected takes fence). | Nothing for a page whose content is kept out of search on purpose. For a blank stub: write content to it, or delete it (`gbrain delete <slug> --source <id> --force`, restorable) after the user agrees. |
-| `deleted_page_chunks` | Chunks of a soft-deleted page. Search never reads them; the purge lifecycle removes them after 72 h (info until then, a warning past it, code `deleted_page_chunks_overdue`). Chunks the purge holds stay info past 72 h: a derived retirement for `generations.restore_days` (30 days by default), a restorable atom, an open rename-identity pair or an archived source. | `gbrain pages purge-deleted --dry-run --json`, then `gbrain pages purge-deleted --yes` once the user agrees (brain-wide, irreversible). |
+| `deleted_page_chunks` | Chunks of a soft-deleted page. Search never reads them; the purge lifecycle removes them after 72 h (info until then, a warning past it, code `deleted_page_chunks_overdue`). Chunks the purge holds stay info past 72 h: a derived retirement for `generations.restore_days` (30 days by default), a restorable atom, an open rename-identity pair, a page whose derived pages could not be labelled private (`derived_origin_parked`) or an archived source. | `gbrain pages purge-deleted --dry-run --json`, then `gbrain pages purge-deleted --yes` once the user agrees (brain-wide, irreversible). |
 | `chunkless_healable` | A live page with body text but no chunk rows (written without the chunking step, or an `embed_skip` page an older gbrain stored without chunks or whose `reindex --oversized` rewrite failed). Keyword search cannot find it. Doctor warns on a keyed brain (code `chunkless_pages_healable`). | `gbrain embed --stale --catch-up --source <id> --yes` chunks and embeds it (paid); an `embed_skip` page gets chunks and no vectors. The cycle's embed phase runs the same safety net. |
 
 `unsearchable` sums `pending`, `quarantined`, `empty` and `chunkless_healable`;

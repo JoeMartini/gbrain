@@ -311,6 +311,10 @@ import { v307 } from './v307-page-label-guards.ts';
 import { v308 } from './v308-access-labelled-only.ts';
 import { v309 } from './v309-requester-scope.ts';
 import { v310 } from './v310-mcp-request-log-rollup.ts';
+import { v311 } from './v311-concept-inputs-private.ts';
+import { v312 } from './v312-guest-notes.ts';
+import { v313 } from './v313-wake-events.ts';
+import { v314 } from './v314-guest-notes-fail-closed.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -620,4 +624,8 @@ export const MIGRATIONS: Migration[] = [
   v308,
   v309,
   v310,
+  v311,
+  v312,
+  v313,
+  v314,
 ];

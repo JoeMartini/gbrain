@@ -37,10 +37,12 @@ providers
 publish
 recall
 repair
+setup
 skillify
 skillopt
 skillpack
 sources
+storage
 sync
 takes
 transcripts

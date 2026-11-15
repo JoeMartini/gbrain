@@ -429,7 +429,7 @@ export interface CycleReport {
    *   - 'failed'  : lock acquired but all attempted phases failed
    */
   status: CycleStatus;
-  /** Present when status = 'skipped'. E.g., 'cycle_already_running' or 'no_database'. Also 'aborted' when the cycle was cancelled mid-flight (#1972), or 'stamp_write_failed' (#3504). */
+  /** Present when status = 'skipped'. E.g., 'cycle_already_running' or 'no_database'. Also 'aborted' when the cycle was cancelled mid-flight (#1972), or 'stamp_write_failed' (#3504), or 'storage_manifest_source' when the cycle's source is the storage shelf (GST-1943). */
   reason?: string;
   /** `cycle_already_running` on the DB lock: who holds it and for how long (best effort). */
   lock_holder?: { id: string; holder_pid: number; holder_host: string; age_ms: number };
@@ -1301,6 +1301,7 @@ async function runPhaseSync(
   dryRun: boolean,
   pull: boolean,
   willRunExtractPhase: boolean,
+  signal?: AbortSignal,
 ): Promise<SyncPhaseResult> {
   try {
     const { performSync } = await import('../commands/sync.ts');
@@ -1322,6 +1323,7 @@ async function runPhaseSync(
                                            // If extract isn't scheduled (e.g. `gbrain dream --phase sync`),
                                            // sync's inline extract still runs to preserve prior behavior.
       drainHolder: { kind: 'cycle', id: null }, // #6712 PR 1: a busy drain lease skips like a busy sync lock
+      ...(signal ? { signal } : {}),
     });
     const syncedCount = result.added + result.modified;
     // #3068: a pull_failed partial means the internal git pull failed and the
@@ -1473,7 +1475,7 @@ async function runPhaseExtract(
         includeFrontmatter,
         sourceIdFilter: sourceId,
         catchUp: false,
-        timeBudgetMs: CYCLE_STALE_DRAIN_BUDGET_MS,
+        timeBudgetMs: CYCLE_STALE_DRAIN_BUDGET_MS, signal, // GBRA-438: idle upkeep's budget and a tool call stop the drain
       });
       staleRemaining = drained.staleRemaining;
       staleDetails = {
@@ -1913,6 +1915,18 @@ export async function runCycle(
 /** #7241: tell `opts.onPhaseStart` a selected phase is starting; a hook error is logged, never fatal. */
 const notifyPhaseStart = (opts: CycleOpts, phase: CyclePhase, phases: readonly CyclePhase[]): Promise<void> => Promise.resolve().then(() => opts.onPhaseStart?.(phase, phases.indexOf(phase), phases.length)).then(() => undefined, (e: unknown) => { console.warn(`[cycle] onPhaseStart hook error (non-fatal): ${e instanceof Error ? e.message : String(e)}`); });
 
+/** GBRA-504: a cycle scoped to a guest source skips every phase that would derive rows from guest pages (guests/derived.ts); each is reported skipped. */
+async function withoutGuestPhases(engine: BrainEngine | null, sourceId: string | undefined, phases: CyclePhase[], phaseResults: PhaseResult[]): Promise<CyclePhase[]> {
+  if (!engine || !sourceId) return phases;
+  const { guestSourceVerdict, guestSkipDetails } = await import('./guests/note.ts');
+  const verdict = await guestSourceVerdict(engine, sourceId);
+  if (!verdict.guest) return phases;
+  const { summary, details } = guestSkipDetails(sourceId, verdict.lookupError);
+  const guestSkipped = new Set((await import('./guests/derived.ts')).guestSkippedPhases());
+  for (const phase of phases.filter(p => guestSkipped.has(p))) phaseResults.push({ phase, status: 'skipped', duration_ms: 0, summary: `skipped: ${summary}`, details });
+  return phases.filter(p => !guestSkipped.has(p));
+}
+
 async function runCycleUnscoped(
   engine: BrainEngine | null,
   opts: CycleOpts,
@@ -1940,7 +1954,7 @@ async function runCycleUnscoped(
       phase_scope: PHASE_SCOPE[phase],
     },
   }));
-
+  phases = await withoutGuestPhases(engine, opts.sourceId, phases, phaseResults);
   // Capture as a const so it narrows to `string` inside the `else` branches of
   // the per-phase `if (brainDir === null)` guards, even within async closures
   // (const bindings narrow across closures; property accesses don't).
@@ -1968,6 +1982,8 @@ async function runCycleUnscoped(
     ? (opts.sourceId ?? (await resolveSourceForDir(engine, brainDir)))
     : opts.sourceId;
   const orphansSourceId = opts.forceGlobalOrphans ? undefined : cycleSourceId;
+  const storageShelf = engine && cycleSourceId ? await (await import('./storage-manifest/door.ts')).isStorageManifestSource(engine, cycleSourceId) : false;
+  if (storageShelf) return { schema_version: '1', timestamp, duration_ms: Math.round(performance.now() - start), status: 'skipped', reason: 'storage_manifest_source', brain_dir: opts.brainDir, phases: [], totals: emptyTotals() };
   let sourceWindow: SourceCycleWindow | undefined;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
@@ -2278,8 +2294,8 @@ async function runCycleUnscoped(
         // coverage. Raced like the other five: an abandoned wait is safe —
         // sync checkpoints its progress, holds its own per-source lock (the
         // successor's sync phase skips with lock-busy), and its stall
-        // watchdog bounds the dangling import. Signal threading lands in W6.
-        const { result, duration_ms } = await racedTimePhase(() => runPhaseSync(engine, brainDir, dryRun, pull, phases.includes('extract')), 'sync');
+        // watchdog bounds the dangling import. The cycle signal stops the import between files (GBRA-438).
+        const { result, duration_ms } = await racedTimePhase(() => runPhaseSync(engine, brainDir, dryRun, pull, phases.includes('extract'), cycleSignal), 'sync');
         result.duration_ms = duration_ms;
         // Capture changed slugs for incremental extract.
         syncPagesAffected = (result as SyncPhaseResult).pagesAffected;
@@ -2361,7 +2377,7 @@ async function runCycleUnscoped(
           details: { reason: 'no_database' },
         });
       } else if (brainDir === null) {
-        const { result, duration_ms } = await timePhase(async () => (await import('./cycle/connector-extract.ts')).runPhaseExtractDatabaseOnly(engine, { dryRun, sourceId: cycleSourceId, timeBudgetMs: CYCLE_STALE_DRAIN_BUDGET_MS }), 'extract');
+        const { result, duration_ms } = await timePhase(async () => (await import('./cycle/connector-extract.ts')).runPhaseExtractDatabaseOnly(engine, { dryRun, sourceId: cycleSourceId, timeBudgetMs: CYCLE_STALE_DRAIN_BUDGET_MS, signal: cycleSignal }), 'extract');
         phaseResults.push({ ...result, duration_ms });
       } else {
         // No sync (or a failed one) and no source window (#8573): syncPagesAffected
