@@ -130,6 +130,7 @@
     "check:skills-manifest": "bash scripts/check-skills-manifest-fresh.sh",
     "check:skills-lock-history": "bun scripts/check-skills-lock-history.ts",
     "check:test-names": "bash scripts/check-test-real-names.sh",
+    "check:test-fragment-reads": "bash scripts/check-test-fragment-reads.sh",
     "check:progress": "bash scripts/check-progress-to-stdout.sh",
     "check:no-tracked-symlinks": "bash scripts/check-no-tracked-symlinks.sh",
     "check:admin-build": "bash scripts/check-admin-build.sh",
@@ -149,7 +150,6 @@
     "check:source-scope-onboard": "bash scripts/check-source-scope-onboard.sh",
     "check:getpage-scope": "node scripts/check-getpage-scoped-write.mjs",
     "check:origin-assignment": "node scripts/check-origin-assignment.mjs",
-    "postinstall": "bun run scripts/postinstall.ts",
     "prepublish:clawhub": "bun run build:all",
     "publish:clawhub": "clawhub package publish . --family bundle-plugin",
     "check:skill-refs": "bun scripts/check-skill-refs.mjs",
@@ -260,7 +260,7 @@
     "bun": ">=1.4.4"
   },
   "license": "MIT",
-  "version": "0.60.722.0",
+  "version": "0.60.729.0",
   "overrides": {
     "@aws-sdk/util-format-url": "3.972.9",
     "@ai-sdk/provider-utils": "4.0.56",

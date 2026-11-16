@@ -124,6 +124,7 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'guest_source',
   'extractor_facts_expired',
   'unwithdrawn_facts',
+  'purged_page_facts',
   'loop_facts_drift',
   'ontology_facts_fenced',
   'orphan_persistence_bindings',
@@ -285,6 +286,10 @@ export const BRAIN_CHECK_NAMES: ReadonlySet<string> = new Set([
   'timeline_history',
   // #6147: imported conversation pages that may still carry a typed credential (cached audit).
   'transcript_secret_exposure',
+  // GST-2768: the conversation archive keeping up with the harness sessions (doctor/checks/transcript-archive.ts).
+  'transcript_archive_freshness',
+  // GST-2731: facts pages with undated fact lines (doctor/checks/facts-pages.ts).
+  'facts_undated_lines',
   // #5254 — pages written database-only to a source with no canonical owner.
   'unbound_source',
   'undeclared_db_only_pages',
