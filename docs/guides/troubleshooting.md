@@ -75,6 +75,7 @@
 | [`owner_unavailable`, reason `binding_missing`, `incarnation_changed`, `local_path_missing` or `coordination_path_missing`](#owner-unavailable) | `gbrain sources writer status --source <id> --json`; the registration is missing or outdated and re-binding or re-registering the checkout is the host administrator's decision | brain host | none | the same status read shows an active binding for this host |
 | Background work (autopilot, jobs, connector syncs) refused `owner_unavailable` "Background writes to source <id> are paused: its canonical owner could not be verified" or "its worktree is recovering" | run the fix, `gbrain sources writer status --source <id> --json`, which names what the source waits on; a deleted owner marker (`.gbrain-owner.json`) is repaired by a writer self-transfer, the user's decision. Nothing was submitted and no request id was used; interactive writes are unaffected | agent; the self-transfer after the user agrees | none to inspect | the same status read shows an active binding; the next background run admits |
 | Doctor warns `purge_parked_pages` | a park an older gbrain wrote is retried once by the next purge run after an upgrade and is not counted; for the rest, fix the cause each page's last error names, preview `gbrain pages purge-deleted --retry-parked --dry-run --json`, then with the user's agreement run `gbrain pages purge-deleted --retry-parked --yes` | agent, after the user agrees | `destructive` | `gbrain doctor --only purge_parked_pages --json` |
+| Doctor warns `purge_mirror` | some purges of the last 30 days have no line in the purge mirror this process uses (`<config dir>/purge-events.jsonl`), so a restore from an older backup would not replay them; gbrain ran in a home directory removed after the run, or on another machine. Run every gbrain writer with `GBRAIN_HOME` set to one durable directory | brain host operator | none | `gbrain doctor --only purge_mirror --json` |
 | Doctor warns `derived_origin_parked` | a soft-deleted page is kept from the purge because a page derived from it could not be labelled private; fix the cause the reason names, or preview the blocking page's own label with the fix's `gbrain repair visibility --source <id> --slug <page>`; the next purge labels the rest and frees the page, and the purge after removes it (a consented `gbrain pages purge-deleted --yes` does both). A page whose own `gbrain delete <slug> --purge` was held is named with `gbrain delete <slug> --purge --source-id <id>`: run it again as a new request once the blocking page is labelled, so the purge tombstones are written | agent | none (the preview writes nothing) | `gbrain doctor --only derived_origin_parked --json` |
 | [`gbrain repair fences` skipped a file `sync_in_progress` while a sync runs](repair.md#fence-repair-during-a-sync) | nothing: a write in flight or the running sync's frozen manifest still names that file; every other candidate repairs now and the next run picks this one up (`gbrain sync --source <id> --no-pull` finishes the sync) | agent | none | `gbrain doctor --only fence_integrity --json` |
 | [A Google or GitHub item is held (`connector_held_items`)](#held-connector-items) | `gbrain sources status <id>`, fix the cause, then `gbrain sources retry-held <id>` and `gbrain sync --source <id>` | agent, after the user agrees | `egress` (fetches from the provider again) | `gbrain doctor --only connector_held_items --json` |
@@ -579,25 +580,34 @@ strict count still read every match of a term that matches most of the corpus,
 so prefer narrowing with `--source-id` (MCP `source_id`), `--types` or
 `--since`.
 
-**A timed-out keyword search is skipped for 10 minutes.** After hybrid search's
-keyword statement hits the bound, a serving process (`gbrain serve`, an MCP
-session) skips that exact statement for
+**A timed-out keyword search is skipped for up to 10 minutes.** After hybrid
+search's keyword statement hits the bound, a serving process (`gbrain serve`,
+an MCP session) skips that exact statement for at most
 `search.keyword_timeout_negative_cache_seconds` (integer seconds, default 600,
 range 0 to 86400, 0 turns it off) instead of holding a backend for the whole
-bound again. The skipped search answers from the vector arm at once and its
+bound again. A timeout on a cold cache (the first searches after a restart or
+an eviction) is often gone a minute later, so the serve re-runs the timed-out
+statement once in the background 30 seconds after the timeout, then after 60,
+120 and so on seconds while it keeps failing, never past that limit. The first
+re-run that answers ends the skip, and the next search runs keyword search
+again. A re-run uses the same statement, scope and bound, starts only when the
+pool has no waiting query and keeps a connection free for other queries
+(otherwise it waits for the next step), runs one at
+a time per brain, throws its rows away and is not recorded as a search. The skipped search answers from the vector arm at once and its
 metadata carries `keyword_arm_failed` with reason `skipped_after_timeout`
 (error code `keyword_skipped_after_timeout` in `gbrain errors`). The skip
 covers the same statement only: the same terms with the same source scope,
 types, dates, slug filters, visibility and trust floor of the caller, and the
 same keyword bound. A narrower query (another `--source-id`, `--types`,
 `--since`) still runs keyword search, another brain is never affected, and
-the skip ends by itself when the entry expires, so a brief contention spike
-recovers without anyone acting. A call with `use_cache: false` runs the
+the skip ends by itself when a re-run answers or the entry expires, so a brief
+contention spike recovers without anyone acting. A call with `use_cache: false` runs the
 statement anyway.
 
 Limits: the cache lives in the serving process's memory, so a one-shot CLI
-command (`gbrain search …`) starts with an empty cache and gains nothing from
-it, and a restart clears it. The TTL is read on the first timeout after the
+command (`gbrain search …`) starts with an empty cache, runs no re-runs and
+gains nothing from it, and a restart clears it. A CLI search that the serve
+answers through its warm CLI socket uses the serve's cache. The TTL is read on the first timeout after the
 process starts; a changed value takes effect after a restart. Each timeout
 writes one counter row (`search.keyword_timeout_stats`: timeouts, skips counted
 since the previous timeout, last timeout time), never one per search, and

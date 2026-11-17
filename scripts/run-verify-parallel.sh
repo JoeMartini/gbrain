@@ -220,6 +220,8 @@ CHECKS=(
   # CQ3 / EO17 (refactor wave 1): engine-sql splices only constant text, no
   # composed $n, no expanded IN lists.
   "check:engine-sql-dynamic"
+  # #9192: a migration that changes what the page revision trigger watches empties search until the rebuild.
+  "check:migration-projection"
   # GBRA-218: the remote-privacy relaxations are read only in private-visibility.ts.
   "check:remote-privacy-reads"
   # EO4 (refactor wave 1): RLS read brands stay unforgeable; brand factories
@@ -241,6 +243,9 @@ CHECKS=(
   # A since: 'TBD' BEHAVIOR_CHANGES row never ships: refused on a stamped tree
   # (VERSION has a CHANGELOG header and differs from origin/master's) and on master.
   "check:behavior-since"
+  # Stable's promise (docs/STABILITY.md): a documented command, flag, MCP tool, config key or exit code the base has
+  # leaves only through a matured deprecations.d record; new behavior-changes.d rows carry kind:.
+  "check:public-surface"
   # CHANGELOG.md keeps every release heading origin/master has (a cut file is refused).
   "check:changelog-headings"
   "check:structural-manifest"

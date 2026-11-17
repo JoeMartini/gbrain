@@ -249,6 +249,32 @@ describe('scripts/changelog-entry.sh --pr-list', () => {
     }
   });
 
+  test('a headline that ends in an internal issue code drops the code and keeps the pull request bracket', () => {
+    const repo = fixture();
+    try {
+      commit(repo, 'Doctor names the fix (GST-2731) (#21)', { 'changelog.d/e-eps.md': '**Doctor names the fix (GST-2731).**\n' });
+      commit(repo, 'Direct note', { 'changelog.d/f-zeta.md': '**Import keeps calls apart (ABC-7)**\n' });
+      commit(repo, 'Release notes cite issues (#22)', { 'changelog.d/g-eta.md': '**Release notes keep the (ENG-5) code they quote, and PROJECT-9 codes too (TOOLONG-3).**\n' });
+      commit(repo, 'v0.1.1.0 release (#23)', { VERSION: '0.1.1.0\n', 'CHANGELOG.md': section('0.1.1.0', 'Folded.'), 'changelog.d/a-alpha.md': null, 'changelog.d/b-beta.md': null,
+        'changelog.d/e-eps.md': null, 'changelog.d/f-zeta.md': null, 'changelog.d/g-eta.md': null });
+      expect(run(repo, '--pr-list', '0.1.1.0')).toBe('- Search finds old pages again (#12)\n- Sync is faster (#11)\n- Doctor names the fix (#21)\n- Import keeps calls apart\n'
+        + '- Release notes keep the (ENG-5) code they quote, and PROJECT-9 codes too (TOOLONG-3) (#22)\n\n\nFolded.\n');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('a headline with body text after its closing ** on the same line prints the headline alone', () => {
+    const repo = fixture();
+    try {
+      commit(repo, 'Purged pages stay purged (#31)', { 'changelog.d/h-theta.md': '---\nimportant: security\n---\n**A purged page stays purged after a restore.** When an owner purges a page, more text follows **here**.\n' });
+      commit(repo, 'v0.1.1.0 release (#32)', { VERSION: '0.1.1.0\n', 'CHANGELOG.md': section('0.1.1.0', 'Folded.'), 'changelog.d/a-alpha.md': null, 'changelog.d/b-beta.md': null, 'changelog.d/h-theta.md': null });
+      expect(run(repo, '--pr-list', '0.1.1.0')).toBe('- Search finds old pages again (#12)\n- Sync is faster (#11)\n- A purged page stays purged after a restore (#31)\n\n\nFolded.\n');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test('with no earlier release tag the body is the plain entry', () => {
     const repo = fixture();
     try {

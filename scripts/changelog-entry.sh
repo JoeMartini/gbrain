@@ -7,8 +7,10 @@
 # With --pr-list, run in a git checkout of the release commit, the body opens
 # with one line per change: for every changelog.d fragment a release commit
 # deleted since the newest v* tag before HEAD, in fold order (oldest release
-# first, then path order), the fragment's first bold line plus the "(#N)" of
-# the master commit that added it. The list goes on the GitHub release only;
+# first, then path order), the fragment's first bold line, cut at its closing
+# "**", plus the "(#N)" of
+# the master commit that added it; a trailing internal issue code such as
+# "(GST-123)" is dropped from the line. The list goes on the GitHub release only;
 # CHANGELOG.md never carries it.
 #
 # Usage: changelog-entry.sh [--pr-list] <version> [changelog-file]
@@ -43,7 +45,7 @@ list_changes() {
       headline="$(git show "$release^:$path" | awk '
         NR == 1 && /^---[[:space:]]*$/ { fm = 1; next }
         fm { if (/^---[[:space:]]*$/) fm = 0; next }
-        /^\*\*/ { sub(/^\*\*/, ""); sub(/\*\*[[:space:]]*$/, ""); print; exit }
+        /^\*\*/ { s = substr($0, 3); i = index(s, "**"); if (i) s = substr(s, 1, i - 1); print s; exit }
       ')"
       [ -n "$headline" ] || continue
       subject="$(git log --first-parent --diff-filter=A --format=%s -1 "$release^" -- "$path")"
@@ -51,6 +53,7 @@ list_changes() {
       headline="${headline%.}"
       cited="$(printf '%s\n' "$headline" | sed -nE 's/.*[[:space:]]\((#[0-9]+(, #[0-9]+)*)\)$/\1/p')"
       if [ -n "$cited" ]; then headline="${headline% ("$cited")}"; fi
+      headline="$(printf '%s\n' "$headline" | sed -E 's/[[:space:]]+\([A-Z]{2,5}-[0-9]+\)$//')"
       if [ -n "$pr" ] && [[ ", $cited, " != *", #$pr, "* ]]; then cited="${cited:+$cited, }#$pr"; fi
       if [ -n "$cited" ]; then
         printf -- '- %s (%s)\n' "$headline" "$cited"
