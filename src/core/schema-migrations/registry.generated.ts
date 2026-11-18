@@ -319,6 +319,9 @@ import { v315 } from './v315-facts-context-head-index.ts';
 import { v316 } from './v316-pages-source-type-index.ts';
 import { v317 } from './v317-pages-projection-waiting-index.ts';
 import { v318 } from './v318-guard-ledgers-fail-closed.ts';
+import { v319 } from './v319-principal-private-facts.ts';
+import { v320 } from './v320-owner-only-lineage.ts';
+import { v321 } from './v321-unbacked-entity-keys-guards.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -636,4 +639,7 @@ export const MIGRATIONS: Migration[] = [
   v316,
   v317,
   v318,
+  v319,
+  v320,
+  v321,
 ];
