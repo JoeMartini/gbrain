@@ -40,7 +40,7 @@ export interface GBrainConfig {
   push?: { allow_unverified_remote?: boolean };
   hooks?: { stop_push_debounce_min?: number | string };
   /** GST-2988: what a publish does with secrets in unpushed commits (file plane: engine-free publishers read it); default redact. */
-  secrets?: { on_push?: 'redact' | 'refuse' };
+  secrets?: { on_push?: 'redact' | 'refuse'; on_write?: 'off' | 'redact' | 'block' };
   /** #7242 terminal hook (minions/terminal-hook.ts): file plane only, read by `gbrain jobs work`. */
   minions?: { terminal_hook?: string[] | { argv: string[]; timeout_ms?: number } };
   /** GST-3849 Google token socket (core/google-socket/config.ts): file plane only, read engine-free by both start paths. */
@@ -306,6 +306,7 @@ export interface GBrainConfig {
     autopilot_launcher?: 'external';
     /** #9483: a launcher outside gbrain's serve service starts serve again when it exits (`gbrain upgrade` stops serve and waits for it, or restarts the systemd unit serve runs in). */
     serve_launcher?: 'external';
+    worker_launcher?: 'external';
   };
 
   /**
@@ -1331,6 +1332,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'push.allow_unverified_remote',
   'hooks.stop_push_debounce_min',
   'secrets.on_push', // GST-2988 file plane: redact (default) or refuse secrets in unpushed commits at publish (git/redact-unpushed.ts)
+  'secrets.on_write', // file plane: off (default), redact or block secrets in remote page writes (persistence/write-secrets.ts)
   // File-plane backup-check keys (routed to ~/.gbrain/config.json by `config
   // set` — the engine-free render sites read loadConfigFileOnly). Default ON /
   // 30 days; interval clamps to >=1 day at read time (backup/status-file.ts).
@@ -1578,6 +1580,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'conversation_parser.llm_fallback_enabled',
   // Dream cycle config
   'dream.synthesize.session_corpus_dir', 'dream.synthesize.conversation_pages', // #4419 conversation pages feed synthesis
+  'dream.synthesize.since',
   'dream.synthesize.meeting_transcripts_dir',
   'dream.synthesize.last_completion_ts',
   'dream.synthesize.verdict_model',
@@ -1643,6 +1646,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // A11: IANA timezone for offset-less frontmatter datetimes in effective_date.
   // Unset → UTC (date-only values are always UTC calendar dates). Validated at set time.
   'brain.timezone',
+  'rules.session_start', // C2 (opt-in, off until the cross-harness eval passes): the session-start standing-rules section
   // A12 (opt-in, default off): undated new pages in git-backed sources take the
   // file's git first-commit date as their effective-date fallback on full import.
   'sync.git_first_commit_dates',
@@ -1701,6 +1705,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'self_upgrade.last_applied_version',
   'self_upgrade.autopilot_launcher',
   'self_upgrade.serve_launcher',
+  'self_upgrade.worker_launcher',
   // Misc
   'artifacts_sync_mode',
   'cross_project_learnings',
