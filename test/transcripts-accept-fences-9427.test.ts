@@ -133,7 +133,7 @@ async function cli(args: string[]): Promise<{ doc: Record<string, unknown>; exit
     expect(await listed()).toEqual([EMAIL, TRANSCRIPTS[0]!, REMOTE].sort());
     expect((await cli([])).doc).toMatchObject({ pages: [expect.objectContaining({ slug: TRANSCRIPTS[0], takes: 1 })] });
 
-    await engine.executeRaw("UPDATE pages SET ingested_via = 'mcp:put_page' WHERE slug = $1", [TRANSCRIPTS[1]]);
+    await conversation(TRANSCRIPTS[1]!, 'mcp:put_page', 'Session rewritten');
     expect(await listed()).toEqual([EMAIL, TRANSCRIPTS[0]!, TRANSCRIPTS[1]!, REMOTE].sort());
     const preview = await cli([]);
     expect((preview.doc.pages as Array<{ slug: string }>).map(p => p.slug)).toEqual([TRANSCRIPTS[0]]);
@@ -193,6 +193,26 @@ async function cli(args: string[]): Promise<{ doc: Record<string, unknown>; exit
     await conversation(TRANSCRIPTS[0]!, 'cli:transcripts-ingest', 'Session, imported again');
     expect(await listed()).toEqual([EMAIL, REMOTE].sort());
     expect((await cli([])).doc).toMatchObject({ pages: [], already_accepted: 3 });
+  }, 60_000);
+
+  test('GST-4026: a direct-path acceptance holds on the page content, so maintenance that only moves timestamps keeps it and a later edit does not', async () => {
+    await acceptAll();
+    await engine.executeRaw("UPDATE pages SET updated_at = updated_at + interval '1 minute' WHERE slug = ANY($1)", [[TRANSCRIPTS[0], TRANSCRIPTS[1]]]);
+    expect(await listed()).toEqual([EMAIL, REMOTE].sort());
+    expect((await cli([])).doc).toMatchObject({ pages: [], already_accepted: 3, not_eligible: expect.not.arrayContaining([expect.objectContaining({ slug: TRANSCRIPTS[0] })]) });
+    await conversation(TRANSCRIPTS[0]!, undefined, 'Session, edited by hand');
+    expect(await listed()).toEqual([EMAIL, TRANSCRIPTS[0]!, REMOTE].sort());
+    expect(((await cli([])).doc.not_eligible as Array<{ slug: string }>).map(p => p.slug)).toContain(TRANSCRIPTS[0]);
+  }, 60_000);
+
+  test('GST-4026, GST-4056: an acceptance recorded before it carried a content hash holds while the importer authored the live text', async () => {
+    await acceptAll();
+    const stored = JSON.parse((await engine.getConfig(FENCE_ACCEPTANCE_KEY))!) as Array<Record<string, unknown>>;
+    await engine.setConfig(FENCE_ACCEPTANCE_KEY, JSON.stringify(stored.map(({ content_hash: _hash, ...entry }) => entry)));
+    await engine.executeRaw("UPDATE pages SET updated_at = updated_at + interval '1 minute' WHERE slug = $1", [TRANSCRIPTS[0]]);
+    expect(await listed()).toEqual([EMAIL, REMOTE].sort());
+    await conversation(TRANSCRIPTS[0]!, undefined, 'Session, edited by hand');
+    expect(await listed()).toEqual([EMAIL, TRANSCRIPTS[0]!, REMOTE].sort());
   }, 60_000);
 }
 });

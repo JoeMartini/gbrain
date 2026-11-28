@@ -188,12 +188,13 @@ function putProvenance(row: WriteRequest, snapshot: PageSnapshot | null, parsed:
   const managedPut = row.operation === 'put_page' && !!row.worktree_id;
   keepStoredProvenance(parsed.frontmatter, snapshot?.page.frontmatter);
   if (!managedPut) return undefined;
+  const first = snapshot?.page;
+  if (row.authority.remote && first && !(first.source_kind && first.ingested_via && first.ingested_at)) return undefined;
   const tags = [...new Set([...(snapshot?.tags ?? []), ...parsed.tags])].sort();
   if (snapshot && !snapshot.page.deleted_at && digest(canonical(snapshot.page, snapshot.tags)) === digest(canonical(parsed, tags))) {
     return undefined;
   }
   const string = (value: unknown) => typeof value === 'string' && value ? value : undefined;
-  const first = snapshot?.page;
   const via = row.authority.remote ? 'mcp:put_page' : 'put_page';
   // Historical frontmatter was caller-controlled. Only trusted provenance
   // columns may supply a prior channel or timestamp for the first-write record.
@@ -208,6 +209,16 @@ function putProvenance(row: WriteRequest, snapshot: PageSnapshot | null, parsed:
   const { ingested_at, ...channel } = stamp;
   Object.assign(parsed.frontmatter, ingested_at ? stamp : channel);
   return stamp;
+}
+/**
+ * #10330: an edit of a stored page is not a new ingestion, so the import keeps its first-ingest columns. A managed
+ * put_page stamps the first write's provenance (putProvenance), so its import keeps them too, and the provenance update
+ * keeps a stored ingested_at as the column holds it (microseconds; a JS Date keeps milliseconds). A remote put, append
+ * or capture is not an ingestion either, so it keeps them as well (GST-4037 item D).
+ */
+function keepsIngestColumns(row: WriteRequest): boolean {
+  return row.operation === 'edit_page' || (row.operation === 'put_page' && !!row.worktree_id)
+    || (row.authority.remote && ['put_page', 'append_page', 'capture'].includes(row.operation));
 }
 function serverOwnsProvenance(row: WriteRequest): boolean {
   return (row.operation === 'put_page' && !!row.worktree_id) || (row.authority.remote === true && CALLER_CONTENT_OPERATIONS.includes(row.operation));
@@ -1222,7 +1233,8 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
     source_kind: typeof p.source_kind === 'string' ? p.source_kind : null,
     source_uri: typeof p.source_uri === 'string' ? p.source_uri : null,
     ingested_via: typeof p.ingested_via === 'string' ? p.ingested_via : null,
-    keepIngestColumns: row.operation === 'edit_page',
+    keepIngestColumns: keepsIngestColumns(row),
+    content_author: row.authority.remote ? `mcp:${row.operation}` : typeof p.content_author === 'string' ? p.content_author : typeof p.ingested_via === 'string' ? p.ingested_via : null,
     ...(gateTrust ? { writeGate: gateInput(gateTrust, row.id) } : {}),
     // Provenance compares the caller's page with the stored one, so it runs before the server's trust marker is stamped.
     prepareFrontmatter: page => {
@@ -1331,8 +1343,8 @@ async function prepareInlineOrSegmentedMutation(unbounded: BrainEngine, row: Wri
         async () => pinMode ? (await tx.executeRaw<{ mode: string | null }>(`UPDATE sources SET config=CASE WHEN config->>'slug_root_mode' IS NULL
           THEN jsonb_set(${SOURCE_CONFIG_OBJECT_SQL},'{slug_root_mode}',to_jsonb($2::text)) ELSE config END WHERE id=$1 RETURNING config->>'slug_root_mode' AS mode`,
         [row.source_id, pinMode]))[0] : undefined,
-        async () => { if (provenance) await tx.executeRaw(`UPDATE pages SET source_kind=$3,ingested_via=$4,ingested_at=$5::timestamptz
-          WHERE source_id=$1 AND slug=$2`, [row.source_id, row.slug, provenance.source_kind, provenance.ingested_via, provenance.ingested_at]); },
+        async () => { if (provenance) await tx.executeRaw(`UPDATE pages SET source_kind=$3,ingested_via=$4,ingested_at=CASE WHEN $6::boolean THEN ingested_at ELSE $5::timestamptz END
+          WHERE source_id=$1 AND slug=$2`, [row.source_id, row.slug, provenance.source_kind, provenance.ingested_via, provenance.ingested_at, snapshot?.page.ingested_at != null]); },
         async () => { if (lean) ({ removedTimeline, contested } = projectedRows(await project?.(tx, applied?.pageId))); },
       ]) as [unknown, { mode: string | null } | undefined, unknown, unknown];
       if (pinMode && pinned?.mode !== pinMode) throw pageRefusal('revision_conflict', 'The source slug-root mode changed during preparation.', row,

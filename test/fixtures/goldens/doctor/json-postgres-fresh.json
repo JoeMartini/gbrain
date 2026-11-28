@@ -1313,7 +1313,7 @@
         {
           "category": "meta",
           "elapsed_ms": "<volatile>",
-          "message": "1422 column(s) verified against live schema",
+          "message": "1423 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -2457,7 +2457,7 @@
         {
           "category": "ops",
           "elapsed_ms": "<volatile>",
-          "message": "Subagent tier resolves to default (claude-sonnet-4-6) — full tool-loop capability",
+          "message": "Subagent tier resolves to default (claude-sonnet-5-5) — full tool-loop capability",
           "name": "subagent_capability",
           "status": "ok"
         },
